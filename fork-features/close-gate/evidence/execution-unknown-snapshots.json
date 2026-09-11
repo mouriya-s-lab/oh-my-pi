@@ -1,0 +1,74 @@
+{
+  "bridge": "FakeRemoteEndpoint test adapter triggered by real SSH stdout EOF; NOT live hub/registry/AsyncJobManager integration",
+  "target": {
+    "kind": "ssh",
+    "host": "close-gate-53090",
+    "cwd": "/var/folders/j1/5g4c8n255j3f95292lsctb6w0000gn/T/omp-ssh-loopback-xlOCiQ",
+    "executable": "/var/folders/j1/5g4c8n255j3f95292lsctb6w0000gn/T/omp-ssh-loopback-xlOCiQ/managed-omp"
+  },
+  "transportCommand": [
+    "ssh",
+    "-F",
+    "/dev/null",
+    "-i",
+    "/var/folders/j1/5g4c8n255j3f95292lsctb6w0000gn/T/omp-ssh-loopback-xlOCiQ/id_ed25519",
+    "-o",
+    "UserKnownHostsFile=/var/folders/j1/5g4c8n255j3f95292lsctb6w0000gn/T/omp-ssh-loopback-xlOCiQ/known_hosts",
+    "-o",
+    "GlobalKnownHostsFile=/dev/null",
+    "-o",
+    "StrictHostKeyChecking=yes",
+    "-o",
+    "IdentitiesOnly=yes",
+    "-p",
+    "53090",
+    "-o",
+    "ControlMaster=no",
+    "-o",
+    "ControlPath=none",
+    "-o",
+    "ControlPersist=no",
+    "-o",
+    "StrictHostKeyChecking=yes",
+    "-o",
+    "ControlMaster=auto",
+    "-o",
+    "ControlPath=/Users/mouriya/.omp/ssh-control/%C.sock",
+    "-o",
+    "ControlPersist=3600",
+    "-o",
+    "BatchMode=yes",
+    "-o",
+    "StrictHostKeyChecking=accept-new",
+    "-p",
+    "53090",
+    "mouriya@127.0.0.1",
+    "cd '/var/folders/j1/5g4c8n255j3f95292lsctb6w0000gn/T/omp-ssh-loopback-xlOCiQ' && exec '/var/folders/j1/5g4c8n255j3f95292lsctb6w0000gn/T/omp-ssh-loopback-xlOCiQ/managed-omp' '--mode' 'rpc' '--rpc-subagent'"
+  ],
+  "sshdPid": 24755,
+  "sshChildPid": 24783,
+  "signal": "SIGTERM",
+  "exitCode": 255,
+  "stdoutEof": true,
+  "reference": "fake-remote",
+  "snapshots": {
+    "job": {
+      "runId": "21e0606d-4037-473a-bcc0-f9e520a5a34d",
+      "status": "execution-unknown",
+      "endpointKind": "remote",
+      "message": "transport aborted"
+    },
+    "handle": {
+      "runId": "21e0606d-4037-473a-bcc0-f9e520a5a34d",
+      "status": "execution-unknown",
+      "endpointKind": "remote",
+      "message": "transport aborted"
+    },
+    "roster": {
+      "runId": "21e0606d-4037-473a-bcc0-f9e520a5a34d",
+      "status": "execution-unknown",
+      "endpointKind": "remote",
+      "message": "transport aborted"
+    }
+  }
+}

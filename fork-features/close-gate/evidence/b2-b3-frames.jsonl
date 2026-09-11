@@ -1,0 +1,4 @@
+{"id":"baseline-subscribe","type":"response","command":"set_subagent_subscription","success":true,"data":{"level":"events"}}
+{"id":"baseline-subagents","type":"response","command":"get_subagents","success":true,"data":{"subagents":[]}}
+{"id":"baseline-abort","type":"response","command":"abort","success":true}
+{"type":"response","command":"irc_message","success":false,"error":"Unknown command: irc_message"}

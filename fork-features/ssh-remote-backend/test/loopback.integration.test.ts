@@ -1,6 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
-import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 import { readLines } from "@oh-my-pi/pi-utils";
@@ -9,8 +8,9 @@ import { RpcClient } from "../../../packages/coding-agent/src/modes/rpc/rpc-clie
 import { RpcFrameDecoder } from "../../../packages/coding-agent/src/modes/rpc/rpc-frame";
 import { quotePosixPath } from "../../../packages/coding-agent/src/ssh/utils";
 import { createManagedRpcTransport } from "../src";
+import { startIsolatedLoopbackSshd, sshdBinaryPresent, type LoopbackSshdHandle } from "./support/loopback-sshd";
 
-const hasSshd = process.platform !== "win32" && Bun.spawnSync(["which", "sshd"]).exitCode === 0;
+const hasSshd = await sshdBinaryPresent();
 const loopback = hasSshd ? describe : describe.skip;
 
 function resolveRepoRoot(): string {
@@ -26,34 +26,6 @@ async function within<T>(promise: Promise<T>, timeoutMs: number, label: string):
 	} finally {
 		clearTimeout(timer);
 	}
-}
-
-async function freePort(): Promise<number> {
-	const ready = Promise.withResolvers<number>();
-	const server = net.createServer();
-	server.once("error", ready.reject);
-	server.listen(0, "127.0.0.1", () => {
-		const address = server.address();
-		server.close(error => {
-			if (error) ready.reject(error);
-			else if (address && typeof address !== "string") ready.resolve(address.port);
-			else ready.reject(new Error("Loopback probe did not receive a TCP address"));
-		});
-	});
-	return ready.promise;
-}
-
-async function canConnect(port: number): Promise<boolean> {
-	const connected = Promise.withResolvers<boolean>();
-	const socket = net.connect(port, "127.0.0.1");
-	const finish = (result: boolean) => {
-		socket.destroy();
-		connected.resolve(result);
-	};
-	socket.once("connect", () => finish(true));
-	socket.once("error", () => finish(false));
-	socket.setTimeout(250, () => finish(false));
-	return connected.promise;
 }
 
 interface ObservedResponse {
@@ -73,9 +45,8 @@ interface LivePeer {
 }
 
 loopback("isolated SSH managed RPC", () => {
+	let fixture: LoopbackSshdHandle | undefined;
 	let tempDir: string | undefined;
-	let sshd: Subprocess<"ignore", "ignore", "ignore"> | undefined;
-	const daemonAbort = new AbortController();
 	const peerAbort = new AbortController();
 	const peers: LivePeer[] = [];
 	let first: LivePeer;
@@ -84,55 +55,18 @@ loopback("isolated SSH managed RPC", () => {
 	let alias: string;
 	let executable: string;
 
-	// Last-resort synchronous finalizer also covers interrupted setup. It touches only our tempdir/children.
+	// Last-resort synchronous finalizer also covers interrupted setup. It touches only our peer children;
+	// the helper owns daemon/temp lifecycle.
 	const finalize = () => {
 		peerAbort.abort();
-		daemonAbort.abort();
-		if (tempDir) fs.rmSync(tempDir, { recursive: true, force: true });
 	};
 
 	beforeAll(async () => {
-		tempDir = await fs.promises.mkdtemp(path.join(Bun.env.TMPDIR ?? "/tmp", "omp-ssh-loopback-"));
+		fixture = await startIsolatedLoopbackSshd({ logLabel: "ssh-loopback" });
+		tempDir = fixture.tmpDir;
+		port = fixture.port;
 		process.once("exit", finalize);
-		port = await freePort();
 		alias = `loopback-${port}`;
-		for (const key of ["id_ed25519", "host_ed25519"]) {
-			const generated = Bun.spawnSync(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", path.join(tempDir, key)]);
-			if (generated.exitCode !== 0) throw new Error(generated.stderr.toString());
-		}
-		await Bun.write(path.join(tempDir, "authorized_keys"), Bun.file(path.join(tempDir, "id_ed25519.pub")));
-		const hostKey = (await Bun.file(path.join(tempDir, "host_ed25519.pub")).text()).trim().split(/\s+/);
-		await Bun.write(path.join(tempDir, "known_hosts"), `[127.0.0.1]:${port} ${hostKey[0]} ${hostKey[1]}\n`);
-		const fingerprint = Bun.spawnSync(["ssh-keygen", "-lf", path.join(tempDir, "host_ed25519.pub")]);
-		if (fingerprint.exitCode !== 0) throw new Error(fingerprint.stderr.toString());
-		console.log(`Pinned loopback host key: ${fingerprint.stdout.toString().trim()}; StrictHostKeyChecking=yes`);
-		const configPath = path.join(tempDir, "sshd_config");
-		await Bun.write(configPath, [
-			`HostKey ${path.join(tempDir, "host_ed25519")}`,
-			`Port ${port}`,
-			"ListenAddress 127.0.0.1",
-			`PidFile ${path.join(tempDir, "sshd.pid")}`,
-			"LogLevel VERBOSE",
-			"StrictModes no",
-			"PasswordAuthentication no",
-			"KbdInteractiveAuthentication no",
-			"PubkeyAuthentication yes",
-			`AuthorizedKeysFile ${path.join(tempDir, "authorized_keys")}`,
-			"UsePAM no",
-			"PermitTTY no",
-			// No Subsystem directive: this daemon exposes no SFTP subsystem.
-			"",
-		].join("\n"));
-		sshd = Bun.spawn(["/usr/sbin/sshd", "-f", configPath, "-D", "-E", path.join(tempDir, "sshd.log")], {
-			stdin: "ignore", stdout: "ignore", stderr: "ignore", signal: daemonAbort.signal,
-		});
-		const deadline = Date.now() + 10_000;
-		while (!(await canConnect(port))) {
-			if (sshd.exitCode !== null || Date.now() >= deadline) {
-				throw new Error(`Isolated sshd failed to listen: ${await Bun.file(path.join(tempDir, "sshd.log")).text()}`);
-			}
-			await Bun.sleep(50);
-		}
 
 		// Real project discovery, not a patched inventory. The unique alias lives only under the fixture cwd.
 		await Bun.write(path.join(tempDir, "ssh.json"), JSON.stringify({
@@ -155,24 +89,21 @@ loopback("isolated SSH managed RPC", () => {
 			peerAbort.abort();
 			await Promise.all(peers.map(peer => peer.child.exited));
 		} finally {
-			daemonAbort.abort();
-			if (sshd) await sshd.exited;
-			if (tempDir) {
-				await fs.promises.rm(tempDir, { recursive: true, force: true });
-				expect(fs.existsSync(tempDir)).toBe(false);
-				console.log("Cleanup: isolated sshd stopped; fixture keys/config/known_hosts/home removed");
-			}
+			// Reap our peers first, then hand the daemon and tempdir to the helper's idempotent stop.
+			await fixture?.stop();
+			if (tempDir) expect(fs.existsSync(tempDir)).toBe(false);
 			process.removeListener("exit", finalize);
 		}
 	});
 
 	async function openPeer(): Promise<LivePeer> {
-		if (!tempDir) throw new Error("Loopback fixture not initialized");
+		const sshd = fixture;
+		if (!sshd || !tempDir) throw new Error("Loopback fixture not initialized");
 		const transport = await createManagedRpcTransport({
 			name: alias, cwd: tempDir, executable,
 			extraSshArgs: [
-				"-F", "/dev/null", "-i", path.join(tempDir, "id_ed25519"),
-				"-o", `UserKnownHostsFile=${path.join(tempDir, "known_hosts")}`,
+				"-F", "/dev/null", "-i", sshd.clientKeyPath,
+				"-o", `UserKnownHostsFile=${sshd.knownHostsPath}`,
 				"-o", "GlobalKnownHostsFile=/dev/null", "-o", "StrictHostKeyChecking=yes",
 				"-o", "IdentitiesOnly=yes", "-p", String(port),
 				// Independent-connection fallback is acceptable for this skeleton: release must not kill the daemon/peer.
@@ -219,7 +150,11 @@ loopback("isolated SSH managed RPC", () => {
 					return child.stdin.write(data);
 				} },
 				stdout: clientOutput, peekStderr: () => "See captured loopback SSH stderr",
-				kill: signal => { if (child.exitCode === null) child.kill(signal); }, exited: child.exited,
+				kill: signal => {
+					// The RpcClient seam passes an Exception reason; Bun's kill takes a signal, so narrow it.
+					if (child.exitCode !== null) return;
+					child.kill(typeof signal === "string" || typeof signal === "number" ? signal : "SIGTERM");
+				}, exited: child.exited,
 			}),
 		});
 		const peer: LivePeer = {

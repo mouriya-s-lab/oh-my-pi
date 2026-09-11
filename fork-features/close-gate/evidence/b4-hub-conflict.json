@@ -1,0 +1,1 @@
+{"id":"irc-native-hub-conflict","type":"response","command":"set_host_tools","success":false,"error":"RPC host tool \"hub\" conflicts with an existing tool"}

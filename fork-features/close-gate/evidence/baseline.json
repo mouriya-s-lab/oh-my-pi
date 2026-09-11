@@ -1,0 +1,51 @@
+{
+  "sha": "f5ac63954278ad931d5cf4be8a0b8ce58b342f0b",
+  "shaScope": "HEAD before the close-gate evidence commit; driver changes are in the containing commit",
+  "version": "omp/18.1.12",
+  "cli": "/Users/mouriya/Ext/orca/workspaces/oh-my-pi/ribbonworm/packages/coding-agent/src/cli.ts",
+  "commands": {
+    "sha": "git rev-parse HEAD",
+    "version": [
+      "/opt/homebrew/Cellar/bun/1.4.1/bin/bun",
+      "/Users/mouriya/Ext/orca/workspaces/oh-my-pi/ribbonworm/packages/coding-agent/src/cli.ts",
+      "--version"
+    ]
+  },
+  "exitCodes": {
+    "sha": 0,
+    "version": 0
+  },
+  "environment": {
+    "bun": "1.4.1",
+    "sshd": "OpenSSH_9.9p2, LibreSSL 3.3.6",
+    "sshClient": "OpenSSH_9.9p2, LibreSSL 3.3.6",
+    "platform": "darwin",
+    "architecture": "arm64"
+  },
+  "model": {
+    "selection": "anthropic/claude-sonnet-4-5",
+    "authorization": "No model request or credential required for control-only RPC; fresh temporary config, no copied user configs"
+  },
+  "legacy": {
+    "command": [
+      "/opt/homebrew/Cellar/bun/1.4.1/bin/bun",
+      "/Users/mouriya/Ext/orca/workspaces/oh-my-pi/ribbonworm/packages/coding-agent/src/cli.ts",
+      "--mode",
+      "rpc",
+      "--no-session",
+      "--provider",
+      "anthropic",
+      "--model",
+      "claude-sonnet-4-5"
+    ],
+    "readyFrame": "{\"type\":\"ready\",\"protocolVersion\":1,\"supportedProtocolVersions\":[1,2],\"maxFrameBytes\":1048576,\"maxReassembledFrameBytes\":67108864}\n",
+    "inputFrames": [
+      "{\"id\":\"baseline-subscribe\",\"type\":\"set_subagent_subscription\",\"level\":\"events\"}\n",
+      "{\"id\":\"baseline-subagents\",\"type\":\"get_subagents\"}\n",
+      "{\"id\":\"baseline-abort\",\"type\":\"abort\"}\n",
+      "{\"id\":\"baseline-irc-ingress\",\"type\":\"irc_message\",\"message\":{\"role\":\"custom\",\"customType\":\"irc:relay\",\"content\":\"transport-boundary-probe\",\"display\":true,\"details\":{\"from\":\"probe-source\",\"to\":\"probe-target\"},\"attribution\":\"agent\",\"timestamp\":0}}\n"
+    ],
+    "hostToolInput": "{\"id\":\"irc-native-hub-conflict\",\"type\":\"set_host_tools\",\"tools\":[{\"name\":\"hub\",\"description\":\"IRC transport compatibility probe\",\"parameters\":{\"type\":\"object\",\"properties\":{}}}]}\n",
+    "exitCode": 0
+  }
+}

@@ -261,7 +261,7 @@ async function validateKeyPermissions(keyPath?: string, platform: SshPlatform = 
 	}
 }
 
-function buildCommonArgs(host: SSHConnectionTarget, options?: SSHArgsOptions): string[] {
+export function buildCommonArgs(host: SSHConnectionTarget, options?: SSHArgsOptions): string[] {
 	const args = options?.allowStdin ? [] : ["-n"];
 
 	if (supportsSshControlMaster(options?.platform)) {

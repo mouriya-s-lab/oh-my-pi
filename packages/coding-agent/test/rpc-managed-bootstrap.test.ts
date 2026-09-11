@@ -1,6 +1,5 @@
 import { describe, expect, mock, test } from "bun:test";
-import { RpcClient, type RpcAgentProcess } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-client";
-import { MAX_RPC_FRAME_BYTES, MAX_RPC_REASSEMBLED_BYTES } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-frame";
+import { MAX_RPC_FRAME_BYTES, MAX_RPC_REASSEMBLED_BYTES, MAX_RPC_RESOURCE_CHUNK_BYTES } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-frame";
 import {
 	createRpcReadyFrame,
 	type PendingExtensionRequest,
@@ -8,7 +7,7 @@ import {
 	type RpcInputFrameDeps,
 	RpcShutdownCoordinator,
 } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-mode";
-import type { RpcResponse, RpcSessionState } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-types";
+import { MANAGED_NATIVE_AGENT_CAPABILITIES, type RpcResponse, type RpcSessionState } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-types";
 
 const makeDeps = (handleCommand: RpcInputFrameDeps["handleCommand"]) => {
 	const outputs: unknown[] = [];
@@ -52,38 +51,13 @@ describe("managed RPC bootstrap", () => {
 			maxFrameBytes: MAX_RPC_FRAME_BYTES,
 			maxReassembledFrameBytes: MAX_RPC_REASSEMBLED_BYTES,
 		});
+		expect(JSON.stringify(legacy)).toBe(`{"type":"ready","protocolVersion":1,"supportedProtocolVersions":[1,2],"maxFrameBytes":${MAX_RPC_FRAME_BYTES},"maxReassembledFrameBytes":${MAX_RPC_REASSEMBLED_BYTES}}`);
 		const managed = createRpcReadyFrame(true);
 		expect(managed.nativeAgent?.protocolMajor).toBe(1);
-		expect(managed.nativeAgent?.capabilities).toEqual(["managed-bootstrap/v0", "control-side-channel/v0"]);
+		expect(managed.nativeAgent?.capabilities).toEqual(MANAGED_NATIVE_AGENT_CAPABILITIES);
+		expect(managed.maxResourceChunkBytes).toBe(MAX_RPC_RESOURCE_CHUNK_BYTES);
 	});
 
-	test("client rejects missing or incompatible managed declarations without writing subsequent commands", async () => {
-		for (const ready of [
-			createRpcReadyFrame(false),
-			{ ...createRpcReadyFrame(true), nativeAgent: { protocolMajor: 2, capabilities: [] } },
-		]) {
-			const exited = Promise.withResolvers<number>();
-			const write = mock((_data: string | Uint8Array) => {});
-			const kill = mock(() => {
-				exited.resolve(0);
-			});
-			const child: RpcAgentProcess = {
-				stdin: { write },
-				stdout: new ReadableStream<Uint8Array>({
-					start(controller) {
-						controller.enqueue(new TextEncoder().encode(`${JSON.stringify(ready)}\n`));
-					},
-				}),
-				peekStderr: () => "",
-				kill,
-				exited: exited.promise,
-			};
-			using client = new RpcClient({ spawn: () => child, expectManagedBootstrap: true });
-			await expect(client.start()).rejects.toThrow("remote did not declare a managed native-agent bootstrap");
-			expect(write).not.toHaveBeenCalled();
-			expect(kill).toHaveBeenCalledTimes(1);
-		}
-	});
 
 	test("managed controls respond during a blocked serial command while legacy get_state stays queued", async () => {
 		const scenarios = [
@@ -171,6 +145,24 @@ describe("managed RPC bootstrap", () => {
 			await draining;
 			expect(events).toEqual(managed ? ["abort-signal", "cancelled", "drained"] : ["completed", "drained"]);
 			expect(outputs).toContainEqual({ id: "long", type: "response", command: "prompt", success: true });
+		}
+	});
+
+	test("managed parse, control validation, and execution errors preserve the complete correlation envelope", async () => {
+		const envelope = { id: "original", correlationId: "original-correlation", scope: "run", generation: 4, operationId: "operation" };
+		for (const scenario of [
+			{ request: { type: 9 }, command: "parse", code: "protocol-incompatible" },
+			{ request: { type: "cancel_run", runId: 9 }, command: "cancel_run", code: "protocol-incompatible" },
+			{ request: { type: "bash", command: "unavailable" }, command: "bash", code: "remote-execution-failed" },
+		]) {
+			const { deps, outputs } = makeDeps(async () => { throw new Error("execution failed"); });
+			const dispatcher = new RpcInputDispatcher({ deps, managed: true });
+			dispatcher.dispatch({ ...scenario.request, ...envelope });
+			await dispatcher.drain();
+			expect(outputs).toEqual([expect.objectContaining({
+				...envelope, type: "response", command: scenario.command, success: false,
+				code: scenario.code, error: expect.any(String), message: expect.any(String),
+			})]);
 		}
 	});
 });

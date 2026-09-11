@@ -16,11 +16,26 @@
  * entry in memory. No `AgentSession` is ever constructed here — that
  * fabrication is exactly what this migration removes.
  *
+ * The peer also carries the two #9 facts a resume must respect. Its
+ * receive-side lease is renewed by each inbound heartbeat
+ * ({@link FakeRemoteEndpoint.receiveHeartbeat}) and, once its window lapses
+ * ({@link FakeRemoteEndpoint.advanceLease}), the connection is treated as lost
+ * — the run reads `execution-unknown`, never `cancelled`, because a silent peer
+ * proves nothing about what the far side did with the work. And its ownership
+ * is explicit: a run the peer has not released — in flight, or terminal with
+ * replies still outstanding — keeps `park` and `ensureLive` refusing
+ * (`still-owned`), so a resume cannot start a second execution of the session
+ * the first owner still holds. Reopening happens only on the peer's own drain
+ * report, and it reuses the same reference, the same run and the one session
+ * the table has always held.
+ *
  * Test-only: nothing under `src/` may import this module.
  */
 
+import { createLeaseState, isLeaseExpired, tickLease, type LeaseState } from "@oh-my-pi/pi-coding-agent/modes/rpc/lease";
 import {
 	type AgentEndpoint,
+	ENDPOINT_STILL_OWNED_REFUSAL,
 	type EndpointControlAck,
 	type EndpointEvent,
 	EndpointEventStream,
@@ -87,6 +102,21 @@ export class FakeRemoteEndpoint implements AgentEndpoint {
 	#verdict: RunOutcome | undefined;
 	/** Deferred for the in-flight `run()`; absent once that run has a verdict. */
 	#pending: PromiseWithResolvers<RunOutcome> | undefined;
+	/**
+	 * The peer's receive-side lease: renewed by inbound heartbeats, expired when
+	 * a tick finds the window lapsed with no renewal. Live only as a fact — the
+	 * expiry is evaluated on {@link FakeRemoteEndpoint.advanceLease}, never on a
+	 * timer, so a test drives time instead of sleeping through it.
+	 */
+	#lease: LeaseState = createLeaseState();
+	/** True once the current lease window was observed lapsed; cleared by the next renewal. */
+	#leaseExpired = false;
+	/**
+	 * The peer's reply-drain fact for the current run. Ownership is released by
+	 * the pair (terminal verdict + drained), never by the verdict alone, so the
+	 * resume gate reads this flag and not the barrier.
+	 */
+	#repliesDrained = false;
 
 	constructor(options: { simulate?: FakeRemoteEndpointSimulate } = {}) {
 		this.#simulate = options.simulate ?? {};
@@ -117,6 +147,7 @@ export class FakeRemoteEndpoint implements AgentEndpoint {
 		this.#lastMessage = assignment.trim() || undefined;
 		this.#verdict = undefined;
 		this.#pending = undefined;
+		this.#repliesDrained = false;
 		this.#openSession(runId);
 		const acceptedAt = Date.now();
 		this.#events.emit({ type: "run_ack", runId, acceptedAt });
@@ -176,7 +207,11 @@ export class FakeRemoteEndpoint implements AgentEndpoint {
 	 * Simulates losing the transport mid-run. The run settles with
 	 * `execution-unknown` on every view instead of a failure verdict, and a
 	 * resolver that arrives later cannot overwrite it. The peer-side session
-	 * survives, so the same reference can be resumed.
+	 * survives, so the same reference can be reopened — but only once its owner
+	 * has let go: a lost connection confirms nothing about what the far side did
+	 * with the work, so this reports neither cancellation nor a completed
+	 * cleanup, and the run stays `still-owned` until the peer's own drain fact
+	 * lands.
 	 */
 	abortTransport(): void {
 		const runId = this.#currentRunId;
@@ -187,7 +222,9 @@ export class FakeRemoteEndpoint implements AgentEndpoint {
 	/**
 	 * Report the peer's run as reply-drained — the fact that lands after the
 	 * terminal run. Until it does, `waitReplyDrained` stays blocked, which is
-	 * what keeps "terminal" from being read as "stopped without replying".
+	 * what keeps "terminal" from being read as "stopped without replying", and
+	 * the peer keeps owning the run, which is what keeps a resume out of it.
+	 * Together with the terminal verdict this is the ownership release.
 	 */
 	emitReplyDrained(runId: string): void {
 		if (runId !== this.#currentRunId) {
@@ -196,12 +233,47 @@ export class FakeRemoteEndpoint implements AgentEndpoint {
 			);
 		}
 		this.#barrier.markDrained(runId);
+		this.#repliesDrained = true;
 		this.#events.emit({ type: "reply_drained", runId });
+	}
+
+	/**
+	 * Record one inbound heartbeat at `now`: the receive-side lease is renewed
+	 * and the fact is published as a `heartbeat_received` event. Renewing is all
+	 * it does — a live peer proves the connection, never a run's outcome, so the
+	 * snapshot is left alone (which is why the event's `runId` is optional: a
+	 * heartbeat can arrive between runs).
+	 */
+	receiveHeartbeat(now = Date.now()): void {
+		this.#lease = tickLease(this.#lease, now);
+		this.#leaseExpired = false;
+		const runId = this.#currentRunId;
+		this.#events.emit({ type: "heartbeat_received", ...(runId !== null ? { runId } : {}), timestamp: now });
+	}
+
+	/**
+	 * Evaluate the receive-side lease at `now`. A window that lapsed with no
+	 * inbound heartbeat is the disconnect path — the same semantics as
+	 * {@link FakeRemoteEndpoint.abortTransport}, reached through silence rather
+	 * than a torn pipe: the current run reads `execution-unknown`, nothing is
+	 * cancelled and nothing is replayed, and ownership stays with the peer until
+	 * its drain fact lands. The first tick that observes the lapse publishes the
+	 * `lease_expired` event; later ticks over the same lapse are silent, and a
+	 * renewal arms the next one.
+	 */
+	advanceLease(now: number): void {
+		if (!isLeaseExpired(this.#lease, now) || this.#leaseExpired) return;
+		this.#leaseExpired = true;
+		const runId = this.#currentRunId;
+		this.#events.emit({ type: "lease_expired", ...(runId !== null ? { runId } : {}), timestamp: now });
+		if (runId === null) return;
+		this.#settle({ status: "execution-unknown", runId, error: "receive lease expired" }, "receive lease expired");
 	}
 
 	async terminate(): Promise<void> {
 		this.#pending = undefined;
 		this.#verdict = undefined;
+		this.#repliesDrained = false;
 		this.#currentRunId = null;
 		this.#currentStatus = "idle";
 		this.#lastMessage = "terminated";
@@ -217,9 +289,10 @@ export class FakeRemoteEndpoint implements AgentEndpoint {
 	}
 
 	/**
-	 * Not implemented: #8 defers the inbound routing to #11. The answer is a
-	 * resolved not-implemented receipt naming the owning slice; a fake that
-	 * cannot deliver must not borrow the local bus receipt either.
+	 * Not implemented: the negotiated capability set advertises
+	 * `ircBidirectional: 0` until #11, so there is no inbound route to take and
+	 * the answer is a resolved not-implemented receipt naming the owning slice.
+	 * A fake that cannot deliver must not borrow the local bus receipt either.
 	 */
 	async deliverIrc(_envelope: IrcInboundEnvelope): Promise<IrcDeliveryReceipt> {
 		return { status: "not-implemented", detail: IRC_TRANSPORT_DEFERRED };
@@ -231,10 +304,15 @@ export class FakeRemoteEndpoint implements AgentEndpoint {
 	}
 
 	/**
-	 * Suspends the peer-side session in the in-memory table: the entry keeps its
-	 * run identity and is only marked parked. The busy / reply-obligation
-	 * refusal rules belong to the managed protocol (#9); this fake models the
-	 * identity-preserving suspension those rules gate.
+	 * Suspend the peer-side session in the in-memory table: the entry keeps its
+	 * run identity and is only marked parked, and the acknowledgement names the
+	 * opaque reference a later resume passes back.
+	 *
+	 * A refusal is a refusal of the *state*, not of the request: a run that is
+	 * still in flight or still owes replies is one the peer still owns, and
+	 * freezing it mid-flight would strand the owner's work under a session two
+	 * callers believe is idle (D4). Those two cases answer `still-owned`, the
+	 * same gate a resume reads.
 	 */
 	async park(runId: string): Promise<EndpointControlAck> {
 		const session = this.#sessions.get(this.handle.reference);
@@ -245,8 +323,10 @@ export class FakeRemoteEndpoint implements AgentEndpoint {
 			};
 		}
 		if (!session) return { acknowledged: false, reason: "the peer holds no session to park" };
+		const owned = this.#ownershipRefusal();
+		if (owned) return { acknowledged: false, reason: owned };
 		session.parked = true;
-		return { acknowledged: true };
+		return { acknowledged: true, resumeReference: session.reference };
 	}
 
 	/**
@@ -254,6 +334,13 @@ export class FakeRemoteEndpoint implements AgentEndpoint {
 	 * entry is reused, its run identity preserved, its parked flag cleared, and
 	 * nothing new is created. An unknown reference is refused outright — a
 	 * resume must never open a new session.
+	 *
+	 * A reference the peer still owns is refused too, and that refusal is the
+	 * point of the gate: reopening while the first execution is in flight, or
+	 * while its cleanup is unconfirmed, would run the same logical session
+	 * twice. Ownership is released by the terminal-plus-drained pair, so the
+	 * refusal outlives the run's verdict — a disconnected or cancelled run whose
+	 * replies have not drained is still owned.
 	 */
 	async ensureLive(reference: string): Promise<EndpointControlAck> {
 		const session = this.#sessions.get(reference);
@@ -263,6 +350,8 @@ export class FakeRemoteEndpoint implements AgentEndpoint {
 				reason: `unknown reference ${JSON.stringify(reference)}; resume never opens a new session`,
 			};
 		}
+		const owned = this.#ownershipRefusal();
+		if (owned) return { acknowledged: false, reason: owned };
 		session.parked = false;
 		return { acknowledged: true };
 	}
@@ -295,6 +384,22 @@ export class FakeRemoteEndpoint implements AgentEndpoint {
 
 	asRosterSnapshot(): EndpointSnapshot {
 		return this.#snapshot();
+	}
+
+	/**
+	 * The peer's ownership of its current run, as a refusal reason: present
+	 * while the run is in flight, and present again after a terminal verdict
+	 * until the replies drain. `undefined` once the owner has let go — the only
+	 * state in which `park` and `ensureLive` proceed.
+	 */
+	#ownershipRefusal(): string | undefined {
+		const runId = this.#currentRunId;
+		if (runId === null) return undefined;
+		if (this.#verdict === undefined) return `${ENDPOINT_STILL_OWNED_REFUSAL}: run ${runId} is in flight`;
+		if (!this.#repliesDrained) {
+			return `${ENDPOINT_STILL_OWNED_REFUSAL}: run ${runId} reached ${this.#verdict.status} but has not drained its replies`;
+		}
+		return undefined;
 	}
 
 	/** Open the peer session for `handle.reference` on first use; later runs reuse that session. */

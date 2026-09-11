@@ -7,10 +7,14 @@
  * same interface with the control and observation surface the monitor, the
  * registry, and the Hub need: a revision-stamped event stream with a resumable
  * subscription, park/ensureLive, the reply-drained hook, and the inbound
- * boundaries for IRC (#11) and resources/UI (#13). The methods whose owning
- * slice has not landed are *honest* stubs: they answer with a refusal or an
- * explicit not-implemented outcome that names the owning slice instead of
- * fabricating delivery, parking, or content.
+ * boundaries for IRC (#11) and resources/UI (#13). Stage 3 (#9) pins the
+ * managed facts that surface carries — the receive-side lease events
+ * (`heartbeat_received` / `lease_expired`), the opaque resume reference a park
+ * may hand back, and the ownership refusals that stop a resume from starting a
+ * second execution of a session whose owner has not let go. The methods whose
+ * owning slice has not landed are *honest* stubs: they answer with a refusal
+ * or an explicit not-implemented outcome that names the owning slice instead
+ * of fabricating delivery, parking, or content.
  *
  * Two invariants this module protects on its own:
  *
@@ -106,8 +110,32 @@ export interface EndpointSnapshotResult {
  * {@link AgentEndpoint.ensureLive}). `acknowledged: false` is a real refusal:
  * it carries the transport's reason, and the caller must neither retry blindly
  * nor claim the state the request asked for.
+ *
+ * A successful `park` may hand back an opaque `resumeReference` (D4, #9): the
+ * peer's handle for the suspended session, which a later `ensureLive` — or the
+ * managed `resume` command — passes back verbatim. It is deliberately opaque:
+ * callers store and echo it, never parse it, and its absence means the peer
+ * kept the suspension addressable through the reference the caller already
+ * holds.
  */
-export type EndpointControlAck = { acknowledged: true } | { acknowledged: false; reason: string };
+export type EndpointControlAck =
+	| { acknowledged: true; resumeReference?: string }
+	| { acknowledged: false; reason: string };
+
+/**
+ * Prefix a peer puts on a refusal while it still owns the work it was asked
+ * about (D4, #9): the run is in flight, or it reached a terminal verdict with
+ * replies still outstanding. Both are the same answer to a resume — the
+ * referenced session has an owner — so both carry this token.
+ *
+ * A refusal's `reason` is the only channel an {@link EndpointControlAck}
+ * offers, which makes this prefix its machine-readable half. Callers that act
+ * on ownership match it and must *not* fall back to treating every refusal as
+ * `still-owned`: an unknown reference is a different fact with a different
+ * resolution (a managed resume reports it as `resource-unavailable`, never as
+ * "try again later").
+ */
+export const ENDPOINT_STILL_OWNED_REFUSAL = "still-owned";
 
 /** Envelope fields the event stream stamps onto every event. */
 export interface EndpointEventEnvelope {
@@ -129,6 +157,16 @@ export interface EndpointEventEnvelope {
  * - `run_outcome`: the run's single verdict, reported verbatim.
  * - `reply_drained`: the run owes no more replies; the second half of the
  *   terminal-plus-drained pair the reply barrier waits for.
+ * - `heartbeat_received`: a peer heartbeat renewed the receive-side lease (D4,
+ *   #9); `timestamp` is the local instant the frame was observed, never the
+ *   sender's clock. A viewer watching for liveness reads this as "the lease
+ *   just moved", not as a run fact.
+ * - `lease_expired`: the receive-side lease ran out with no renewal inside its
+ *   window (D4, #9). This is the disconnect signal, not a run verdict: the run
+ *   it names becomes `execution-unknown`, and nothing is cancelled, retried, or
+ *   replayed on the strength of it. `timestamp` is the instant the expiry was
+ *   observed; the deadline is the last renewal (`LeaseState.renewedAt`) plus
+ *   the lease window, so several ticks can observe one lapse.
  */
 export type EndpointEventDraft =
 	| { type: "snapshot"; runId?: string; snapshot: EndpointSnapshot }
@@ -136,7 +174,9 @@ export type EndpointEventDraft =
 	| { type: "activity_changed"; runId?: string; message: string }
 	| { type: "run_ack"; runId: string; acceptedAt: number }
 	| { type: "run_outcome"; runId: string; outcome: RunOutcome }
-	| { type: "reply_drained"; runId: string };
+	| { type: "reply_drained"; runId: string }
+	| { type: "heartbeat_received"; runId?: string; timestamp: number }
+	| { type: "lease_expired"; runId?: string; timestamp: number };
 
 /** One stamped state event; see {@link EndpointEventDraft} for the variants. */
 export type EndpointEvent = EndpointEventDraft & EndpointEventEnvelope;
@@ -275,8 +315,9 @@ export type IrcInboundEnvelope = IrcMessage;
 /**
  * Result of {@link AgentEndpoint.deliverIrc}.
  *
- * `not-implemented` is the only variant this slice produces, and it is a
- * resolved answer rather than a thrown error: the boundary exists so the
+ * `not-implemented` is the only variant produced while the negotiated
+ * capability set advertises `ircBidirectional: 0` (#11 turns it on), and it is
+ * a resolved answer rather than a thrown error: the boundary exists so the
  * caller above (the IRC routing under #11) has one place to call, and a stub
  * that cannot deliver must say so instead of borrowing the local bus receipt —
  * that receipt would claim a delivery the frame never left the process for.
@@ -339,13 +380,17 @@ export interface UiResponse {
  * reads and the control methods below are available throughout.
  *
  * Honest stubs, and the slice that replaces each — the return shapes are real,
- * only the answers are deferred past #8:
+ * only the answers are deferred:
  *
- * - `deliverIrc` — inbound IRC routing: #11.
+ * - `deliverIrc` — inbound IRC routing: #11 (this slice negotiates
+ *   `ircBidirectional: 0`, so no frame has a route to take).
  * - `readResource`, `respondUi` — peer-scoped resources and UI round trips: #13.
- * - `park`, `ensureLive` — the managed park/resume protocol: #9 (a local
- *   endpoint refuses: an in-process session is parked by
- *   `AgentLifecycleManager`, not by an endpoint).
+ *
+ * The control pair carries real semantics from #9 on: `ensureLive` refuses a
+ * reference whose owner is still active or whose cleanup is unconfirmed, and
+ * `park` refuses a run that is busy or still owes replies. A local endpoint
+ * refuses both outright — an in-process session is parked by
+ * `AgentLifecycleManager`, not by an endpoint.
  */
 export interface AgentEndpoint {
 	/** The session or peer reference this endpoint was built around. */
@@ -382,10 +427,12 @@ export interface AgentEndpoint {
 	/**
 	 * Deliver one inbound IRC frame to this endpoint's peer.
 	 *
-	 * Not implemented here: #8 defers the inbound routing to #11, so the answer
-	 * is a resolved `not-implemented` receipt carrying
+	 * Not implemented here: the managed capability set negotiates
+	 * `ircBidirectional: 0` until #11, so no inbound routing exists to call and
+	 * this answer is a resolved `not-implemented` receipt carrying
 	 * {@link IRC_TRANSPORT_DEFERRED} — never a fabricated
-	 * `injected`/`woken`/`revived`.
+	 * `injected`/`woken`/`revived`, and never a silent fallback to the local
+	 * bus.
 	 */
 	deliverIrc(envelope: IrcInboundEnvelope): Promise<IrcDeliveryReceipt>;
 	/**
@@ -397,14 +444,26 @@ export interface AgentEndpoint {
 	waitReplyDrained(runId: string, opts?: { signal?: AbortSignal }): Promise<ReplyDrainedResult>;
 	/**
 	 * Ask the peer to suspend `runId`, keeping its identity and resume
-	 * reference. A refusal must say why; #8 defers the managed park protocol to
-	 * #9.
+	 * reference. A refusal must say why: a run that is still busy or that owes
+	 * replies is refused rather than frozen mid-flight, and the caller reports
+	 * that refusal instead of claiming a park. A successful acknowledgement may
+	 * carry the peer's opaque `resumeReference` for the suspended session; the
+	 * reference the caller already holds stays valid either way.
 	 */
 	park(runId: string): Promise<EndpointControlAck>;
 	/**
 	 * Open (or confirm) the peer's session for an existing opaque `reference`.
 	 * A resume reuses the referenced session — it never creates a new one — and
-	 * a refusal must say why.
+	 * a refusal must say why, distinguishing two cases a caller must not
+	 * conflate:
+	 *
+	 * - `still-owned`: the peer still owns the work, either because the run is
+	 *   in flight or because its cleanup is unconfirmed (the run reached a
+	 *   terminal verdict but has not drained its replies). Reopening here would
+	 *   start a second execution of the same logical session, so the request is
+	 *   refused until the owner releases the work.
+	 * - unknown reference: the peer never held it, so there is nothing to
+	 *   resume and nothing new is minted.
 	 */
 	ensureLive(reference: string): Promise<EndpointControlAck>;
 	/**

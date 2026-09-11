@@ -7478,6 +7478,8 @@ export class AgentSession {
 		reason?: string;
 		/** Internal `/compact` startup keeps the manual-compaction marker alive while aborting the active turn. */
 		preserveCompaction?: boolean;
+		/** Managed run cancellation leaves separately owned RPC shell commands alive. */
+		preserveBash?: boolean;
 	}): Promise<void> {
 		const userInterrupt = options?.reason === USER_INTERRUPT_LABEL;
 		this.#pendingAbortErrorId = userInterrupt ? AIError.create(AIError.Flag.UserInterrupt) : undefined;
@@ -7511,7 +7513,7 @@ export class AgentSession {
 			} else {
 				manualCompactionCleanup = this.#maintenance.abortCompaction(options?.reason);
 			}
-			this.abortBash();
+			if (!options?.preserveBash) this.abortBash();
 			this.abortEval();
 			const postPromptDrain = this.#cancelPostPromptTasks();
 			this.agent.abort(options?.reason);
@@ -8404,11 +8406,12 @@ export class AgentSession {
 	 * @param onChunk Optional streaming callback for output
 	 * @param options.excludeFromContext If true, command output won't be sent to LLM (!! prefix)
 	 * @param options.useUserShell If true, allow caller to request configured user-shell routing
+	 * @param options.signal Cancel only this command; abortBash still cancels every owned shell.
 	 */
 	executeBash(
 		command: string,
 		onChunk?: (chunk: string) => void,
-		options?: { excludeFromContext?: boolean; useUserShell?: boolean; pty?: BashPtyOptions },
+		options?: { excludeFromContext?: boolean; useUserShell?: boolean; pty?: BashPtyOptions; signal?: AbortSignal },
 	): Promise<BashResult> {
 		return this.#bash.executeBash(command, onChunk, options);
 	}

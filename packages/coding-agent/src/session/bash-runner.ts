@@ -69,7 +69,7 @@ export class BashRunner {
 	async executeBash(
 		command: string,
 		onChunk?: (chunk: string) => void,
-		options?: { excludeFromContext?: boolean; useUserShell?: boolean; pty?: BashPtyOptions },
+		options?: { excludeFromContext?: boolean; useUserShell?: boolean; pty?: BashPtyOptions; signal?: AbortSignal },
 	): Promise<BashResult> {
 		const target = this.#captureSessionTarget();
 		let targetTransferred = false;
@@ -113,7 +113,9 @@ export class BashRunner {
 			try {
 				result = await executeBashCommand(command, {
 					onChunk,
-					signal: abortController.signal,
+					signal: options?.signal
+						? AbortSignal.any([abortController.signal, options.signal])
+						: abortController.signal,
 					sessionKey: target.sessionId,
 					cwd,
 					timeout: clampTimeout("bash", undefined, this.#host.settings.get("tools.maxTimeout")) * 1000,

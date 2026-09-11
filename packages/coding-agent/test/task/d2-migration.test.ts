@@ -13,8 +13,10 @@
  *    `exitCode: 0` fabrication.
  * 3. terminal ≠ deliverable — a completed run holds the owner drain until its
  *    replies drain; abort is per-waiter and never settles the run itself.
- * 4. resume — an unknown run resumes through the same opaque reference and run
- *    id, and the peer's session table still holds exactly one session.
+ * 4. resume — a run the peer still owns (in flight, or terminal without its
+ *    replies drained) refuses park and resume as `still-owned`; after the peer
+ *    reports the drain, the same opaque reference and run id reopen, and the
+ *    peer's session table still holds exactly one session.
  * 5. hygiene — the whole remote driver never calls `createAgentSession`, and
  *    `snapshot()`/`subscribe()` answers come from the endpoint's own stream;
  *    `runSubprocess`'s `endpointExecution` monitor reports a transport loss the
@@ -440,20 +442,45 @@ describe("D2 RPC waiters: a scheduling pause is not a final stop", () => {
 });
 
 describe("D2 row 4: resume reaches the same reference and run", () => {
-	it("re-opens the existing peer reference without creating a session", async () => {
+	it("re-opens the existing peer reference once its owner has let go", async () => {
 		const manager = createManager();
 		const { endpoint, ack, job, agentId } = await startRemoteRun(manager, {
 			agentId: "D2RemoteResume",
 			jobId: "d2-remote-resume",
 		});
+		const reference = endpoint.handle.reference;
+
+		// A run that is still in flight belongs to the peer: resuming here would
+		// start a second execution of the same logical session, and parking would
+		// freeze work that is still moving.
+		expect(await endpoint.ensureLive(reference)).toEqual({
+			acknowledged: false,
+			reason: expect.stringContaining("still-owned"),
+		});
+		expect(await endpoint.park(ack.runId)).toEqual({
+			acknowledged: false,
+			reason: expect.stringContaining("still-owned"),
+		});
+
 		endpoint.abortTransport();
 		await job.promise;
 		expect(job.status).toBe("execution-unknown");
 
-		const resumed = await endpoint.ensureLive(endpoint.handle.reference);
+		// A lost transport confirms nothing about the far side: the run is
+		// `execution-unknown`, not cancelled, and the peer still owns it until
+		// its cleanup is reported. Resuming now would be the second execution.
+		expect(await endpoint.ensureLive(reference)).toEqual({
+			acknowledged: false,
+			reason: expect.stringContaining("still-owned"),
+		});
+
+		// The peer's own drain report releases ownership; only then does the same
+		// reference reopen, and it reuses the same run in the same sole session.
+		endpoint.emitReplyDrained(ack.runId);
+		const resumed = await endpoint.ensureLive(reference);
 		expect(resumed).toEqual({ acknowledged: true });
 		expect(endpoint.sessionsCreatedCount).toBe(1);
-		expect(endpoint.sessions.get(endpoint.handle.reference)?.runId).toBe(ack.runId);
+		expect(endpoint.sessions.get(reference)?.runId).toBe(ack.runId);
 		expect(endpoint.asHandleSnapshot().runId).toBe(ack.runId);
 
 		// The lifecycle path resumes the same opaque reference — no local session,
@@ -480,15 +507,35 @@ describe("D2 row 4: resume reaches the same reference and run", () => {
 		expect(endpoint.sessionsCreatedCount).toBe(0);
 	});
 
-	it("acknowledges park and resume against the same peer session entry", async () => {
+	it("parks and resumes against the same peer session entry only after the drain", async () => {
 		const endpoint = new FakeRemoteEndpoint();
 		const ack = await endpoint.start(REMOTE_ASSIGNMENT);
 		const reference = endpoint.handle.reference;
 		if (!endpoint.sessions.get(reference)) throw new Error("the peer opened no session for the run it acked");
 
-		// Parking suspends the entry in place: the run identity survives and no
-		// session is created to hold the suspension.
-		expect(await endpoint.park(ack.runId)).toEqual({ acknowledged: true });
+		// A busy run is refused, and so is a run that reached its verdict while
+		// still owing replies: both are states the peer still owns, so parking or
+		// resuming them would leave two owners for one session.
+		expect(await endpoint.park(ack.runId)).toEqual({
+			acknowledged: false,
+			reason: expect.stringContaining("still-owned"),
+		});
+		endpoint.completeRun({ status: "completed", runId: ack.runId, text: "peer finished the assignment" });
+		expect(await endpoint.park(ack.runId)).toEqual({
+			acknowledged: false,
+			reason: expect.stringContaining("still-owned"),
+		});
+		expect(await endpoint.ensureLive(reference)).toEqual({
+			acknowledged: false,
+			reason: expect.stringContaining("still-owned"),
+		});
+		expect(endpoint.sessions.get(reference)?.parked).toBe(false);
+
+		// The drain fact ends the ownership: parking then suspends the entry in
+		// place — the run identity survives, no session is created to hold the
+		// suspension, and the acknowledgement names the resumable reference.
+		endpoint.emitReplyDrained(ack.runId);
+		expect(await endpoint.park(ack.runId)).toEqual({ acknowledged: true, resumeReference: reference });
 		const parked = endpoint.sessions.get(reference);
 		if (!parked) throw new Error("the peer session disappeared while parking");
 		expect(parked.parked).toBe(true);

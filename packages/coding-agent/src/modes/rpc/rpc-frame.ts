@@ -1,15 +1,101 @@
 import { isDeepStrictEqual } from "node:util";
 import { isRecord } from "@oh-my-pi/pi-utils";
-import type { RpcChunkFrame } from "./rpc-types";
+import { readRpcCorrelation, type RpcChunkFrame, type RpcErrorCode, type RpcFrameLimits } from "./rpc-types";
+
+export type { RpcFrameLimits };
 
 /** Maximum UTF-8 size of one newline-delimited RPC frame, including the newline. */
 export const MAX_RPC_FRAME_BYTES = 1024 * 1024;
 /** Maximum UTF-8 size of one logical frame reassembled by protocol v2. */
 export const MAX_RPC_REASSEMBLED_BYTES = 64 * 1024 * 1024;
+/** Maximum payload bytes one protocol v2 resource chunk may carry. */
+export const MAX_RPC_RESOURCE_CHUNK_BYTES = 256 * 1024;
 
-const RPC_CHUNK_PAYLOAD_BYTES = 256 * 1024;
+/**
+ * The limits every legacy peer already speaks. They are what an encoder or
+ * decoder uses before `setLimits`, so a connection that negotiates nothing
+ * serializes exactly the frames it always did.
+ */
+export const DEFAULT_RPC_FRAME_LIMITS: RpcFrameLimits = {
+	maxFrameBytes: MAX_RPC_FRAME_BYTES,
+	maxReassembledFrameBytes: MAX_RPC_REASSEMBLED_BYTES,
+	maxResourceChunkBytes: MAX_RPC_RESOURCE_CHUNK_BYTES,
+};
+
+/**
+ * Bytes reserved for a chunk frame's own envelope — field names, index/count/
+ * byteLength digits, the base64 quotes and the newline — so the payload budget
+ * stays inside {@link RpcFrameLimits.maxFrameBytes} once base64 and JSON have
+ * added their overhead.
+ */
+const CHUNK_FRAME_HEADROOM_BYTES = 1024;
+
+/** The managed error a frame that cannot fit the negotiated limits is reported as. */
+const FRAME_OVERFLOW_ERROR: RpcErrorCode = "protocol-incompatible";
 
 export type RpcProtocolVersion = 1 | 2;
+
+/** Positive finite numbers only; anything else is treated as "not proposed". */
+function positiveLimit(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : undefined;
+}
+
+/** Fill in every field of a (possibly partial) limit set; malformed entries fall back to the defaults. */
+function normalizeFrameLimits(value: Partial<RpcFrameLimits>): RpcFrameLimits {
+	return {
+		maxFrameBytes: positiveLimit(value.maxFrameBytes) ?? MAX_RPC_FRAME_BYTES,
+		maxReassembledFrameBytes: positiveLimit(value.maxReassembledFrameBytes) ?? MAX_RPC_REASSEMBLED_BYTES,
+		maxResourceChunkBytes: positiveLimit(value.maxResourceChunkBytes) ?? MAX_RPC_RESOURCE_CHUNK_BYTES,
+	};
+}
+
+/**
+ * Take the smaller value per field: a frame is only ever sent when both ends
+ * can carry it. An unspecified or non-positive client proposal keeps the
+ * server's value, so a peer that negotiates nothing lands on the defaults.
+ */
+export function negotiateRpcFrameLimits(client: Partial<RpcFrameLimits>, server: RpcFrameLimits): RpcFrameLimits {
+	const mine = normalizeFrameLimits(client);
+	const theirs = normalizeFrameLimits(server);
+	return {
+		maxFrameBytes: Math.min(mine.maxFrameBytes, theirs.maxFrameBytes),
+		maxReassembledFrameBytes: Math.min(mine.maxReassembledFrameBytes, theirs.maxReassembledFrameBytes),
+		maxResourceChunkBytes: Math.min(mine.maxResourceChunkBytes, theirs.maxResourceChunkBytes),
+	};
+}
+
+/**
+ * Payload bytes one chunk may carry: the negotiated resource-chunk cap, further
+ * reduced so its base64 expansion plus the chunk envelope still fits a physical
+ * frame. At the defaults this is exactly the historical 256 KiB chunk.
+ */
+function chunkPayloadBytes(limits: RpcFrameLimits): number {
+	const base64Budget = Math.floor(((limits.maxFrameBytes - CHUNK_FRAME_HEADROOM_BYTES) * 3) / 4);
+	return Math.max(1, Math.min(limits.maxResourceChunkBytes, base64Budget));
+}
+
+/**
+ * A frame that violated the negotiated framing contract — malformed chunk
+ * metadata, a payload over the chunk budget, a sequence that does not add up.
+ *
+ * It is a distinct type because the two failures it separates have different
+ * handling: a broken *frame* is a protocol violation the caller reports and
+ * stops on, while a broken *stream* is a lost connection. Both ends map this to
+ * `protocol-incompatible` rather than to a transport verdict.
+ */
+export class RpcFrameError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = "RpcFrameError";
+	}
+}
+
+/** Everything the serializers need beyond the frame itself. */
+interface RpcFrameEncodeContext {
+	limits: RpcFrameLimits;
+	/** Legacy bytes by default; managed adds codes and complete correlation to error frames. */
+	managed: boolean;
+}
 
 interface PendingRpcChunks {
 	chunkId: string;
@@ -91,14 +177,21 @@ function encodedMessageSnapshot(encoded: string): { message: unknown } | undefin
  * whole ~4/3-sized base64 transport in memory. The reassembly ceiling is enforced on
  * `Buffer.byteLength` BEFORE any full-payload allocation.
  */
-function* encodeChunkedRpcFrames(frame: object, json: string, chunkId: string): Generator<string> {
+function* encodeChunkedRpcFrames(
+	frame: object,
+	json: string,
+	chunkId: string,
+	context: RpcFrameEncodeContext,
+): Generator<string> {
+	const { limits } = context;
 	const byteLength = Buffer.byteLength(json, "utf8");
-	if (byteLength > MAX_RPC_REASSEMBLED_BYTES) {
-		yield `${JSON.stringify(overflowFrame(frame))}\n`;
+	if (byteLength > limits.maxReassembledFrameBytes) {
+		yield `${JSON.stringify(overflowFrame(frame, context))}\n`;
 		return;
 	}
+	const payloadBytes = chunkPayloadBytes(limits);
 	const bytes = Buffer.from(json, "utf8");
-	const count = Math.ceil(byteLength / RPC_CHUNK_PAYLOAD_BYTES);
+	const count = Math.ceil(byteLength / payloadBytes);
 	for (let index = 0; index < count; index++) {
 		const chunk: RpcChunkFrame = {
 			type: "rpc_chunk",
@@ -106,13 +199,11 @@ function* encodeChunkedRpcFrames(frame: object, json: string, chunkId: string): 
 			index,
 			count,
 			byteLength,
-			data: bytes
-				.subarray(index * RPC_CHUNK_PAYLOAD_BYTES, (index + 1) * RPC_CHUNK_PAYLOAD_BYTES)
-				.toString("base64"),
+			data: bytes.subarray(index * payloadBytes, (index + 1) * payloadBytes).toString("base64"),
 		};
 		const line = `${JSON.stringify(chunk)}\n`;
-		if (serializedFrameBytes(line.slice(0, -1)) > MAX_RPC_FRAME_BYTES)
-			throw new Error("RPC chunk exceeded the transport limit");
+		if (serializedFrameBytes(line.slice(0, -1)) > limits.maxFrameBytes)
+			throw new RpcFrameError("RPC chunk exceeded the transport limit");
 		yield line;
 	}
 }
@@ -127,22 +218,33 @@ function decodeBase64(data: unknown): Buffer {
 		data.length === 0 ||
 		!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(data)
 	)
-		throw new Error("invalid rpc chunk data");
+		throw new RpcFrameError("invalid rpc chunk data");
 	const bytes = Buffer.from(data, "base64");
-	if (bytes.toString("base64") !== data) throw new Error("invalid rpc chunk data");
+	if (bytes.toString("base64") !== data) throw new RpcFrameError("invalid rpc chunk data");
 	return bytes;
 }
 
 /** Reassemble protocol v2 chunk frames after each JSONL line has been parsed. */
 export class RpcFrameDecoder {
 	#pending?: PendingRpcChunks;
+	#limits: RpcFrameLimits = DEFAULT_RPC_FRAME_LIMITS;
+
+	/**
+	 * Apply the negotiated frame limits. They bound the chunk sequences parsed
+	 * after this call — chunk count, per-chunk payload and the reassembled total
+	 * — and never re-interpret a frame that is already assembled.
+	 */
+	setLimits(limits: RpcFrameLimits): void {
+		this.#limits = limits;
+	}
 
 	push(value: unknown): object | undefined {
 		if (!isRpcChunkFrame(value)) {
-			if (this.#pending) throw new Error("rpc chunk sequence interrupted");
-			if (!isRecord(value)) throw new Error("rpc frame must be an object");
+			if (this.#pending) throw new RpcFrameError("rpc chunk sequence interrupted");
+			if (!isRecord(value)) throw new RpcFrameError("rpc frame must be an object");
 			return value;
 		}
+		const limits = this.#limits;
 		const { chunkId, index, count, byteLength } = value;
 		if (
 			typeof chunkId !== "string" ||
@@ -153,17 +255,21 @@ export class RpcFrameDecoder {
 			!Number.isSafeInteger(byteLength) ||
 			index < 0 ||
 			count < 2 ||
-			count > Math.ceil(MAX_RPC_REASSEMBLED_BYTES / RPC_CHUNK_PAYLOAD_BYTES) ||
+			// A chunk carries at most `payloadBytes`, so a sequence cannot declare more
+			// chunks than the frame's length needs — the same bound the fixed-budget
+			// decoder enforced (256 at the defaults), now tracking the negotiated budget.
+			count > Math.ceil(byteLength / chunkPayloadBytes(limits)) ||
 			index >= count ||
-			byteLength < MAX_RPC_FRAME_BYTES ||
-			byteLength > MAX_RPC_REASSEMBLED_BYTES
+			byteLength < limits.maxFrameBytes ||
+			byteLength > limits.maxReassembledFrameBytes
 		)
-			throw new Error("invalid rpc chunk metadata");
+			throw new RpcFrameError("invalid rpc chunk metadata");
 		const bytes = decodeBase64(value.data);
-		if (bytes.byteLength > RPC_CHUNK_PAYLOAD_BYTES) throw new Error("rpc chunk payload exceeds the transport limit");
+		if (bytes.byteLength > chunkPayloadBytes(limits))
+			throw new RpcFrameError("rpc chunk payload exceeds the transport limit");
 
 		if (!this.#pending) {
-			if (index !== 0) throw new Error("rpc chunk sequence must start at index 0");
+			if (index !== 0) throw new RpcFrameError("rpc chunk sequence must start at index 0");
 			this.#pending = { chunkId, count, byteLength, nextIndex: 0, chunks: [], receivedBytes: 0 };
 		}
 		const pending = this.#pending;
@@ -173,18 +279,20 @@ export class RpcFrameDecoder {
 			pending.byteLength !== byteLength ||
 			pending.nextIndex !== index
 		)
-			throw new Error("rpc chunk sequence mismatch");
+			throw new RpcFrameError("rpc chunk sequence mismatch");
 		pending.chunks.push(bytes);
 		pending.receivedBytes += bytes.byteLength;
 		pending.nextIndex++;
-		if (pending.receivedBytes > pending.byteLength) throw new Error("rpc chunk sequence exceeds declared length");
+		if (pending.receivedBytes > pending.byteLength)
+			throw new RpcFrameError("rpc chunk sequence exceeds declared length");
 		if (pending.nextIndex < pending.count) return undefined;
-		if (pending.receivedBytes !== pending.byteLength) throw new Error("rpc chunk sequence length mismatch");
+		if (pending.receivedBytes !== pending.byteLength)
+			throw new RpcFrameError("rpc chunk sequence length mismatch");
 
 		this.#pending = undefined;
 		const decoded = new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(pending.chunks));
 		const frame: unknown = JSON.parse(decoded);
-		if (!isRecord(frame)) throw new Error("rpc frame must be an object");
+		if (!isRecord(frame)) throw new RpcFrameError("rpc frame must be an object");
 		return frame;
 	}
 }
@@ -215,7 +323,11 @@ function compactTerminalFrame(
 	};
 }
 
-function overflowFrame(frame: object): object {
+/**
+ * The legacy overflow frame, byte-for-byte what an unstructured peer already
+ * receives: no error code, metadata truncated to a diagnostic cap.
+ */
+function legacyOverflowFrame(frame: object): object {
 	if (!isRecord(frame)) return { type: "rpc_frame_error", error: "RPC frame exceeded the transport limit" };
 	if (frame.type === "response") {
 		return {
@@ -240,32 +352,77 @@ function overflowFrame(frame: object): object {
 	};
 }
 
+/**
+ * What a peer receives when an envelope cannot be encoded at all. Legacy keeps
+ * the historical uncoded, truncated frame; managed reports it as a real error:
+ * `error` + `message` share the human-readable text, `code` names the taxonomy
+ * entry, and every correlation field arrives complete, so the client can still
+ * attribute the failure to the request that caused it. Truncating or dropping
+ * an identifier here is what turns a failed large reply into a timeout.
+ */
+function overflowFrame(frame: object, context: RpcFrameEncodeContext): object {
+	if (!context.managed) return legacyOverflowFrame(frame);
+	const { correlationId, scope, generation, operationId, id } = readRpcCorrelation(frame);
+	const correlation = {
+		...(id === undefined ? {} : { id }),
+		...(correlationId === undefined ? {} : { correlationId }),
+		...(scope === undefined ? {} : { scope }),
+		...(generation === undefined ? {} : { generation }),
+		...(operationId === undefined ? {} : { operationId }),
+	};
+	const error = "RPC frame exceeded the negotiated transport limit";
+	if (isRecord(frame) && frame.type === "response") {
+		return {
+			...correlation,
+			type: "response",
+			command: typeof frame.command === "string" ? frame.command : "unknown",
+			success: false,
+			error,
+			message: error,
+			code: FRAME_OVERFLOW_ERROR,
+		};
+	}
+	return {
+		...correlation,
+		type: "rpc_frame_error",
+		originalType: isRecord(frame) && typeof frame.type === "string" ? frame.type : undefined,
+		error,
+		message: error,
+		code: FRAME_OVERFLOW_ERROR,
+	};
+}
+
 function encodeRpcFrameFromJson(
 	frame: object,
 	json: string,
 	streamedMessageCount: number,
-	streamedMessages?: readonly unknown[],
+	streamedMessages: readonly unknown[] | undefined,
+	context: RpcFrameEncodeContext,
 ): string {
-	if (serializedFrameBytes(json) <= MAX_RPC_FRAME_BYTES) return `${json}\n`;
+	const { limits } = context;
+	if (serializedFrameBytes(json) <= limits.maxFrameBytes) return `${json}\n`;
 	if (isRecord(frame) && frame.type === "response") {
-		return `${JSON.stringify(overflowFrame(frame))}\n`;
+		return `${JSON.stringify(overflowFrame(frame, context))}\n`;
 	}
 
 	const compacted = compactTerminalFrame(frame, streamedMessageCount, streamedMessages);
 	json = JSON.stringify(compacted);
-	if (serializedFrameBytes(json) <= MAX_RPC_FRAME_BYTES) return `${json}\n`;
+	if (serializedFrameBytes(json) <= limits.maxFrameBytes) return `${json}\n`;
 
 	for (const pass of SHRINK_PASSES) {
 		json = JSON.stringify(shrinkValue(compacted, pass));
-		if (serializedFrameBytes(json) <= MAX_RPC_FRAME_BYTES) return `${json}\n`;
+		if (serializedFrameBytes(json) <= limits.maxFrameBytes) return `${json}\n`;
 	}
 
-	return `${JSON.stringify(overflowFrame(compacted))}\n`;
+	return `${JSON.stringify(overflowFrame(compacted, context))}\n`;
 }
 
 /** Serialize a complete JSONL frame while enforcing the transport byte ceiling. */
 export function encodeRpcFrame(frame: object, streamedMessageCount = 0, streamedMessages?: readonly unknown[]): string {
-	return encodeRpcFrameFromJson(frame, JSON.stringify(frame), streamedMessageCount, streamedMessages);
+	return encodeRpcFrameFromJson(frame, JSON.stringify(frame), streamedMessageCount, streamedMessages, {
+		limits: DEFAULT_RPC_FRAME_LIMITS,
+		managed: false,
+	});
 }
 
 /** Stateful encoder that tracks which messages a client has already received. */
@@ -273,10 +430,33 @@ export class RpcFrameEncoder {
 	#streamedMessages: unknown[] = [];
 	#protocolVersion: RpcProtocolVersion = 1;
 	#chunkCounter = 0;
+	#limits: RpcFrameLimits = DEFAULT_RPC_FRAME_LIMITS;
+	#managed = false;
 
 	setProtocolVersion(version: number): void {
 		if (version !== 1 && version !== 2) throw new Error(`Unsupported RPC protocol version: ${version}`);
 		this.#protocolVersion = version;
+	}
+
+	/**
+	 * Apply the negotiated frame limits. They govern the frames this encoder
+	 * produces from now on: chunk payload sizing, the per-physical-frame ceiling
+	 * and the reassembled ceiling. An iterable already returned by
+	 * {@link RpcFrameEncoder.encodeFrames} keeps the chunk layout it was built
+	 * with — negotiation never re-chunks work that is already queued.
+	 */
+	setLimits(limits: RpcFrameLimits): void {
+		this.#limits = limits;
+	}
+
+	/**
+	 * Choose what an unencodable envelope is reported as. Off (the default) is
+	 * the legacy frame, byte-for-byte; on adds the managed error shape — code,
+	 * message and the complete correlation envelope — for peers that speak the
+	 * managed protocol.
+	 */
+	setManagedEnvelope(enabled: boolean): void {
+		this.#managed = enabled;
 	}
 
 	/**
@@ -288,20 +468,27 @@ export class RpcFrameEncoder {
 	encodeFrames(frame: object): Iterable<string> {
 		if (isRecord(frame) && frame.type === "agent_start") this.#streamedMessages = [];
 		const json = JSON.stringify(frame);
+		const context: RpcFrameEncodeContext = { limits: this.#limits, managed: this.#managed };
 		let frames: Iterable<string>;
 		let singleFrame: string | undefined;
-		if (this.#protocolVersion === 2 && serializedFrameBytes(json) > MAX_RPC_FRAME_BYTES) {
+		if (this.#protocolVersion === 2 && serializedFrameBytes(json) > this.#limits.maxFrameBytes) {
 			const compacted = compactTerminalFrame(frame, this.#streamedMessages.length, this.#streamedMessages);
 			// Reuse the original serialization when compaction was a no-op.
 			const compactedJson = compacted === frame ? json : JSON.stringify(compacted);
-			if (serializedFrameBytes(compactedJson) > MAX_RPC_FRAME_BYTES) {
-				frames = encodeChunkedRpcFrames(compacted, compactedJson, `rpc-${++this.#chunkCounter}`);
+			if (serializedFrameBytes(compactedJson) > this.#limits.maxFrameBytes) {
+				frames = encodeChunkedRpcFrames(compacted, compactedJson, `rpc-${++this.#chunkCounter}`, context);
 			} else {
 				singleFrame = `${compactedJson}\n`;
 				frames = [singleFrame];
 			}
 		} else {
-			singleFrame = encodeRpcFrameFromJson(frame, json, this.#streamedMessages.length, this.#streamedMessages);
+			singleFrame = encodeRpcFrameFromJson(
+				frame,
+				json,
+				this.#streamedMessages.length,
+				this.#streamedMessages,
+				context,
+			);
 			frames = [singleFrame];
 		}
 		if (!isRecord(frame)) return frames;

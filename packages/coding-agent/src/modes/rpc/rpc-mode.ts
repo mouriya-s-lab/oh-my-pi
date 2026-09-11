@@ -13,7 +13,7 @@
 import { once } from "node:events";
 import { getOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
 import { toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
-import { $env, isRecord, Snowflake } from "@oh-my-pi/pi-utils";
+import { $env, isRecord, Snowflake, withTimeout } from "@oh-my-pi/pi-utils";
 import { reset as resetCapabilities } from "../../capability";
 import { clearPluginRootsAndCaches, resolveActiveProjectRegistryPath } from "../../discovery/helpers";
 import {
@@ -33,6 +33,8 @@ import { loadSlashCommands } from "../../extensibility/slash-commands";
 import { type Theme, theme } from "../../modes/theme/theme";
 import type { AgentSession } from "../../session/agent-session";
 import { SKILL_PROMPT_MESSAGE_TYPE, USER_INTERRUPT_LABEL } from "../../session/messages";
+import { type AgentEndpoint, ENDPOINT_STILL_OWNED_REFUSAL } from "../../task/endpoint";
+import { LocalAgentEndpoint, type LocalTerminalResult } from "../../task/endpoint/local";
 import { executeAcpBuiltinSlashCommand } from "../../slash-commands/acp-builtins";
 import { buildAvailableSlashCommands } from "../../slash-commands/available-commands";
 import { defaultLoadModeForToolName } from "../../tools/essential-tools";
@@ -41,12 +43,25 @@ import { calculateTokensPerSecond } from "../../utils/token-rate";
 import { initializeExtensions } from "../runtime-init";
 import { isRpcHostToolResult, isRpcHostToolUpdate, RpcHostToolBridge } from "./host-tools";
 import { isRpcHostUriResult, RpcHostUriBridge } from "./host-uris";
-import { MAX_RPC_FRAME_BYTES, MAX_RPC_REASSEMBLED_BYTES, RpcFrameEncoder } from "./rpc-frame";
+import { createLeaseState, isLeaseExpired, negotiateLease, tickLease, type LeaseState } from "./lease";
+import {
+	DEFAULT_RPC_FRAME_LIMITS,
+	MAX_RPC_FRAME_BYTES,
+	MAX_RPC_REASSEMBLED_BYTES,
+	MAX_RPC_RESOURCE_CHUNK_BYTES,
+	negotiateRpcFrameLimits,
+	RpcFrameDecoder,
+	RpcFrameEncoder,
+} from "./rpc-frame";
 import { claimRpcInput, readRpcInputFrames } from "./rpc-input";
 import { pageRpcMessages, RPC_MESSAGES_PAGE_BUSY_ERROR, RpcMessagesPageError } from "./rpc-messages";
 import { RpcSubagentRegistry, readRpcSubagentTranscript } from "./rpc-subagents";
+import { isRpcErrorCode, MANAGED_NATIVE_AGENT_CAPABILITIES, readRpcCorrelation } from "./rpc-types";
 import type {
 	RpcCommand,
+	RpcCancelRunResult,
+	RpcCorrelationFields,
+	RpcErrorCode,
 	RpcExtensionUIRequest,
 	RpcExtensionUIResponse,
 	RpcExtensionUISelectOptionDetail,
@@ -58,8 +73,10 @@ import type {
 	RpcHostUriCancelRequest,
 	RpcHostUriRequest,
 	RpcHostUriResult,
+	RpcManagedErrorResponse,
 	RpcReadyFrame,
 	RpcResponse,
+	RpcResumeResult,
 	RpcSessionState,
 	RpcSubagentSubscriptionLevel,
 } from "./rpc-types";
@@ -246,6 +263,13 @@ type RpcExtensionUserMessageScope = {
  */
 export class RpcExtensionUserMessageTracker {
 	#activePromptScopes = new Set<RpcExtensionUserMessageScope>();
+	readonly #onPromptTask: ((task: Promise<unknown>) => void) | undefined;
+	readonly #beforePrompt: (() => void) | undefined;
+
+	constructor(onPromptTask?: (task: Promise<unknown>) => void, beforePrompt?: () => void) {
+		this.#onPromptTask = onPromptTask;
+		this.#beforePrompt = beforePrompt;
+	}
 
 	markAgentMessageTask(): void {
 		for (const scope of this.#activePromptScopes) {
@@ -290,7 +314,9 @@ export class RpcExtensionUserMessageTracker {
 		this.#activePromptScopes.add(scope);
 		let prompt: Promise<T>;
 		try {
+			this.#beforePrompt?.();
 			prompt = startPrompt();
+			this.#onPromptTask?.(prompt);
 		} catch (error) {
 			this.#activePromptScopes.delete(scope);
 			throw error;
@@ -336,6 +362,11 @@ export interface RpcInputFrameDeps {
 	onHostToolResult: (frame: RpcHostToolResult) => void;
 	onHostToolUpdate: (frame: RpcHostToolUpdate) => void;
 	onHostUriResult: (frame: RpcHostUriResult) => void;
+	managed?: boolean;
+	runOnCancelRun?: (runId: string) => Promise<RpcCancelRunResult>;
+	runOnTerminate?: (peerId?: string) => Promise<void>;
+	onControlFrame?: () => void;
+	afterResponse?: (command: RpcCommand, response: RpcResponse) => Promise<void>;
 }
 
 /**
@@ -349,8 +380,116 @@ function isRpcExtensionUIResponse(value: unknown): value is RpcExtensionUIRespon
 	return value.type === "extension_ui_response" && typeof value.id === "string";
 }
 
+function managedErrorCode(value: unknown, fallback: RpcErrorCode = "remote-execution-failed"): RpcErrorCode {
+	return isRpcErrorCode(value) ? value : fallback;
+}
+
+class ManagedRpcError extends Error {
+	constructor(readonly code: RpcErrorCode, message: string) {
+		super(message);
+	}
+}
+
+function managedErrorResponse(
+	request: unknown,
+	command: string,
+	message: string,
+	code: RpcErrorCode,
+): RpcManagedErrorResponse & RpcCorrelationFields {
+	return { ...readRpcCorrelation(request), type: "response", command, success: false, error: message, message, code };
+}
+
+type RpcManagedControlCommand = Extract<RpcCommand, {
+	type: "get_state" | "abort" | "abort_bash" | "heartbeat" | "cancel_run" | "terminate" | "park" | "resume";
+}>;
+
+function parseManagedControlCommand(value: unknown): RpcManagedControlCommand | undefined {
+	if (!isRecord(value)) return undefined;
+	const correlation = readRpcCorrelation(value);
+	switch (value.type) {
+		case "get_state":
+		case "abort":
+		case "abort_bash":
+		case "heartbeat":
+			return { ...correlation, type: value.type };
+		case "cancel_run":
+		case "park":
+			if (typeof value.runId === "string") return { ...correlation, type: value.type, runId: value.runId };
+			throw new ManagedRpcError("protocol-incompatible", "Invalid managed control command");
+		case "terminate":
+			if (value.peerId === undefined) return { ...correlation, type: "terminate" };
+			if (typeof value.peerId === "string") return { ...correlation, type: "terminate", peerId: value.peerId };
+			throw new ManagedRpcError("protocol-incompatible", "Invalid managed control command");
+		case "resume":
+			if (typeof value.reference !== "string" ||
+				(value.expectedRunId !== undefined && typeof value.expectedRunId !== "string")) {
+				throw new ManagedRpcError("protocol-incompatible", "Invalid managed control command");
+			}
+			return {
+				...correlation, type: "resume", reference: value.reference,
+				...(typeof value.expectedRunId === "string" ? { expectedRunId: value.expectedRunId } : {}),
+			};
+		default:
+			return undefined;
+	}
+}
+
+function correlateManagedResponse(response: RpcResponse, request: unknown): RpcResponse {
+	if (response.success) return { ...response, ...readRpcCorrelation(request) };
+	return {
+		...response,
+		...readRpcCorrelation(request),
+		message: response.error,
+		code: managedErrorCode(response.code),
+	};
+}
+
+async function dispatchManagedCommand(command: RpcCommand, deps: RpcInputFrameDeps): Promise<void> {
+	let response: RpcResponse;
+	try {
+		if (command.type === "cancel_run" && deps.runOnCancelRun) {
+			response = { type: "response", command: "cancel_run", success: true, data: await deps.runOnCancelRun(command.runId) };
+		} else if (command.type === "terminate" && deps.runOnTerminate) {
+			await deps.runOnTerminate(command.peerId);
+			response = { type: "response", command: "terminate", success: true, data: { acknowledged: true } };
+		} else {
+			response = await deps.handleCommand(command);
+		}
+	} catch (err: unknown) {
+		const message = err instanceof Error ? err.message : String(err);
+		response = managedErrorResponse(command, command.type, message,
+			err instanceof ManagedRpcError ? err.code : "remote-execution-failed");
+	}
+	response = correlateManagedResponse(response, command);
+	deps.output(response);
+	await deps.afterResponse?.(command, response);
+}
+
 /** Dispatch side-channel frames that must overtake the serialized command queue. */
 export function dispatchRpcControlFrame(parsed: unknown, deps: RpcInputFrameDeps): boolean {
+	if (deps.managed && isRecord(parsed) && parsed.type === "response" &&
+		parsed.command === "heartbeat" && parsed.success === true) {
+		deps.onControlFrame?.();
+		return true;
+	}
+	if (deps.managed) {
+		let command: RpcManagedControlCommand | undefined;
+		try {
+			command = parseManagedControlCommand(parsed);
+		} catch (failure) {
+			const commandType = isRecord(parsed) && typeof parsed.type === "string" ? parsed.type : "parse";
+			const message = failure instanceof Error ? failure.message : String(failure);
+			deps.output(managedErrorResponse(parsed, commandType, message, "protocol-incompatible"));
+			return true;
+		}
+		if (command) {
+			deps.onControlFrame?.();
+			const task = dispatchManagedCommand(command, deps);
+			deps.trackBackgroundTask?.(task);
+			return true;
+		}
+	}
+
 	if (isRpcExtensionUIResponse(parsed)) {
 		const pending = deps.pendingExtensionRequests.get(parsed.id);
 		if (pending) pending.resolve(parsed);
@@ -392,6 +531,15 @@ export function dispatchRpcControlFrame(parsed: unknown, deps: RpcInputFrameDeps
  */
 export function dispatchRpcInputFrame(parsed: unknown, deps: RpcInputFrameDeps): Promise<void> | undefined {
 	if (dispatchRpcControlFrame(parsed, deps)) return undefined;
+	if (deps.managed) {
+		const command = parsed as RpcCommand;
+		const task = dispatchManagedCommand(command, deps);
+		if (command.type === "bash") {
+			deps.trackBackgroundTask?.(task);
+			return undefined;
+		}
+		return task;
+	}
 	// Regular RPC command. The transport contract states each remaining frame
 	// is an {@link RpcCommand}; `handleCommand`'s `default` arm surfaces
 	// unknown discriminants as an error response, so we do not shape-check
@@ -428,8 +576,23 @@ export class RpcInputDispatcher {
 	readonly #afterSerialCommand: (() => Promise<void>) | undefined;
 	readonly #managed: boolean;
 
-	constructor(options: { deps: RpcInputFrameDeps; afterSerialCommand?: () => Promise<void>; managed?: boolean }) {
-		this.#deps = options.deps;
+	constructor(options: {
+		deps: RpcInputFrameDeps;
+		afterSerialCommand?: () => Promise<void>;
+		managed?: boolean;
+		runOnCancelRun?: (runId: string) => Promise<RpcCancelRunResult>;
+		runOnTerminate?: (peerId?: string) => Promise<void>;
+	}) {
+		this.#deps = options.managed ? {
+			...options.deps,
+			managed: true,
+			runOnCancelRun: options.runOnCancelRun ?? options.deps.runOnCancelRun,
+			runOnTerminate: options.runOnTerminate ?? options.deps.runOnTerminate,
+			trackBackgroundTask: task => {
+				this.#track(task);
+				options.deps.trackBackgroundTask?.(task);
+			},
+		} : options.deps;
 		this.#afterSerialCommand = options.afterSerialCommand;
 		this.#managed = options.managed === true;
 	}
@@ -437,6 +600,10 @@ export class RpcInputDispatcher {
 	/** Accept a parsed input frame without blocking the stdin reader. */
 	dispatch(parsed: unknown): void {
 		try {
+			if (this.#managed && (!isRecord(parsed) || typeof parsed.type !== "string")) {
+				this.#deps.output(managedErrorResponse(parsed, "parse", "Invalid RPC command object", "protocol-incompatible"));
+				return;
+			}
 			if (dispatchRpcControlFrame(parsed, this.#deps)) return;
 
 			const command = parsed as RpcCommand;
@@ -445,24 +612,27 @@ export class RpcInputDispatcher {
 				return;
 			}
 
-			const isManagedControl =
-				this.#managed &&
-				(command.type === "get_state" || command.type === "abort" || command.type === "abort_bash");
-			const task = isManagedControl
-				? this.#dispatchCommand(command)
-				: this.#tail.then(
-						() => this.#dispatchCommand(command),
-						() => this.#dispatchCommand(command),
-					);
-			if (!isManagedControl) this.#tail = task.catch(() => {});
-			this.#tasks.add(task);
-			void task.finally(() => {
-				this.#tasks.delete(task);
-			});
+			const task = this.#tail.then(
+				() => this.#dispatchCommand(command),
+				() => this.#dispatchCommand(command),
+			);
+			this.#tail = task.catch(() => {});
+			this.#track(task);
 		} catch (err: unknown) {
 			const message = err instanceof Error ? err.message : String(err);
-			this.#deps.output(this.#deps.errorResponse(undefined, "parse", `Failed to parse command: ${message}`));
+			const parseMessage = `Failed to parse command: ${message}`;
+			this.#deps.output(this.#managed
+				? managedErrorResponse(parsed, "parse", parseMessage, "protocol-incompatible")
+				: this.#deps.errorResponse(undefined, "parse", parseMessage));
 		}
+	}
+
+	#track(task: Promise<void>): void {
+		this.#tasks.add(task);
+		void task.then(
+			() => this.#tasks.delete(task),
+			() => this.#tasks.delete(task),
+		);
 	}
 
 	/** Await serial and managed control commands, including commands queued before EOF. */
@@ -478,7 +648,8 @@ export class RpcInputDispatcher {
 			if (awaited) await awaited;
 		} catch (err: unknown) {
 			const message = err instanceof Error ? err.message : String(err);
-			this.#deps.output(this.#deps.errorResponse(command.id, command.type, message));
+			const response = this.#deps.errorResponse(command.id, command.type, message);
+			this.#deps.output(this.#managed ? correlateManagedResponse(response, command) : response);
 		} finally {
 			await this.#afterSerialCommand?.();
 		}
@@ -503,13 +674,13 @@ export class RpcShutdownCoordinator {
 	readonly #isShutdownRequested: () => boolean;
 	readonly #performShutdown: () => Promise<void>;
 	readonly #managed: boolean;
-	readonly #runOnManagedEof: (() => void) | undefined;
+	readonly #runOnManagedEof: (() => void | Promise<void>) | undefined;
 
 	constructor(options: {
 		isShutdownRequested: () => boolean;
 		performShutdown: () => Promise<void>;
 		managed?: boolean;
-		runOnManagedEof?: () => void;
+		runOnManagedEof?: () => void | Promise<void>;
 	}) {
 		this.#isShutdownRequested = options.isShutdownRequested;
 		this.#performShutdown = options.performShutdown;
@@ -535,9 +706,15 @@ export class RpcShutdownCoordinator {
 
 	/** Cancel managed work before draining; legacy EOF still only drains. */
 	async handleEof(dispatcher: RpcInputDispatcher): Promise<void> {
-		// Cancel-then-drain proves issue #4 acceptance #3 wiring. Heartbeat,
-		// lease and the full cleanup taxonomy remain Stage-2 (issue #9).
-		if (this.#managed) this.#runOnManagedEof?.();
+		if (this.#managed) {
+			await this.#runOnManagedEof?.();
+			await withTimeout(
+				Promise.all([dispatcher.drain(), this.drain()]),
+				MANAGED_CLEANUP_TIMEOUT_MS,
+				"Managed shutdown drain timed out",
+			).catch(() => {});
+			return;
+		}
 		await dispatcher.drain();
 		await this.drain();
 	}
@@ -556,7 +733,10 @@ export class RpcShutdownCoordinator {
 	checkShutdownRequested(): Promise<void> {
 		if (!this.#shutdown) {
 			if (!this.#isShutdownRequested()) return Promise.resolve();
-			this.#shutdown = this.drain().then(() => this.#performShutdown());
+			const drain = this.#managed
+				? withTimeout(this.drain(), MANAGED_CLEANUP_TIMEOUT_MS, "Managed shutdown drain timed out").catch(() => {})
+				: this.drain();
+			this.#shutdown = drain.then(() => this.#performShutdown());
 		}
 		return this.#shutdown;
 	}
@@ -801,13 +981,53 @@ export function createRpcReadyFrame(managed = false): RpcReadyFrame {
 		maxReassembledFrameBytes: MAX_RPC_REASSEMBLED_BYTES,
 	};
 	if (managed) {
+		const lease = createLeaseState();
+		frame.maxResourceChunkBytes = MAX_RPC_RESOURCE_CHUNK_BYTES;
 		frame.nativeAgent = {
 			protocolMajor: 1,
-			capabilities: ["managed-bootstrap/v0", "control-side-channel/v0"],
+			capabilities: MANAGED_NATIVE_AGENT_CAPABILITIES,
+			proposed: { heartbeatSeconds: lease.heartbeatSeconds, leaseSeconds: lease.leaseSeconds },
 		};
 	}
 	return frame;
 }
+
+/** Resume the endpoint's existing session, never allocate a replacement session. */
+export async function resumeManagedEndpoint(
+	endpoint: AgentEndpoint,
+	reference: string,
+	expectedRunId?: string,
+): Promise<RpcResumeResult> {
+	const before = await endpoint.snapshot();
+	if (expectedRunId !== undefined && before.snapshot.runId !== expectedRunId) {
+		throw new ManagedRpcError("resource-unavailable", `Resume reference does not own run ${expectedRunId}`);
+	}
+	const acknowledgement = await endpoint.ensureLive(reference);
+	if (!acknowledgement.acknowledged) {
+		if (!acknowledgement.reason.startsWith(ENDPOINT_STILL_OWNED_REFUSAL)) {
+			throw new ManagedRpcError("resource-unavailable", acknowledgement.reason);
+		}
+		return { status: "still-owned", detail: acknowledgement.reason };
+	}
+	const { snapshot } = await endpoint.snapshot();
+	if (snapshot.runId === null) {
+		throw new ManagedRpcError("resource-unavailable", "Resume reference has no existing run");
+	}
+	return { status: "reopened", snapshot, runId: snapshot.runId };
+}
+
+interface ManagedRpcRun {
+	runId: string;
+	command: "bash" | "prompt";
+	endpoint: AgentEndpoint;
+	terminal: PromiseWithResolvers<LocalTerminalResult>;
+	abortController: AbortController;
+	promptTasks?: Promise<unknown>[];
+	outcome?: LocalTerminalResult;
+	cleanup?: Promise<RpcCancelRunResult>;
+}
+
+const MANAGED_CLEANUP_TIMEOUT_MS = 3_000;
 
 /**
  * Run in RPC mode.
@@ -828,6 +1048,9 @@ export async function runRpcMode(
 	process.env.PI_NOTIFICATIONS = "off";
 
 	const frameEncoder = new RpcFrameEncoder();
+	const frameDecoder = new RpcFrameDecoder();
+	let managedFrameLimits = DEFAULT_RPC_FRAME_LIMITS;
+	if (options.managed) frameEncoder.setManagedEnvelope(true);
 	// Ordered stdout writer honoring backpressure: chunked v2 frames are produced
 	// lazily by the encoder and written one physical line at a time, so a near-limit
 	// logical frame never materializes its full base64 transport in memory.
@@ -843,10 +1066,25 @@ export async function runRpcMode(
 			.catch(() => {});
 	};
 	writeFrames(frameEncoder.encodeFrames(createRpcReadyFrame(options.managed)));
+	const flushStdout = async (): Promise<void> => {
+		await stdoutQueue;
+		if (process.stdout.destroyed) return;
+		const drained = Promise.withResolvers<void>();
+		// A successful write() only means "below highWaterMark", not delivered.
+		// Its callback is the barrier before acknowledging drained replies or exiting.
+		process.stdout.write("", () => drained.resolve());
+		await drained.promise;
+	};
 	const output = (obj: RpcResponse | RpcExtensionUIRequest | object) => {
 		writeFrames(frameEncoder.encodeFrames(obj));
-		if (isRecord(obj) && obj.type === "response" && obj.command === "negotiate_protocol" && obj.success === true)
+		if (isRecord(obj) && obj.type === "response" && "command" in obj && obj.command === "negotiate_protocol" &&
+			"success" in obj && obj.success === true) {
 			frameEncoder.setProtocolVersion(2);
+			if (options.managed) {
+				frameEncoder.setLimits(managedFrameLimits);
+				frameDecoder.setLimits(managedFrameLimits);
+			}
+		}
 	};
 	const emitRpcTitles = shouldEmitRpcTitles();
 
@@ -862,10 +1100,24 @@ export async function runRpcMode(
 	};
 
 	const error = (id: string | undefined, command: string, message: string, code?: string): RpcResponse => {
+		if (options.managed) {
+			return {
+				id, type: "response", command, success: false, error: message, message,
+				code: managedErrorCode(code, command === "parse" || command === "negotiate_protocol"
+					? "protocol-incompatible" : "remote-execution-failed"),
+			};
+		}
 		return { id, type: "response", command, success: false, error: message, ...(code ? { code } : {}) };
 	};
 
-	const extensionUserMessageTracker = new RpcExtensionUserMessageTracker();
+	let currentModelRun: ManagedRpcRun | undefined;
+	const extensionUserMessageTracker = new RpcExtensionUserMessageTracker(options.managed ? task => {
+		currentModelRun?.promptTasks?.push(task);
+	} : undefined, options.managed ? () => {
+		if (managedClosing || currentModelRun?.abortController.signal.aborted) {
+			throw new ManagedRpcError("user-cancelled", "Managed prompt was cancelled before execution");
+		}
+	} : undefined);
 
 	const pendingExtensionRequests = new RpcPendingExtensionRequests();
 	const hostToolBridge = new RpcHostToolBridge(output);
@@ -874,6 +1126,145 @@ export async function runRpcMode(
 
 	// Shutdown request flag (wrapped in object to allow mutation with const)
 	const shutdownState = { requested: false };
+	const managedRuns = new Map<string, ManagedRpcRun>();
+	const managedCommandRuns = new WeakMap<RpcCommand, ManagedRpcRun>();
+	const resumeEndpoints = new Map<string, AgentEndpoint>();
+	let managedClosing = false;
+	let managedLease: LeaseState | undefined;
+	let leaseTimer: NodeJS.Timeout | undefined;
+	let heartbeatTimer: NodeJS.Timeout | undefined;
+	const stopManagedTimers = (): void => {
+		clearInterval(leaseTimer);
+		clearInterval(heartbeatTimer);
+		leaseTimer = undefined;
+		heartbeatTimer = undefined;
+	};
+	let managedDisposal: Promise<boolean> | undefined;
+	const disposeRpcSession = async (): Promise<boolean> => {
+		if (!options.managed) {
+			await session.dispose();
+			return true;
+		}
+		managedDisposal ??= withTimeout(session.dispose(), MANAGED_CLEANUP_TIMEOUT_MS,
+			"Managed session disposal timed out").then(() => true, failure => {
+				output(error(undefined, "terminate", failure instanceof Error ? failure.message : String(failure), "timeout"));
+				return false;
+			});
+		return managedDisposal;
+	};
+	const cancelOwnedJobs = async (signal: AbortSignal): Promise<void> => {
+		const manager = session.asyncJobManager;
+		const ownerId = session.getAgentId();
+		if (!manager || !ownerId) return;
+		const jobs = manager.getAllJobs({ ownerId });
+		manager.acknowledgeDeliveries(jobs.map(job => job.id));
+		manager.cancelAll({ ownerId }, USER_INTERRUPT_LABEL);
+		const result = await manager.waitForOwnerJobsAndReplies(ownerId, signal);
+		if (result.status !== "drained") throw new ManagedRpcError("timeout", "Owned job replies did not drain");
+	};
+	const beginManagedRun = async (command: RpcCommand, kind: "bash" | "prompt"): Promise<ManagedRpcRun> => {
+		if (managedClosing) throw new ManagedRpcError("connection-lost", "Managed peer is shutting down");
+		if (kind === "prompt" && [...managedRuns.values()].some(run =>
+			run.command === "prompt" && run.endpoint.asHandleSnapshot().status === "running")) {
+			throw new ManagedRpcError("resource-unavailable", "A model run still owns the session");
+		}
+		const terminal = Promise.withResolvers<LocalTerminalResult>();
+		const abortController = new AbortController();
+		const endpoint = new LocalAgentEndpoint({
+			session,
+			agent: session.getAgentId() ?? session.sessionId,
+			managed: true,
+			awaitTerminal: () => terminal.promise,
+			cancelRun: async () => {
+				abortController.abort();
+				if (kind === "prompt") {
+					const owned = cancelOwnedJobs(AbortSignal.timeout(MANAGED_CLEANUP_TIMEOUT_MS));
+					await session.abort({ reason: USER_INTERRUPT_LABEL, preserveBash: true });
+					await owned;
+				}
+			},
+			terminate: () => session.dispose(),
+		});
+		const ack = await endpoint.start(kind);
+		const run: ManagedRpcRun = { runId: ack.runId, command: kind, endpoint, terminal, abortController };
+		managedRuns.set(run.runId, run);
+		managedCommandRuns.set(command, run);
+		void endpoint.run(run.runId);
+		if (managedClosing) {
+			abortController.abort();
+			terminal.resolve({ status: "cancelled" });
+			throw new ManagedRpcError("connection-lost", "Managed peer closed before execution started");
+		}
+		output({ type: "managed_run_start", runId: run.runId, command: kind, ...readRpcCorrelation(command) });
+		return run;
+	};
+	const finishManagedRun = async (run: ManagedRpcRun, outcome: LocalTerminalResult): Promise<void> => {
+		run.outcome = outcome;
+		await flushStdout();
+		run.terminal.resolve(outcome);
+		await run.endpoint.waitReplyDrained(run.runId);
+		output({ type: "managed_run_end", runId: run.runId, status: outcome.status, replyDrained: true });
+	};
+	const runOnCancelRun = async (runId: string): Promise<RpcCancelRunResult> => {
+		const run = managedRuns.get(runId);
+		if (!run) throw new ManagedRpcError("resource-unavailable", `Unknown managed run: ${runId}`);
+		if (run.cleanup) return run.cleanup;
+		output({ type: "managed_lifecycle", phase: "cancel_run", runId });
+		const cleanup = async (): Promise<RpcCancelRunResult> => {
+			const abort = new AbortController();
+			try {
+				await withTimeout((async () => {
+					await run.endpoint.cancelRun(runId);
+					const drained = await run.endpoint.waitReplyDrained(runId, { signal: abort.signal });
+					if (drained.status !== "drained") throw new ManagedRpcError("timeout", `Reply cleanup timed out for ${runId}`);
+					await flushStdout();
+				})(), MANAGED_CLEANUP_TIMEOUT_MS, `Cancellation cleanup timed out for ${runId}`);
+				return { status: "cancelled", replyDrained: true };
+			} catch (failure) {
+				return { status: "cleanup-unconfirmed", detail: failure instanceof Error ? failure.message : String(failure) };
+			} finally {
+				abort.abort();
+			}
+		};
+		run.cleanup = cleanup();
+		return run.cleanup;
+	};
+	const closeManagedWork = async (reason: "eof" | "lease" | "terminate"): Promise<boolean> => {
+		managedClosing = true;
+		stopManagedTimers();
+		pendingExtensionRequests.rejectAll("Managed peer is shutting down");
+		hostToolBridge.close("Managed peer is shutting down");
+		hostUriBridge.clear("Managed peer is shutting down");
+		const active = [...managedRuns.values()].filter(run => run.endpoint.asHandleSnapshot().status === "running");
+		// Invoke every cancellation before waiting for any one cleanup.
+		const cancellations = active.map(run => runOnCancelRun(run.runId));
+		const owned = cancelOwnedJobs(AbortSignal.timeout(MANAGED_CLEANUP_TIMEOUT_MS)).then(() => true, failure => {
+			output(error(undefined, "cancel_run", failure instanceof Error ? failure.message : String(failure), "timeout"));
+			return false;
+		});
+		const results = await Promise.all(cancellations);
+		const ownedDrained = await owned;
+		for (let index = 0; index < results.length; index++) {
+			output({ type: "managed_lifecycle", phase: "cleanup", reason, runId: active[index].runId, ...results[index] });
+		}
+		if (reason === "lease") {
+			for (const run of managedRuns.values()) {
+				const ack = await run.endpoint.park(run.runId);
+				output({ type: "managed_lifecycle", phase: "park", reason, runId: run.runId, ...ack });
+			}
+		}
+		output({ type: "managed_lifecycle", phase: "drain", reason });
+		return ownedDrained && results.every(result => result.status === "cancelled");
+	};
+	const runOnTerminate = async (peerId?: string): Promise<void> => {
+		if (peerId !== undefined && peerId !== session.getAgentId() && peerId !== session.sessionId) {
+			throw new ManagedRpcError("resource-unavailable", `Unknown managed peer: ${peerId}`);
+		}
+		const cleaned = await closeManagedWork("terminate");
+		const disposed = await disposeRpcSession();
+		shutdownState.requested = true;
+		if (!cleaned || !disposed) throw new ManagedRpcError("timeout", "Managed termination cleanup is unconfirmed");
+	};
 
 	/**
 	 * Extension UI context that uses the RPC protocol.
@@ -1073,7 +1464,10 @@ export async function runRpcMode(
 			output(error(undefined, action, err.message));
 		},
 		reportRuntimeError: err => {
-			output({ type: "extension_error", extensionPath: err.extensionPath, event: err.event, error: err.error });
+			output({
+				type: "extension_error", extensionPath: err.extensionPath, event: err.event, error: err.error,
+				...(options.managed ? { message: err.error, code: "remote-execution-failed" } : {}),
+			});
 		},
 		onShutdown: () => {
 			shutdownState.requested = true;
@@ -1115,12 +1509,74 @@ export async function runRpcMode(
 	// Handle a single command
 	const handleCommand = async (command: RpcCommand): Promise<RpcResponse> => {
 		const id = command.id;
+		if (options.managed && managedClosing && command.type !== "get_state" && command.type !== "heartbeat") {
+			throw new ManagedRpcError("connection-lost", "Managed peer is shutting down");
+		}
 
 		switch (command.type) {
 			case "negotiate_protocol": {
 				if (command.protocolVersion !== 2)
 					return error(id, "negotiate_protocol", `Unsupported RPC protocol version: ${command.protocolVersion}`);
+				if (options.managed) {
+					managedFrameLimits = negotiateRpcFrameLimits(command, DEFAULT_RPC_FRAME_LIMITS);
+					return success(id, "negotiate_protocol", { protocolVersion: 2, ...managedFrameLimits });
+				}
 				return success(id, "negotiate_protocol", { protocolVersion: 2 });
+			}
+
+			case "prepare": {
+				if (!options.managed) return error(undefined, command.type, `Unknown command: ${command.type}`);
+				const proposed = createLeaseState();
+				const negotiated = negotiateLease({
+					heartbeatSeconds: command.heartbeatSeconds ?? proposed.heartbeatSeconds,
+					leaseSeconds: command.leaseSeconds ?? proposed.leaseSeconds,
+				}, proposed);
+				managedLease = createLeaseState(Date.now(), negotiated);
+				stopManagedTimers();
+				heartbeatTimer = setInterval(() => output({ type: "heartbeat" }), negotiated.heartbeatSeconds * 1_000);
+				leaseTimer = setInterval(() => {
+					if (!managedLease || managedClosing || !isLeaseExpired(managedLease)) return;
+					stopManagedTimers();
+					output(error(undefined, "heartbeat", "Managed receive lease expired", "connection-lost"));
+					void (async () => {
+						await closeManagedWork("lease");
+						await shutdownCoordinator.handleEof(inputDispatcher);
+						await disposeRpcSession();
+						await flushStdout();
+						process.exit(0);
+					})();
+				}, Math.min(negotiated.heartbeatSeconds * 1_000, 250));
+				return success(id, "prepare", negotiated);
+			}
+
+			case "heartbeat": {
+				if (!options.managed) return error(undefined, command.type, `Unknown command: ${command.type}`);
+				return success(id, "heartbeat");
+			}
+
+			case "cancel_run":
+			case "terminate":
+				return error(options.managed ? id : undefined, command.type, `Unknown command: ${command.type}`);
+
+			case "park": {
+				if (!options.managed) return error(undefined, command.type, `Unknown command: ${command.type}`);
+				const run = managedRuns.get(command.runId);
+				if (!run) throw new ManagedRpcError("resource-unavailable", `Unknown managed run: ${command.runId}`);
+				const acknowledgement = await run.endpoint.park(command.runId);
+				if (acknowledgement.acknowledged && acknowledgement.resumeReference) {
+					resumeEndpoints.set(acknowledgement.resumeReference, run.endpoint);
+				}
+				return success(id, "park", acknowledgement);
+			}
+
+			case "resume": {
+				if (!options.managed) return error(undefined, command.type, `Unknown command: ${command.type}`);
+				const endpoint = resumeEndpoints.get(command.reference);
+				if (!endpoint) throw new ManagedRpcError("resource-unavailable", `Unknown resume reference: ${command.reference}`);
+				if ([...managedRuns.values()].some(run => run.endpoint.asHandleSnapshot().status === "running")) {
+					return success(id, "resume", { status: "still-owned", detail: "The existing session still owns active work" });
+				}
+				return success(id, "resume", await resumeManagedEndpoint(endpoint, command.reference, command.expectedRunId));
 			}
 
 			// =================================================================
@@ -1128,13 +1584,19 @@ export async function runRpcMode(
 			// =================================================================
 
 			case "prompt": {
+				if (options.managed) {
+					currentModelRun = await beginManagedRun(command, "prompt");
+					currentModelRun.promptTasks = [];
+				}
 				const skillResult = await dispatchRpcSkillPrompt({
 					id,
 					session,
 					message: command.message,
 					streamingBehavior: command.streamingBehavior,
 					output,
-					onError: promptError => output(error(id, "prompt", promptError.message)),
+					onError: promptError => output(options.managed
+						? correlateManagedResponse(error(id, "prompt", promptError.message), command)
+						: error(id, "prompt", promptError.message)),
 					extensionUserMessageTracker,
 				});
 				if (skillResult) {
@@ -1162,7 +1624,9 @@ export async function runRpcMode(
 							id,
 							startPrompt: () => session.prompt(builtinResult.prompt, { images: command.images }),
 							output,
-							onError: promptError => output(error(id, "prompt", promptError.message)),
+							onError: promptError => output(options.managed
+								? correlateManagedResponse(error(id, "prompt", promptError.message), command)
+								: error(id, "prompt", promptError.message)),
 							extensionUserMessageTracker,
 						});
 						return success(id, "prompt");
@@ -1185,7 +1649,9 @@ export async function runRpcMode(
 							streamingBehavior: command.streamingBehavior,
 						}),
 					output,
-					onError: promptError => output(error(id, "prompt", promptError.message)),
+					onError: promptError => output(options.managed
+						? correlateManagedResponse(error(id, "prompt", promptError.message), command)
+						: error(id, "prompt", promptError.message)),
 					extensionUserMessageTracker,
 				});
 				return success(id, "prompt");
@@ -1207,6 +1673,20 @@ export async function runRpcMode(
 			}
 
 			case "abort_and_prompt": {
+				if (options.managed) {
+					for (const run of managedRuns.values()) {
+						if (run.command === "prompt" && run.endpoint.asHandleSnapshot().status === "running") {
+							await runOnCancelRun(run.runId);
+						}
+					}
+					currentModelRun = await beginManagedRun(command, "prompt");
+					currentModelRun.promptTasks = [];
+					const task = session.prompt(command.message, { images: command.images });
+					currentModelRun.promptTasks.push(task);
+					task.catch(failure => output(correlateManagedResponse(
+						error(id, "abort_and_prompt", failure instanceof Error ? failure.message : String(failure)), command)));
+					return success(id, "abort_and_prompt");
+				}
 				await session.abort({ reason: USER_INTERRUPT_LABEL });
 				session
 					.prompt(command.message, { images: command.images })
@@ -1254,6 +1734,7 @@ export async function runRpcMode(
 					})),
 					contextUsage: session.getContextUsage(),
 				};
+				if (options.managed) state.managedRuns = [...managedRuns.values()].map(run => run.endpoint.asHandleSnapshot());
 				return success(id, "get_state", state);
 			}
 
@@ -1439,6 +1920,14 @@ export async function runRpcMode(
 			// =================================================================
 
 			case "bash": {
+				if (options.managed) {
+					const run = await beginManagedRun(command, "bash");
+					const result = await session.executeBash(command.command, chunk => {
+						output({ type: "bash_output", runId: run.runId, chunk, ...readRpcCorrelation(command) });
+					}, { signal: run.abortController.signal });
+					run.outcome = { status: result.cancelled ? "cancelled" : result.exitCode === 0 ? "completed" : "failed" };
+					return success(id, "bash", result);
+				}
 				const result = await session.executeBash(command.command);
 				return success(id, "bash", result);
 			}
@@ -1597,7 +2086,8 @@ export async function runRpcMode(
 
 			default: {
 				const unknownCommand = command as { type: string };
-				return error(undefined, unknownCommand.type, `Unknown command: ${unknownCommand.type}`);
+				return error(options.managed ? id : undefined, unknownCommand.type, `Unknown command: ${unknownCommand.type}`,
+					options.managed ? "protocol-incompatible" : undefined);
 			}
 		}
 	};
@@ -1609,14 +2099,18 @@ export async function runRpcMode(
 	const shutdownCoordinator = new RpcShutdownCoordinator({
 		isShutdownRequested: () => shutdownState.requested,
 		managed: options.managed,
-		runOnManagedEof: () => inputDispatcher.dispatch({ type: "abort" }),
+		runOnManagedEof: async () => {
+			if (!managedClosing) await closeManagedWork("eof");
+		},
 		performShutdown: async () => {
 			// Route through the idempotent session.dispose() so the browser
 			// reaper (releaseTabsForOwner) and other bounded teardown run before
 			// the process exits. dispose() also emits `session_shutdown`, so we
 			// must NOT emit it separately here or the event fires twice. Skipping
 			// dispose left OMP-owned Chromium alive after RPC shutdown (#5643).
-			await session.dispose();
+			await disposeRpcSession();
+			stopManagedTimers();
+			await flushStdout();
 			process.exit(0);
 		},
 	});
@@ -1630,11 +2124,42 @@ export async function runRpcMode(
 		onHostToolResult: frame => hostToolBridge.handleResult(frame),
 		onHostToolUpdate: frame => hostToolBridge.handleUpdate(frame),
 		onHostUriResult: frame => hostUriBridge.handleResult(frame),
+		onControlFrame: () => {
+			if (managedLease && !managedClosing) managedLease = tickLease(managedLease);
+		},
+		afterResponse: async (command, response) => {
+			const run = managedCommandRuns.get(command);
+			if (!run) return;
+			if (run.command === "bash" || !response.success) {
+				await finishManagedRun(run, run.outcome ?? {
+					status: run.abortController.signal.aborted ? "cancelled" : "failed",
+					...(!response.success ? { error: response.error } : {}),
+				});
+				return;
+			}
+			const task = (async () => {
+				try {
+					await Promise.all(run.promptTasks ?? []);
+					await session.waitForIdle();
+					const ownerId = session.getAgentId();
+					if (ownerId) await session.asyncJobManager?.waitForOwnerJobsAndReplies(ownerId);
+					await finishManagedRun(run, { status: run.abortController.signal.aborted ? "cancelled" : "completed" });
+				} catch (failure) {
+					await finishManagedRun(run, {
+						status: run.abortController.signal.aborted ? "cancelled" : "failed",
+						error: failure instanceof Error ? failure.message : String(failure),
+					});
+				}
+			})();
+			shutdownCoordinator.track(task);
+		},
 	};
 
 	const inputDispatcher = new RpcInputDispatcher({
 		deps: dispatchFrameDeps,
 		managed: options.managed,
+		runOnCancelRun,
+		runOnTerminate,
 		afterSerialCommand: () => shutdownCoordinator.checkShutdownRequested(),
 	});
 
@@ -1646,7 +2171,19 @@ export async function runRpcMode(
 	// the reader and killing the whole process (issue #5194).
 	await readRpcInputFrames(
 		input ?? Bun.stdin.stream(),
-		parsed => inputDispatcher.dispatch(parsed),
+		parsed => {
+			if (!options.managed) {
+				inputDispatcher.dispatch(parsed);
+				return;
+			}
+			try {
+				const decoded = frameDecoder.push(parsed);
+				if (decoded !== undefined) inputDispatcher.dispatch(decoded);
+			} catch (failure) {
+				output(correlateManagedResponse(error(undefined, "parse",
+					failure instanceof Error ? failure.message : String(failure), "protocol-incompatible"), parsed));
+			}
+		},
 		message => output(error(undefined, "parse", message)),
 	);
 
@@ -1661,6 +2198,8 @@ export async function runRpcMode(
 	// bounded teardown run on the stdin-EOF path too (#5643). Idempotent: a
 	// prior pi.shutdown() through the coordinator makes this await settle
 	// immediately.
-	await session.dispose();
+	await disposeRpcSession();
+	stopManagedTimers();
+	await flushStdout();
 	process.exit(0);
 }

@@ -4,6 +4,7 @@
  * Spawns the agent in RPC mode and provides a typed API for all operations.
  */
 
+import { randomUUID } from "node:crypto";
 import { isPromise } from "node:util/types";
 import type { AgentEvent, AgentMessage, AgentToolResult, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { CompactionResult } from "@oh-my-pi/pi-agent-core/compaction";
@@ -12,16 +13,31 @@ import { isRecord, ptree, readJsonl } from "@oh-my-pi/pi-utils";
 import type { FileSink } from "bun";
 import type { BashResult } from "../../exec/bash-executor";
 import type { AgentSessionEvent, SessionStats } from "../../session/agent-session";
-import { MAX_RPC_FRAME_BYTES, MAX_RPC_REASSEMBLED_BYTES, RpcFrameDecoder, type RpcProtocolVersion } from "./rpc-frame";
+import type { EndpointControlAck } from "../../task/endpoint";
+import { createLeaseState, isLeaseExpired, type LeaseState, negotiateLease, tickLease } from "./lease";
+import {
+	DEFAULT_RPC_FRAME_LIMITS,
+	MAX_RPC_FRAME_BYTES,
+	MAX_RPC_REASSEMBLED_BYTES,
+	negotiateRpcFrameLimits,
+	RpcFrameDecoder,
+	RpcFrameEncoder,
+	type RpcFrameLimits,
+	type RpcProtocolVersion,
+} from "./rpc-frame";
 import {
 	RPC_MESSAGES_PAGE_BUSY_ERROR,
 	RPC_MESSAGES_PAGE_STALE_ERROR,
 	type RpcMessagesPage,
 	type RpcMessagesPageOptions,
 } from "./rpc-messages";
+import { isNativeAgentCapabilitySet, isRpcErrorCode, readRpcCorrelation } from "./rpc-types";
 import type {
 	RpcAvailableCommandsUpdateFrame,
 	RpcAvailableSlashCommand,
+	RpcCancelRunResult,
+	RpcCorrelationFields,
+	RpcErrorCode,
 	RpcCommand,
 	RpcExtensionUIRequest,
 	RpcExtensionUIResponse,
@@ -32,6 +48,7 @@ import type {
 	RpcHostToolResult,
 	RpcHostToolUpdate,
 	RpcResponse,
+	RpcResumeResult,
 	RpcSessionState,
 	RpcSubagentEventFrame,
 	RpcSubagentLifecycleFrame,
@@ -90,13 +107,15 @@ export interface RpcClientOptions {
 	/** Custom tools owned by the embedding host and exposed over the RPC transport */
 	customTools?: RpcClientCustomTool[];
 	/**
-	 * Require the remote `ready` frame to declare a managed native-agent bootstrap
-	 * (a `nativeAgent` object with `protocolMajor === 1`). Without that declaration
-	 * `start()` rejects and the child is reaped before any protocol negotiation or
-	 * custom-tool registration. This only validates the handshake the embedding
-	 * host already arranged; it does not add CLI arguments. Default: false.
+	 * Require the complete major-1 native-agent capability contract. Incompatible
+	 * ready frames reject before any write. This validates the handshake the
+	 * embedding host arranged; it does not add CLI arguments. Default: false.
 	 */
 	expectManagedBootstrap?: boolean;
+	/** Local managed transport ceilings; negotiated independently with the peer. */
+	managedFrameLimits?: RpcFrameLimits;
+	/** Proposed managed heartbeat and receive-side lease durations, in seconds. */
+	managedLease?: { heartbeatSeconds?: number; leaseSeconds?: number };
 }
 
 export type ModelInfo = Pick<Model, "provider" | "id" | "contextWindow" | "reasoning" | "thinking">;
@@ -188,12 +207,20 @@ function supportsRpcProtocolV2(value: Record<string, unknown>): boolean {
 	);
 }
 
-/** True when a `ready` frame declares a managed native-agent bootstrap at protocol major 1. */
+
 function declaresManagedNativeAgentBootstrap(value: Record<string, unknown>): boolean {
-	if (!("nativeAgent" in value)) return false;
 	const nativeAgent = value.nativeAgent;
-	if (!isRecord(nativeAgent)) return false;
-	return typeof nativeAgent.protocolMajor === "number" && nativeAgent.protocolMajor === 1;
+	return isRecord(nativeAgent) && nativeAgent.protocolMajor === 1 && isNativeAgentCapabilitySet(nativeAgent.capabilities);
+}
+
+function readManagedFrameLimits(value: Record<string, unknown>): RpcFrameLimits {
+	const { maxFrameBytes, maxReassembledFrameBytes, maxResourceChunkBytes } = value;
+	if (
+		typeof maxFrameBytes !== "number" || !Number.isSafeInteger(maxFrameBytes) || maxFrameBytes <= 0 ||
+		typeof maxReassembledFrameBytes !== "number" || !Number.isSafeInteger(maxReassembledFrameBytes) || maxReassembledFrameBytes <= 0 ||
+		typeof maxResourceChunkBytes !== "number" || !Number.isSafeInteger(maxResourceChunkBytes) || maxResourceChunkBytes <= 0
+	) throw new RpcClientError("protocol-incompatible", "Managed peer omitted valid frame limits");
+	return { maxFrameBytes, maxReassembledFrameBytes, maxResourceChunkBytes };
 }
 
 function isAgentEvent(value: unknown): value is AgentEvent {
@@ -272,6 +299,31 @@ export class RpcCommandError extends Error {
 	}
 }
 
+/** Managed failures remain distinct from legacy RPC command errors. */
+class ManagedRpcError<Code extends RpcErrorCode = RpcErrorCode> extends Error {
+	constructor(
+		readonly code: Code,
+		message: string,
+		readonly command?: string,
+	) {
+		super(message);
+		this.name = "RpcClientError";
+	}
+}
+
+export type RpcClientError = {
+	[Code in RpcErrorCode]: ManagedRpcError<Code>;
+}[RpcErrorCode];
+export const RpcClientError = ManagedRpcError;
+
+export type RpcManagedLifecycle =
+	| { status: "inactive" }
+	| { status: "active"; heartbeatSeconds: number; leaseSeconds: number }
+	| { status: "execution-unknown"; error: RpcClientError }
+	| { status: "stopped" };
+
+export type RpcManagedLifecycleListener = (lifecycle: RpcManagedLifecycle) => void;
+
 /** True when a high-level `getMessages()` drain should discard partial pages and fall back to `get_messages`. */
 function isPageFallbackError(error: unknown): boolean {
 	if (!(error instanceof Error)) return false;
@@ -293,7 +345,7 @@ export class RpcClient {
 	#subagentProgressListeners = new Set<RpcSubagentProgressListener>();
 	#subagentEventListeners = new Set<RpcSubagentEventListener>();
 	#availableCommandsUpdateListeners = new Set<RpcAvailableCommandsUpdateListener>();
-	#pendingRequests: Map<string, { resolve: (response: RpcResponse) => void; reject: (error: Error) => void }> =
+	#pendingRequests: Map<string, { id: string; resolve: (response: RpcResponse) => void; reject: (error: Error) => void }> =
 		new Map();
 	#customTools: RpcClientCustomTool[] = [];
 	#pendingHostToolCalls = new Map<string, { controller: AbortController }>();
@@ -301,6 +353,15 @@ export class RpcClient {
 	#protocolVersion: RpcProtocolVersion = 1;
 	#extensionUiListeners: Set<(req: RpcExtensionUIRequest) => void> = new Set();
 	#abortController = new AbortController();
+	#managedLifecycle: RpcManagedLifecycle = { status: "inactive" };
+	#managedLifecycleListeners = new Set<RpcManagedLifecycleListener>();
+	#lease: LeaseState | undefined;
+	#heartbeatTimer: NodeJS.Timeout | undefined;
+	#leaseTimer: NodeJS.Timeout | undefined;
+	#managedFailure: ((error: Error) => Promise<void>) | undefined;
+	#managedEncoder = new RpcFrameEncoder();
+	#frameLimits: RpcFrameLimits | undefined;
+	#peerLease: { heartbeatSeconds?: number; leaseSeconds?: number } | undefined;
 
 	constructor(private options: RpcClientOptions = {}) {
 		this.#customTools = [...(options.customTools ?? [])];
@@ -324,6 +385,11 @@ export class RpcClient {
 		// short-circuit the new stdout reader (issue #4079).
 		this.#abortController = new AbortController();
 		this.#protocolVersion = 1;
+		this.#clearManagedTimers();
+		this.#managedLifecycle = { status: "inactive" };
+		this.#managedEncoder = new RpcFrameEncoder();
+		this.#frameLimits = undefined;
+		this.#peerLease = undefined;
 
 		const cliPath = this.options.cliPath ?? "dist/cli.js";
 		const args = ["--mode", "rpc"];
@@ -355,7 +421,7 @@ export class RpcClient {
 		this.#process = child;
 
 		// Wait for the "ready" signal or process exit
-		const { promise: readyPromise, resolve: readyResolve, reject: readyReject } = Promise.withResolvers<void>();
+		const { promise: readyPromise, resolve: readyResolve, reject: readyReject } = Promise.withResolvers<RpcFrameLimits | undefined>();
 		let readySettled = false;
 		let protocolV2Supported = false;
 		let protocolV2Enabled = false;
@@ -364,12 +430,23 @@ export class RpcClient {
 		const reapAfterOutputFailure = async (error: Error) => {
 			if (this.#process !== child) return;
 
+			if (this.options.expectManagedBootstrap) {
+				this.#clearManagedTimers();
+				if (this.#managedLifecycle.status === "active") {
+					const lost = new RpcClientError("connection-lost", error.message);
+					this.#setManagedLifecycle({ status: "execution-unknown", error: lost });
+					if (!(error instanceof RpcClientError)) error = lost;
+				}
+			}
 			this.#process = null;
 			this.#abortController.abort(error);
 			const pendingRequests = Array.from(this.#pendingRequests.values());
 			this.#pendingRequests.clear();
 			for (const pendingCall of this.#pendingHostToolCalls.values()) pendingCall.controller.abort(error);
 			this.#pendingHostToolCalls.clear();
+			if (this.options.expectManagedBootstrap) {
+				for (const request of pendingRequests) request.reject(error);
+			}
 
 			try {
 				child.kill(undefined, this.options.terminationGraceMs);
@@ -377,8 +454,11 @@ export class RpcClient {
 				// The process may already have exited.
 			}
 			await this.#waitForExit(child);
-			for (const request of pendingRequests) request.reject(error);
+			if (!this.options.expectManagedBootstrap) {
+				for (const request of pendingRequests) request.reject(error);
+			}
 		};
+		this.#managedFailure = reapAfterOutputFailure;
 
 		// Process lines in background, intercepting the ready signal.
 		const lines = readJsonl(child.stdout, this.#abortController.signal);
@@ -386,20 +466,50 @@ export class RpcClient {
 			for await (const line of lines) {
 				if (!readySettled && isRecord(line) && line.type === "ready") {
 					readySettled = true;
+					let proposedLimits: RpcFrameLimits | undefined;
 					if (this.options.expectManagedBootstrap && !declaresManagedNativeAgentBootstrap(line)) {
 						// Reject and stop reading so no later frame or response is processed;
 						// the startup failure path in start() reaps the child before any
 						// protocol negotiation or custom-tool write.
-						readyReject(new Error("remote did not declare a managed native-agent bootstrap"));
+						readyReject(new RpcClientError("protocol-incompatible", "remote did not declare a managed native-agent bootstrap with the full capability contract"));
 						return;
 					}
-					protocolV2Supported = supportsRpcProtocolV2(line);
-					readyResolve();
+					if (this.options.expectManagedBootstrap) {
+						try {
+							if (!Array.isArray(line.supportedProtocolVersions) || !line.supportedProtocolVersions.includes(2))
+								throw new RpcClientError("protocol-incompatible", "Managed peer does not support chunked protocol v2");
+							proposedLimits = negotiateRpcFrameLimits(
+								this.options.managedFrameLimits ?? DEFAULT_RPC_FRAME_LIMITS,
+								readManagedFrameLimits(line),
+							);
+							if (isRecord(line.nativeAgent) && isRecord(line.nativeAgent.proposed)) {
+								const { heartbeatSeconds, leaseSeconds } = line.nativeAgent.proposed;
+								if (
+									typeof heartbeatSeconds !== "number" || !Number.isFinite(heartbeatSeconds) || heartbeatSeconds <= 0 ||
+									typeof leaseSeconds !== "number" || !Number.isFinite(leaseSeconds) || leaseSeconds <= 0
+								) throw new RpcClientError("protocol-incompatible", "Invalid managed lease proposal");
+								this.#peerLease = { heartbeatSeconds, leaseSeconds };
+							}
+							protocolV2Supported = true;
+						} catch (error) {
+							readyReject(error);
+							return;
+						}
+					} else {
+						protocolV2Supported = supportsRpcProtocolV2(line);
+					}
+					readyResolve(proposedLimits);
 					continue;
 				}
 				if (isRecord(line) && line.type === "rpc_chunk" && !protocolV2Enabled)
 					throw new Error("RPC chunk received before protocol negotiation");
-				const decoded = frameDecoder.push(line);
+				let decoded: object | undefined;
+				try {
+					decoded = frameDecoder.push(line);
+				} catch (cause) {
+					if (!this.options.expectManagedBootstrap) throw cause;
+					throw new RpcClientError("protocol-incompatible", cause instanceof Error ? cause.message : String(cause));
+				}
 				if (decoded) this.#handleLine(decoded);
 			}
 			// A closed stdout is terminal even if the child remains alive. Startup
@@ -440,20 +550,30 @@ export class RpcClient {
 				readyReject(error);
 				return;
 			}
-			await reapAfterOutputFailure(new Error(`Agent output reader failed: ${error.message}`, { cause: error }));
+			await reapAfterOutputFailure(this.options.expectManagedBootstrap && error instanceof RpcClientError
+				? error
+				: new Error(`Agent output reader failed: ${error.message}`, { cause: error }));
 		});
 
 		// Also race against process exit (in case stdout closes before we read it)
 		void child.exited.then(
 			(exitCode: number) => {
-				if (readySettled) return;
+				if (readySettled) {
+					if (this.options.expectManagedBootstrap && this.#managedLifecycle.status === "active")
+						void reapAfterOutputFailure(new RpcClientError("connection-lost", `Agent process exited with code ${exitCode}`));
+					return;
+				}
 				readySettled = true;
 				readyReject(new Error(`Agent process exited with code ${exitCode}. Stderr: ${child.peekStderr()}`));
 			},
 			(err: Error) => {
 				// Killed or reaped without an exit code (e.g. stop() during
 				// startup); surface it instead of leaking an unhandled rejection.
-				if (readySettled) return;
+				if (readySettled) {
+					if (this.options.expectManagedBootstrap && this.#managedLifecycle.status === "active")
+						void reapAfterOutputFailure(new RpcClientError("connection-lost", err.message));
+					return;
+				}
 				readySettled = true;
 				readyReject(new Error(`Agent process exited before ready. Stderr: ${child.peekStderr()}`, { cause: err }));
 			},
@@ -463,23 +583,45 @@ export class RpcClient {
 		const readyTimeout = this.#startTimeout(30000, () => {
 			if (readySettled) return;
 			readySettled = true;
-			readyReject(new Error(`Timeout waiting for agent to become ready. Stderr: ${child.peekStderr()}`));
+			readyReject(this.options.expectManagedBootstrap
+				? new RpcClientError("timeout", "Timeout waiting for agent to become ready")
+				: new Error(`Timeout waiting for agent to become ready. Stderr: ${child.peekStderr()}`));
 		});
 
 		try {
-			await readyPromise;
+			const proposedLimits = await readyPromise;
+			this.#frameLimits = proposedLimits;
 			if (protocolV2Supported) {
 				protocolV2Enabled = true;
-				const response = await this.#send({ type: "negotiate_protocol", protocolVersion: 2 });
+				const response = await this.#send({
+					type: "negotiate_protocol", protocolVersion: 2,
+					...(this.options.expectManagedBootstrap ? proposedLimits : {}),
+				});
 				if (
 					!response.success ||
 					response.command !== "negotiate_protocol" ||
 					!isRecord(response.data) ||
 					response.data.protocolVersion !== 2
 				)
-					throw new Error("RPC protocol v2 negotiation failed");
+					throw this.options.expectManagedBootstrap
+						? new RpcClientError("protocol-incompatible", "RPC protocol v2 negotiation failed")
+						: new Error("RPC protocol v2 negotiation failed");
 				this.#protocolVersion = 2;
+				if (this.options.expectManagedBootstrap && proposedLimits) {
+					const accepted = readManagedFrameLimits(response.data);
+					if (
+						accepted.maxFrameBytes > proposedLimits.maxFrameBytes ||
+						accepted.maxReassembledFrameBytes > proposedLimits.maxReassembledFrameBytes ||
+						accepted.maxResourceChunkBytes > proposedLimits.maxResourceChunkBytes
+					) throw new RpcClientError("protocol-incompatible", "Peer exceeded proposed frame limits");
+					this.#frameLimits = negotiateRpcFrameLimits(proposedLimits, accepted);
+					frameDecoder.setLimits(this.#frameLimits);
+					this.#managedEncoder.setLimits(this.#frameLimits);
+					this.#managedEncoder.setProtocolVersion(2);
+					this.#managedEncoder.setManagedEnvelope(true);
+				}
 			}
+			if (this.options.expectManagedBootstrap) await this.prepare();
 			if (this.#customTools.length > 0) {
 				await this.setCustomTools(this.#customTools);
 			}
@@ -487,8 +629,11 @@ export class RpcClient {
 			// Startup failed after spawning the child. Reap it before returning
 			// so a retry cannot inherit a live worker or its session lock.
 			const error = cause instanceof Error ? cause : new Error(String(cause));
-			await reapAfterOutputFailure(error);
-			throw cause;
+			const failure = this.options.expectManagedBootstrap && !(error instanceof RpcClientError)
+				? new RpcClientError("connection-lost", error.message)
+				: error;
+			await reapAfterOutputFailure(failure);
+			throw this.options.expectManagedBootstrap ? failure : cause;
 		} finally {
 			clearTimeout(readyTimeout);
 		}
@@ -500,7 +645,11 @@ export class RpcClient {
 	stop(): Promise<void> {
 		if (!this.#process) return this.#reaping ?? Promise.resolve();
 
-		const error = new Error("Client stopped");
+		this.#clearManagedTimers();
+		if (this.options.expectManagedBootstrap) this.#setManagedLifecycle({ status: "stopped" });
+		const error = this.options.expectManagedBootstrap
+			? new RpcClientError("user-cancelled", "Client stopped")
+			: new Error("Client stopped");
 		const child = this.#process;
 		child.kill(undefined, this.options.terminationGraceMs);
 		this.#abortController.abort(error);
@@ -604,9 +753,98 @@ export class RpcClient {
 		return timer;
 	}
 
+	getManagedLifecycle(): RpcManagedLifecycle {
+		return this.#managedLifecycle;
+	}
+
+	onManagedLifecycle(listener: RpcManagedLifecycleListener): () => void {
+		this.#managedLifecycleListeners.add(listener);
+		return () => this.#managedLifecycleListeners.delete(listener);
+	}
+
+	#setManagedLifecycle(lifecycle: RpcManagedLifecycle): void {
+		this.#managedLifecycle = lifecycle;
+		for (const listener of this.#managedLifecycleListeners) listener(lifecycle);
+	}
+
+	#clearManagedTimers(): void {
+		clearInterval(this.#heartbeatTimer);
+		clearInterval(this.#leaseTimer);
+		this.#heartbeatTimer = undefined;
+		this.#leaseTimer = undefined;
+		this.#lease = undefined;
+	}
+
+	#renewManagedLease(): void {
+		if (this.#lease) this.#lease = tickLease(this.#lease);
+	}
+
 	// =========================================================================
 	// Command Methods
 	// =========================================================================
+
+	async prepare(
+		proposed: { heartbeatSeconds?: number; leaseSeconds?: number } = {},
+		metadata: RpcCorrelationFields = {},
+	): Promise<{ heartbeatSeconds: number; leaseSeconds: number }> {
+		const offered = negotiateLease(
+			createLeaseState(Date.now(), { ...this.options.managedLease, ...proposed }),
+			createLeaseState(Date.now(), this.#peerLease),
+		);
+		const response = await this.#send({ ...metadata, type: "prepare", ...offered });
+		const data = this.#getData<{ heartbeatSeconds: number; leaseSeconds: number }>(response);
+		if (
+			!Number.isFinite(data.heartbeatSeconds) || data.heartbeatSeconds <= 0 ||
+			!Number.isFinite(data.leaseSeconds) || data.leaseSeconds <= 0 ||
+			data.heartbeatSeconds > offered.heartbeatSeconds || data.leaseSeconds > offered.leaseSeconds
+		) throw new RpcClientError("protocol-incompatible", "Invalid managed lease negotiation", "prepare");
+		this.#clearManagedTimers();
+		this.#lease = createLeaseState(Date.now(), data);
+		this.#setManagedLifecycle({ status: "active", ...data });
+		this.#heartbeatTimer = setInterval(() => {
+			void this.#send({ type: "heartbeat", scope: "control" }).catch(error => {
+				if (error instanceof RpcClientError && error.code === "connection-lost")
+					void this.#managedFailure?.(error);
+			});
+		}, data.heartbeatSeconds * 1000);
+		this.#leaseTimer = setInterval(() => {
+			if (this.#lease && isLeaseExpired(this.#lease))
+				void this.#managedFailure?.(new RpcClientError("connection-lost", "Managed receive lease expired"));
+		}, Math.min(data.heartbeatSeconds, data.leaseSeconds) * 1000);
+		this.#heartbeatTimer.unref();
+		this.#leaseTimer.unref();
+		return data;
+	}
+
+	async cancelRun(runId: string, metadata: RpcCorrelationFields = {}): Promise<RpcCancelRunResult> {
+		return this.#getData(await this.#send({ ...metadata, type: "cancel_run", runId }));
+	}
+
+	async terminate(peerId?: string, metadata: RpcCorrelationFields = {}): Promise<{ acknowledged: true }> {
+		const result = this.#getData<{ acknowledged: true }>(
+			await this.#send({ ...metadata, type: "terminate", ...(peerId === undefined ? {} : { peerId }) }),
+		);
+		this.#clearManagedTimers();
+		this.#setManagedLifecycle({ status: "stopped" });
+		return result;
+	}
+
+	async park(runId: string, metadata: RpcCorrelationFields = {}): Promise<EndpointControlAck> {
+		return this.#getData(await this.#send({ ...metadata, type: "park", runId }));
+	}
+
+	async resume(reference: string, expectedRunId?: string, metadata: RpcCorrelationFields = {}): Promise<RpcResumeResult> {
+		return this.#getData(await this.#send({
+			...metadata, type: "resume", reference, ...(expectedRunId === undefined ? {} : { expectedRunId }),
+		}));
+	}
+
+	async ensureLive(reference: string): Promise<EndpointControlAck> {
+		const result = await this.resume(reference);
+		return result.status === "reopened"
+			? { acknowledged: true }
+			: { acknowledged: false, reason: result.detail };
+	}
 
 	/**
 	 * Send a prompt to the agent.
@@ -1081,9 +1319,48 @@ export class RpcClient {
 	// =========================================================================
 
 	#handleLine(data: unknown): void {
+		if (this.options.expectManagedBootstrap && isRecord(data) && data.type === "heartbeat") {
+			if (this.#managedLifecycle.status === "execution-unknown") return;
+			const correlation = readRpcCorrelation(data);
+			if (
+				data.id !== correlation.id || data.correlationId !== correlation.correlationId ||
+				data.scope !== correlation.scope || data.generation !== correlation.generation ||
+				data.operationId !== correlation.operationId
+			) return;
+			this.#renewManagedLease();
+			this.#writeFrame({ type: "response", command: "heartbeat", success: true, ...correlation });
+			return;
+		}
 		// Check if it's a response to a pending request
 		if (isRpcResponse(data)) {
-			const id = data.id;
+			if (this.options.expectManagedBootstrap) {
+				if (data.correlationId !== undefined && typeof data.correlationId !== "string") return;
+				if (!data.success && (!isRpcErrorCode(data.code) || typeof data.message !== "string"))
+					throw new RpcClientError("protocol-incompatible", "Managed error response omitted a valid code or message", data.command);
+				if (!data.success && data.command === "heartbeat" && data.code === "connection-lost" &&
+					data.id === undefined && data.correlationId === undefined) {
+					const error = new RpcClientError("connection-lost", data.message ?? data.error, data.command);
+					this.#clearManagedTimers();
+					this.#setManagedLifecycle({ status: "execution-unknown", error });
+					for (const pending of this.#pendingRequests.values()) pending.reject(error);
+					this.#pendingRequests.clear();
+					// The peer announced cancellation, not completed cleanup. Keep
+					// reading until its drain/park closes stdout; do not kill it here.
+					return;
+				}
+				this.#renewManagedLease();
+			}
+			let id = data.id;
+			if (this.options.expectManagedBootstrap) {
+				id = data.correlationId;
+				if (id === undefined && data.id !== undefined) {
+					for (const [key, pending] of this.#pendingRequests) {
+						if (pending.id !== data.id) continue;
+						id = key;
+						break;
+					}
+				}
+			}
 			if (id && this.#pendingRequests.has(id)) {
 				const pending = this.#pendingRequests.get(id)!;
 				this.#pendingRequests.delete(id);
@@ -1151,28 +1428,48 @@ export class RpcClient {
 	}
 
 	#send(command: RpcCommandBody, timeoutMs = 30_000): Promise<RpcResponse> {
+		if (this.options.expectManagedBootstrap && this.#managedLifecycle.status === "execution-unknown")
+			throw this.#managedLifecycle.error;
 		if (!this.#process?.stdin) {
+			if (this.options.expectManagedBootstrap)
+				throw new RpcClientError("connection-lost", "Client not started", command.type);
 			throw new Error("Client not started");
 		}
 
 		const id = `req_${++this.#requestId}`;
-		const fullCommand = { ...command, id } as RpcCommand;
+		const correlationId = this.options.expectManagedBootstrap ? (command.correlationId ?? randomUUID()) : undefined;
+		const key = correlationId ?? id;
+		const fullCommand = {
+			...command, id, ...(correlationId === undefined ? {} : { correlationId }),
+		} as RpcCommand;
+		if (this.#frameLimits && Buffer.byteLength(JSON.stringify(fullCommand), "utf8") + 1 > this.#frameLimits.maxReassembledFrameBytes)
+			throw new RpcClientError("protocol-incompatible", "Managed command exceeds the negotiated logical frame limit", command.type);
 		const { promise, resolve, reject } = Promise.withResolvers<RpcResponse>();
 		let settled = false;
 		const timeoutId = this.#startTimeout(timeoutMs, () => {
 			if (settled) return;
-			this.#pendingRequests.delete(id);
+			this.#pendingRequests.delete(key);
 			settled = true;
 			reject(
-				new Error(`Timeout waiting for response to ${command.type}. Stderr: ${this.#process?.peekStderr() ?? ""}`),
+				this.options.expectManagedBootstrap
+					? new RpcClientError("timeout", `Timeout waiting for response to ${command.type}`, command.type)
+					: new Error(`Timeout waiting for response to ${command.type}. Stderr: ${this.#process?.peekStderr() ?? ""}`),
 			);
 		});
 
-		this.#pendingRequests.set(id, {
+		this.#pendingRequests.set(key, {
+			id,
 			resolve: response => {
 				if (settled) return;
 				settled = true;
 				clearTimeout(timeoutId);
+				if (this.options.expectManagedBootstrap && !response.success) {
+					reject(new RpcClientError(
+						isRpcErrorCode(response.code) ? response.code : "protocol-incompatible",
+						response.message ?? response.error, response.command,
+					));
+					return;
+				}
 				resolve(response);
 			},
 			reject: error => {
@@ -1183,13 +1480,25 @@ export class RpcClient {
 			},
 		});
 
-		this.#writeFrame(fullCommand, err => {
-			this.#pendingRequests.delete(id);
+		const onWriteError = (err: Error) => {
+			this.#pendingRequests.delete(key);
 			if (settled) return;
 			settled = true;
 			clearTimeout(timeoutId);
-			reject(err);
-		});
+			reject(this.options.expectManagedBootstrap
+				? new RpcClientError("connection-lost", err.message, command.type)
+				: err);
+			if (this.options.expectManagedBootstrap) void this.#managedFailure?.(err);
+		};
+		if (this.options.expectManagedBootstrap) {
+			try {
+				this.#writeFrame(fullCommand, onWriteError);
+			} catch (cause) {
+				onWriteError(cause instanceof Error ? cause : new Error(String(cause)));
+			}
+		} else {
+			this.#writeFrame(fullCommand, onWriteError);
+		}
 		return promise;
 	}
 
@@ -1249,16 +1558,21 @@ export class RpcClient {
 	}
 
 	#writeFrame(
-		frame: RpcCommand | RpcExtensionUIResponse | RpcHostToolResult | RpcHostToolUpdate,
+		frame: RpcCommand | RpcResponse | RpcExtensionUIResponse | RpcHostToolResult | RpcHostToolUpdate,
 		onError?: (error: Error) => void,
 	): void {
 		if (!this.#process?.stdin) {
 			throw new Error("Client not started");
 		}
 		const stdin = this.#process.stdin;
-		stdin.write(`${JSON.stringify(frame)}\n`);
+		if (this.options.expectManagedBootstrap) {
+			for (const line of this.#managedEncoder.encodeFrames(frame)) stdin.write(line);
+		} else {
+			stdin.write(`${JSON.stringify(frame)}\n`);
+		}
 		if (!("flush" in stdin)) return;
-		const flushResult = (stdin as FileSink).flush();
+		const sink = stdin as FileSink;
+		const flushResult = sink.flush();
 		if (isPromise(flushResult)) {
 			flushResult.catch((err: Error) => {
 				onError?.(err);

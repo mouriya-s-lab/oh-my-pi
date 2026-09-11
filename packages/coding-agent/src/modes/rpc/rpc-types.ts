@@ -7,6 +7,7 @@
 import type { AgentMessage, AgentToolResult, ThinkingLevel, ToolLoadMode } from "@oh-my-pi/pi-agent-core";
 import type { CompactionResult } from "@oh-my-pi/pi-agent-core/compaction";
 import type { Effort, ImageContent, Model, ToolExample } from "@oh-my-pi/pi-ai";
+import { isRecord } from "@oh-my-pi/pi-utils";
 import type { BashResult } from "../../exec/bash-executor";
 import type { ContextUsage } from "../../extensibility/extensions/types";
 import type { AgentSessionEvent, SessionStats } from "../../session/agent-session";
@@ -18,16 +19,236 @@ import type {
 	SubagentLifecyclePayload,
 	SubagentProgressPayload,
 } from "../../task";
+import type { EndpointControlAck, EndpointSnapshot } from "../../task/endpoint";
 import type { TodoPhase } from "../../tools/todo";
 import type { RpcMessagesPage } from "./rpc-messages";
+
+// ============================================================================
+// Managed protocol envelope (RFC #1 §8 D4/D5)
+// ============================================================================
+
+/** Which conversation a managed request or response belongs to. */
+export type RpcCorrelationScope = "peer" | "run" | "resource" | "control";
+
+/**
+ * Managed correlation envelope, intersected into every command and response.
+ *
+ * Every field is optional because a legacy peer sends none of them and a
+ * managed peer mints its own identifiers. Whoever answers echoes exactly what
+ * it received — the protocol never fabricates an identifier for a frame that
+ * arrived without one — so a client that reads `correlationId` back knows the
+ * frame belongs to its request even when `id` was reused.
+ */
+export interface RpcCorrelationFields {
+	/** Client-minted correlation id; a UUID is preferred over matching `id`. */
+	correlationId?: string;
+	scope?: RpcCorrelationScope;
+	/**
+	 * Caller ownership generation, echoed back exactly as received. This slice
+	 * neither mints nor bumps it: an answer can only carry the generation its
+	 * request carried, and nothing here compares generations across connections.
+	 * Enforcing stale-connection rejection belongs to the remote-resume work.
+	 */
+	generation?: number;
+	operationId?: string;
+}
+
+/** The managed error taxonomy (D4). Every managed failure carries exactly one of these codes. */
+export type RpcErrorCode =
+	| "authorization-denied"
+	| "config-missing"
+	| "protocol-incompatible"
+	| "remote-execution-failed"
+	| "user-cancelled"
+	| "timeout"
+	| "connection-lost"
+	| "resource-unavailable";
+
+const RPC_ERROR_CODES = new Set<string>([
+	"authorization-denied",
+	"config-missing",
+	"protocol-incompatible",
+	"remote-execution-failed",
+	"user-cancelled",
+	"timeout",
+	"connection-lost",
+	"resource-unavailable",
+]);
+
+/** Narrow an untrusted `code` to the managed taxonomy; a legacy free-form code fails it. */
+export function isRpcErrorCode(value: unknown): value is RpcErrorCode {
+	return typeof value === "string" && RPC_ERROR_CODES.has(value);
+}
+
+/**
+ * Read the correlation envelope (and the legacy `id`) off an untrusted frame.
+ *
+ * The single reader both ends use to echo what they received: an answer carries
+ * exactly the identifiers that arrived — none invented, none dropped — so a
+ * client matching on `correlationId` never sees a frame that lost its owner.
+ * Malformed fields are omitted rather than passed through.
+ */
+export function readRpcCorrelation(value: unknown): RpcCorrelationFields & { id?: string } {
+	if (!isRecord(value)) return {};
+	return {
+		...(typeof value.id === "string" ? { id: value.id } : {}),
+		...(typeof value.correlationId === "string" ? { correlationId: value.correlationId } : {}),
+		...(value.scope === "peer" || value.scope === "run" || value.scope === "resource" || value.scope === "control"
+			? { scope: value.scope }
+			: {}),
+		...(typeof value.generation === "number" && Number.isFinite(value.generation)
+			? { generation: value.generation }
+			: {}),
+		...(typeof value.operationId === "string" ? { operationId: value.operationId } : {}),
+	};
+}
+
+/**
+ * Frame-size limits negotiated once per connection (D4). Each end advertises
+ * its own values and both ends run the smaller value per field, so a frame is
+ * only ever sent when both ends can carry it.
+ */
+export interface RpcFrameLimits {
+	/** Maximum UTF-8 size of one newline-delimited physical frame, newline included. */
+	maxFrameBytes: number;
+	/** Maximum UTF-8 size of one logical frame reassembled from `rpc_chunk` frames. */
+	maxReassembledFrameBytes: number;
+	/** Maximum payload bytes one resource chunk may carry. */
+	maxResourceChunkBytes: number;
+}
+
+/** One managed capability flag; a declaration enumerates the whole set (D5). */
+export type NativeAgentCapability =
+	| "sessionControl"
+	| "peerRoster"
+	| "replyQuiescence"
+	| "outputContract"
+	| "workpoolBinding"
+	| "heartbeat"
+	| "lease"
+	| "resumeOwnership"
+	| "errorTaxonomy"
+	| "ircBidirectional"
+	| "resultResource"
+	| "interactionUi"
+	| "isolatedWorkspace"
+	| "hostCallbacks";
+
+/**
+ * The complete capability set a managed build declares.
+ *
+ * Flags are numeric — `1` implemented, `0` not — because the set is wire data a
+ * peer parses without trusting JSON truthiness: `0` is present and explicit,
+ * and only those two values are ever valid.
+ *
+ * Every flag is present, so a reader never confuses "not implemented" with
+ * "field missing". The nine flags this slice's protocol major requires are
+ * pinned to the literal `1`: a declaration that reports `0` for one of them is
+ * not a weaker peer, it is a peer that cannot speak this protocol, and the type
+ * system and {@link isNativeAgentCapabilitySet} both refuse it. The five
+ * channel flags belong to later slices and are `0 | 1`.
+ */
+export interface NativeAgentCapabilitySet {
+	readonly sessionControl: 1;
+	readonly peerRoster: 1;
+	readonly ircBidirectional: 0 | 1;
+	readonly replyQuiescence: 1;
+	readonly resultResource: 0 | 1;
+	readonly interactionUi: 0 | 1;
+	readonly outputContract: 1;
+	readonly workpoolBinding: 1;
+	readonly isolatedWorkspace: 0 | 1;
+	readonly hostCallbacks: 0 | 1;
+	readonly heartbeat: 1;
+	readonly lease: 1;
+	readonly resumeOwnership: 1;
+	readonly errorTaxonomy: 1;
+}
+
+/**
+ * The capability set this slice's managed build declares: the one source of
+ * truth for the flags, so the ready frame a server emits and the flags a client
+ * requires can never drift apart. A receiver checks the flag it needs and stops
+ * when it is `0`, so an unimplemented channel is never mistaken for an
+ * available one.
+ */
+export const MANAGED_NATIVE_AGENT_CAPABILITIES: NativeAgentCapabilitySet = {
+	sessionControl: 1,
+	peerRoster: 1,
+	replyQuiescence: 1,
+	outputContract: 1,
+	workpoolBinding: 1,
+	heartbeat: 1,
+	lease: 1,
+	resumeOwnership: 1,
+	errorTaxonomy: 1,
+	// Deferred to their owning slices; declared `0` rather than omitted, so a peer
+	// reads them as "not available" instead of "unknown".
+	ircBidirectional: 0,
+	resultResource: 0,
+	interactionUi: 0,
+	isolatedWorkspace: 0,
+	hostCallbacks: 0,
+};
+
+/** Flags protocol major 1 requires: a declaration reporting `0` for any of these is refused. */
+const REQUIRED_NATIVE_AGENT_CAPABILITIES = [
+	"sessionControl",
+	"peerRoster",
+	"replyQuiescence",
+	"outputContract",
+	"workpoolBinding",
+	"heartbeat",
+	"lease",
+	"resumeOwnership",
+	"errorTaxonomy",
+] as const;
+
+/** Channel flags owned by later slices; both `0` and `1` are valid declarations. */
+const OPTIONAL_NATIVE_AGENT_CAPABILITIES = [
+	"ircBidirectional",
+	"resultResource",
+	"interactionUi",
+	"isolatedWorkspace",
+	"hostCallbacks",
+] as const;
+
+/**
+ * Accept a declaration's capability set only when it can actually be one: every
+ * flag present, each strictly `0` or `1`, and every required flag `1`.
+ *
+ * A missing flag, a boolean, or an out-of-range value fails — but so does a
+ * `0` on a required flag, which is the case that matters. Such a peer is not
+ * partially capable of protocol major 1; it cannot run it, and admitting it
+ * would turn "stop at the handshake" into a failure discovered mid-run.
+ */
+export function isNativeAgentCapabilitySet(value: unknown): value is NativeAgentCapabilitySet {
+	if (!isRecord(value)) return false;
+	for (const capability of REQUIRED_NATIVE_AGENT_CAPABILITIES) {
+		if (value[capability] !== 1) return false;
+	}
+	for (const capability of OPTIONAL_NATIVE_AGENT_CAPABILITIES) {
+		const flag = value[capability];
+		if (flag !== 0 && flag !== 1) return false;
+	}
+	return true;
+}
 
 // ============================================================================
 // RPC Commands (stdin)
 // ============================================================================
 
-export type RpcCommand =
+type RpcCommandVariants =
 	// Protocol
-	| { id?: string; type: "negotiate_protocol"; protocolVersion: number }
+	| {
+			id?: string;
+			type: "negotiate_protocol";
+			protocolVersion: number;
+			/** Managed peers propose their own frame limits; legacy peers omit all three fields. */
+			maxFrameBytes?: number;
+			maxReassembledFrameBytes?: number;
+			maxResourceChunkBytes?: number;
+	  }
 
 	// Prompting
 	| { id?: string; type: "prompt"; message: string; images?: ImageContent[]; streamingBehavior?: "steer" | "followUp" }
@@ -90,7 +311,22 @@ export type RpcCommand =
 
 	// Login
 	| { id?: string; type: "get_login_providers" }
-	| { id?: string; type: "login"; providerId: string };
+	| { id?: string; type: "login"; providerId: string }
+
+	// Managed control (D4): heartbeat, cancel, terminate, park and resume bypass
+	// the serialized command queue so a long run cannot block them.
+	| { id?: string; type: "prepare"; heartbeatSeconds?: number; leaseSeconds?: number }
+	| { id?: string; type: "heartbeat" }
+	| { id?: string; type: "cancel_run"; runId: string }
+	| { id?: string; type: "terminate"; peerId?: string }
+	| { id?: string; type: "park"; runId: string }
+	| { id?: string; type: "resume"; reference: string; expectedRunId?: string };
+
+/**
+ * Every command may carry the managed correlation envelope; a legacy client
+ * omits it entirely, and an answer echoes back exactly the fields received.
+ */
+export type RpcCommand = RpcCommandVariants & RpcCorrelationFields;
 
 // ============================================================================
 // RPC State
@@ -114,6 +350,8 @@ export interface RpcSessionState {
 	messageCount: number;
 	queuedMessageCount: number;
 	todoPhases: TodoPhase[];
+	/** Managed-only current run views; absent from legacy state frames. */
+	managedRuns?: EndpointSnapshot[];
 	/** For session dump / export (plain-text parity with /dump). */
 	systemPrompt?: string[];
 	dumpTools?: Array<{ name: string; description: string; parameters: unknown; examples?: readonly ToolExample[] }>;
@@ -144,8 +382,15 @@ export interface RpcPromptResultFrame {
 export interface NativeAgentReadyDeclaration {
 	/** Native-agent protocol major (see RFC #1 §8 D5). This slice ships major = 1. */
 	protocolMajor: 1;
-	/** Capabilities implemented in this build. Freeform strings; stable identifiers only. */
-	capabilities: readonly string[];
+	/** Capabilities implemented in this build, enumerated in full. */
+	capabilities: NativeAgentCapabilitySet;
+	/**
+	 * Application version, advisory only: diagnostics and logs. Compatibility is
+	 * decided by `protocolMajor` plus the capability set, never by this string.
+	 */
+	applicationVersion?: string;
+	/** Lease durations this build proposes; `prepare` confirms the exact pair. */
+	proposed?: { heartbeatSeconds: number; leaseSeconds: number };
 }
 
 export interface RpcReadyFrame {
@@ -154,6 +399,12 @@ export interface RpcReadyFrame {
 	supportedProtocolVersions: [1, 2];
 	maxFrameBytes: number;
 	maxReassembledFrameBytes: number;
+	/**
+	 * Managed-bootstrap-only, like {@link RpcReadyFrame.nativeAgent}: emitted when
+	 * the server declares the managed capability set, absent for legacy
+	 * `--mode rpc`, so the legacy ready frame keeps its exact byte shape.
+	 */
+	maxResourceChunkBytes?: number;
 	/** Managed-bootstrap-only. Absent for legacy `--mode rpc`. */
 	nativeAgent?: NativeAgentReadyDeclaration;
 }
@@ -201,15 +452,58 @@ export interface RpcSubagentMessagesResult {
 // RPC Responses (stdout)
 // ============================================================================
 
+/**
+ * The managed error response: `message` and `code` are both required, and `code`
+ * is always one of the eight {@link RpcErrorCode} entries. A managed client can
+ * therefore classify a failure by code alone instead of parsing prose, and
+ * "unclassified failure" is a shape the protocol cannot produce.
+ *
+ * Legacy servers keep the looser variant at the end of {@link RpcResponse}: it
+ * carries `error` only, with an optional free-form `code`.
+ */
+export type RpcManagedErrorResponse = {
+	id?: string;
+	type: "response";
+	command: string;
+	success: false;
+	error: string;
+	message: string;
+	code: RpcErrorCode;
+};
+
+/**
+ * Verdict of `cancel_run`: `cancelled` means the run's work was cancelled and
+ * its replies drained; `cleanup-unconfirmed` is an explicit failure to confirm
+ * cleanup within the grace window, never a slow success.
+ */
+export type RpcCancelRunResult =
+	| { status: "cancelled"; replyDrained: true }
+	| { status: "cleanup-unconfirmed"; detail: string };
+
+/**
+ * Verdict of `resume`: `still-owned` refuses to open a second logical session
+ * while the previous owner is alive or its cleanup is unfinished; `reopened`
+ * hands back the same run's snapshot.
+ */
+export type RpcResumeResult =
+	| { status: "still-owned"; detail: string }
+	| { status: "reopened"; snapshot: EndpointSnapshot; runId: string };
+
 // Success responses with data
-export type RpcResponse =
+type RpcResponseVariants =
 	// Protocol
 	| {
 			id?: string;
 			type: "response";
 			command: "negotiate_protocol";
 			success: true;
-			data: { protocolVersion: 2 };
+			data: {
+				protocolVersion: 2;
+				/** Frame limits the server agreed to; absent for a peer that proposed none. */
+				maxFrameBytes?: number;
+				maxReassembledFrameBytes?: number;
+				maxResourceChunkBytes?: number;
+			};
 	  }
 
 	// Prompting (async - events follow)
@@ -347,8 +641,42 @@ export type RpcResponse =
 	  }
 	| { id?: string; type: "response"; command: "login"; success: true; data: { providerId: string } }
 
-	// Error response (any command can fail); `code` is an optional machine-readable reason.
-	| { id?: string; type: "response"; command: string; success: false; error: string; code?: string };
+	// Managed control (D4)
+	| {
+			id?: string;
+			type: "response";
+			command: "prepare";
+			success: true;
+			data: { heartbeatSeconds: number; leaseSeconds: number };
+	  }
+	| { id?: string; type: "response"; command: "heartbeat"; success: true }
+	| { id?: string; type: "response"; command: "cancel_run"; success: true; data: RpcCancelRunResult }
+	| { id?: string; type: "response"; command: "terminate"; success: true; data: { acknowledged: true } }
+	| { id?: string; type: "response"; command: "park"; success: true; data: EndpointControlAck }
+	| { id?: string; type: "response"; command: "resume"; success: true; data: RpcResumeResult }
+
+	// Error response (any command can fail). `error` remains the legacy
+	// human-readable field; `message` repeats it for managed peers, and `code` is
+	// optional because a legacy server may send a free-form reason while a
+	// managed server always sends an {@link RpcErrorCode}.
+	| {
+			id?: string;
+			type: "response";
+			command: string;
+			success: false;
+			error: string;
+			message?: string;
+			code?: string;
+	  }
+
+	// Managed error (any command, when the peer speaks the managed protocol)
+	| RpcManagedErrorResponse;
+
+/**
+ * Every response may carry the managed correlation envelope, echoed from the
+ * request that caused it; a server never mints identifiers of its own.
+ */
+export type RpcResponse = RpcResponseVariants & RpcCorrelationFields;
 
 // ============================================================================
 // Subagent Events (stdout)

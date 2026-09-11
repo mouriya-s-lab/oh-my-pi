@@ -145,7 +145,7 @@ function describeAgents(agents: AgentActivitySnapshot[]): string[] {
 				: agent.live ? "" : " — no turn in flight (stale registration?)";
 		lines.push(`- \`${agent.id}\` [${agent.endpointKind}]${parent} — up ${formatDuration(agent.ageMs)}${activity}${stale}`);
 	}
-	lines.push("", "These agents have no job entry; remote messaging is pending #11.");
+	lines.push("", "These agents have no job entry.");
 	if (agents.some(agent => agent.status === "running" && !agent.live)) {
 		lines.push(
 			"An agent with no turn in flight cannot answer a message and never satisfies a bare `wait`; clear it with `hub` cancel.",

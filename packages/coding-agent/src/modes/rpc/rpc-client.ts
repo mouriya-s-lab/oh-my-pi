@@ -12,9 +12,16 @@ import type { ImageContent, Model } from "@oh-my-pi/pi-ai";
 import { isRecord, ptree, readJsonl } from "@oh-my-pi/pi-utils";
 import type { FileSink } from "bun";
 import type { BashResult } from "../../exec/bash-executor";
+import { IrcBus, type DeliveryResult, type IrcEnvelope } from "../../irc/bus";
+import { deliverInboundEnvelope } from "../../irc/inbound";
+import { AgentRegistry, MAIN_AGENT_ID } from "../../registry/agent-registry";
 import type { AgentSessionEvent, SessionStats } from "../../session/agent-session";
 import type { EndpointControlAck } from "../../task/endpoint";
 import { createLeaseState, isLeaseExpired, type LeaseState, negotiateLease, tickLease } from "./lease";
+import {
+	ManagedIrcChannel, ManagedIrcObservationRelay, type ManagedIrcObservation,
+	type IrcInboundListener, type ManagedIrcSendOptions, parseManagedIrcWireFrame,
+} from "./managed-irc";
 import {
 	DEFAULT_RPC_FRAME_LIMITS,
 	MAX_RPC_FRAME_BYTES,
@@ -31,8 +38,12 @@ import {
 	type RpcMessagesPage,
 	type RpcMessagesPageOptions,
 } from "./rpc-messages";
-import { isNativeAgentCapabilitySet, isRpcErrorCode, readRpcCorrelation } from "./rpc-types";
+import { isNativeAgentCapabilitySet, isRpcErrorCode, parseManagedIrcBinding, readRpcCorrelation } from "./rpc-types";
 import type {
+	ManagedIrcBinding,
+	ManagedIrcWireFrame,
+	ManagedPeerFrame,
+	ReplyDrainedBarrier,
 	NativeAgentCapabilitySet,
 	RpcAvailableCommandsUpdateFrame,
 	RpcAvailableSlashCommand,
@@ -283,10 +294,8 @@ function isManagedRunEventFrame(
  *
  * There is no permissive middle: a boundary is either complete and consistent
  * or it is malformed. A start must name its run and one of the two permitted
- * commands; a terminal boundary must carry one of the three permitted statuses
- * and `replyDrained: true`, because that flag is written only after the run's
- * replies actually drained. Accepting anything looser would let a forged frame
- * present a non-fact as a terminal one.
+ * commands; a terminal boundary carries a terminal status independently of its
+ * replies. Only the separate managed IRC barrier establishes reply quiescence.
  *
  * The optional correlation envelope is read with {@link readRpcCorrelation},
  * the same reader every other frame uses, so malformed correlation fields are
@@ -303,8 +312,12 @@ function parseManagedRunEvent(value: Record<string, unknown>): RpcManagedRunEven
 	if (value.type === "managed_run_end") {
 		const status = value.status;
 		if (status !== "completed" && status !== "failed" && status !== "cancelled") return undefined;
-		if (value.replyDrained !== true) return undefined;
-		return { type: "managed_run_end", runId, status, replyDrained: true };
+		if (typeof value.replyDrained !== "boolean") return undefined;
+		if (value.runStatusRevision !== undefined &&
+			(typeof value.runStatusRevision !== "number" || !Number.isSafeInteger(value.runStatusRevision) || value.runStatusRevision < 0)) return undefined;
+		if (value.replyDrained === false && typeof value.runStatusRevision !== "number") return undefined;
+		return { type: "managed_run_end", runId, status, replyDrained: value.replyDrained,
+			...(typeof value.runStatusRevision === "number" ? { runStatusRevision: value.runStatusRevision } : {}) };
 	}
 	return undefined;
 }
@@ -334,6 +347,17 @@ function readPreparedContext(data: Record<string, unknown>, requested: RpcPrepar
 		if (typeof applied !== "string" || applied.length === 0)
 			throw new RpcClientError("protocol-incompatible", `Managed peer reported an invalid prepared ${field}`, "prepare");
 		context[field] = applied;
+	}
+	for (const field of ["ircBinding", "coordinatorBinding"] as const) {
+		if (data[field] === undefined && requested[field] === undefined) continue;
+		const binding = parseManagedIrcBinding(data[field]);
+		const expected = requested[field];
+		if (!binding || !expected || binding.ownerPeerId !== expected.ownerPeerId || binding.generation !== expected.generation ||
+			binding.allowedDescendants.length !== expected.allowedDescendants.length ||
+			binding.allowedDescendants.some(id => !expected.allowedDescendants.includes(id))) {
+			throw new RpcClientError("authorization-denied", `Managed prepare did not confirm ${field}`, "prepare");
+		}
+		context[field] = binding;
 	}
 	return context;
 }
@@ -448,9 +472,157 @@ export class RpcClient {
 	#preparedContext: RpcPrepareOptions | undefined;
 	/** Capability flags read from the peer's own ready declaration. */
 	#nativeAgentCapabilities: NativeAgentCapabilitySet | undefined;
+	#irc: ManagedIrcChannel;
+	#ircInboundListener: IrcInboundListener | undefined;
+	#managedPeerListeners = new Set<(frame: ManagedPeerFrame) => void>();
+	#replyDrainedListeners = new Set<(frame: ReplyDrainedBarrier) => void>();
+	#ircRoutes = new Map<string, () => void>();
+	#coordinatorPeers = new Set<string>();
+	#ircRosterUnsubscribe: (() => void) | undefined;
+	#ircObservationUnsubscribe: (() => void) | undefined;
+	#ircOutboundUnregister: (() => void) | undefined;
 
 	constructor(private options: RpcClientOptions = {}) {
 		this.#customTools = [...(options.customTools ?? [])];
+		this.#irc = this.#createIrcChannel();
+	}
+
+	#createIrcChannel(): ManagedIrcChannel {
+		return new ManagedIrcChannel({
+			output: frame => this.#writeFrame(frame, error => this.#closeIrc(error.message)),
+			inbound: (envelope, options) => this.#ircInboundListener
+				? this.#ircInboundListener(envelope, options)
+				: deliverInboundEnvelope(IrcBus.global(), envelope, options.operationId, options.generation, options),
+			onPeerFrame: frame => {
+				const registry = AgentRegistry.global();
+				const binding = this.#irc.binding;
+				if (!binding) return;
+				if (frame.kind === "peer_state_changed" && frame.state === "running" && frame.runId) {
+					IrcBus.global().markRemoteRunStarted(frame.canonicalId, frame.runId);
+				}
+				if (frame.kind === "peer_state_changed") registry.setStatus(frame.canonicalId, frame.state);
+				else if (frame.kind === "peer_deregistered") registry.unregister(frame.canonicalId);
+				else registry.registerManagedPeer({
+					identity: { canonicalId: frame.canonicalId,
+						nativeId: registry.managedPeerIdentity(frame.canonicalId)?.nativeId ??
+							(frame.canonicalId === binding.ownerPeerId ? MAIN_AGENT_ID : frame.canonicalId),
+						ownerPeerId: binding.ownerPeerId, generation: frame.generation },
+					reference: `rpc:${frame.canonicalId}`, displayName: frame.displayName, parentId: frame.parentId, status: "idle",
+				});
+				if (frame.kind === "peer_registered") this.#registerIrcRoute(frame.canonicalId);
+				if (frame.kind === "peer_deregistered") {
+					this.#ircRoutes.get(frame.canonicalId)?.();
+					this.#ircRoutes.delete(frame.canonicalId);
+					if (frame.canonicalId === binding.ownerPeerId) this.#closeIrc("Managed peer deregistered");
+				}
+				const relay = ManagedIrcObservationRelay.forRegistry(registry);
+				if (frame.kind === "peer_deregistered") relay.removePeer(frame.canonicalId);
+				else if (frame.kind === "peer_state_changed" && frame.runId) relay.publish(binding.ownerPeerId, frame);
+				for (const listener of this.#managedPeerListeners) listener(frame);
+			},
+			onReplyDrainedBarrier: frame => {
+				const peerId = frame.peerId ?? this.#irc.binding?.ownerPeerId;
+				if (peerId) IrcBus.global().markRemoteReplyDrained(peerId, frame.runId);
+				const ownerPeerId = this.#irc.binding?.ownerPeerId;
+				if (peerId && ownerPeerId) ManagedIrcObservationRelay.forRegistry(AgentRegistry.global()).publish(ownerPeerId, { ...frame, peerId });
+				for (const listener of this.#replyDrainedListeners) listener(frame);
+			},
+			onControlOrUi: frame => this.#handleLine(frame),
+			onRegistrationRequest: request => {
+				const registry = AgentRegistry.global();
+				const binding = this.#irc.binding;
+				if (!binding || !registry.authorizeManagedSender(binding.ownerPeerId, request.generation, request.parentId).authorized) {
+					throw new RpcClientError("authorization-denied", "Peer registration has an unauthorized parent", "managed_irc");
+				}
+				const identity = registry.managedPeerIdentityByNative(binding.ownerPeerId, request.nativeId) ??
+					registry.allocateManagedDescendant({ ownerPeerId: binding.ownerPeerId, generation: request.generation, nativeId: request.nativeId });
+				if (!identity || identity.generation !== request.generation || identity.canonicalId === binding.ownerPeerId) {
+					throw new RpcClientError("authorization-denied", "Peer registration ownership is stale", "managed_irc");
+				}
+				registry.registerManagedPeer({ identity, reference: `rpc:${identity.canonicalId}`, displayName: request.displayName,
+					parentId: request.parentId, status: "idle" });
+				this.#registerIrcRoute(identity.canonicalId);
+				return { kind: "peer_registered", canonicalId: identity.canonicalId, parentId: request.parentId,
+					displayName: request.displayName, roles: request.roles, generation: request.generation };
+			},
+		});
+	}
+
+	#registerIrcRoute(peerId: string): void {
+		if (this.#ircRoutes.has(peerId)) return;
+		this.#ircRoutes.set(peerId, IrcBus.global().registerOutboundRoute(peerId, {
+			deliver: (envelope, options) => this.deliverIrc(envelope, {
+				operationId: options.operationId ?? envelope.id, targetPeerId: envelope.to,
+				expectsReply: options.expectsReply, suppressRelay: options.suppressRelay, wake: options.wake,
+			}),
+		}));
+	}
+
+	#publishCoordinatorPeer(peerId: string, removed = false): void {
+		const coordinator = this.#preparedContext?.coordinatorBinding;
+		const binding = this.#irc.binding;
+		if (!coordinator || !binding) return;
+		const registry = AgentRegistry.global();
+		const canonicalId = registry.canonicalizeManagedPeerId(peerId);
+		if (canonicalId === coordinator.ownerPeerId || registry.managedPeerIdentity(canonicalId)?.ownerPeerId === binding.ownerPeerId) return;
+		if (removed) {
+			if (!this.#coordinatorPeers.delete(canonicalId)) return;
+			this.#irc.emit({ kind: "peer_deregistered", canonicalId, generation: binding.generation });
+			return;
+		}
+		const ref = registry.get(peerId) ?? registry.get(registry.resolveManagedLocalRefId(canonicalId));
+		if (!ref) return;
+		if (!this.#coordinatorPeers.has(canonicalId)) {
+			this.#coordinatorPeers.add(canonicalId);
+			const parentId = ref.parentId && ref.parentId !== ref.id ?
+				registry.canonicalizeManagedPeerId(ref.parentId) : coordinator.ownerPeerId;
+			if (parentId !== coordinator.ownerPeerId) this.#publishCoordinatorPeer(ref.parentId ?? parentId);
+			this.#irc.emit({ kind: "peer_registered", canonicalId,
+				parentId: this.#coordinatorPeers.has(parentId) ? parentId : coordinator.ownerPeerId,
+				displayName: ref.displayName, roles: [ref.kind], generation: binding.generation });
+		}
+		if (ref.status === "aborted") {
+			this.#coordinatorPeers.delete(canonicalId);
+			this.#irc.emit({ kind: "peer_deregistered", canonicalId, generation: binding.generation });
+		} else this.#irc.emit({ kind: "peer_state_changed", canonicalId, state: ref.status, generation: binding.generation });
+	}
+
+	#forwardIrcObservation(sourceOwnerPeerId: string, frame: ManagedIrcObservation): void {
+		const binding = this.#irc.binding;
+		if (!binding || binding.ownerPeerId === sourceOwnerPeerId) return;
+		const peerId = frame.kind === "peer_state_changed" ? frame.canonicalId : frame.peerId;
+		if (!peerId) return;
+		try {
+			if (!this.#syncIrcBinding()) return;
+			this.#publishCoordinatorPeer(peerId);
+			if (!this.#coordinatorPeers.has(peerId)) return;
+			this.#irc.emit(frame.kind === "peer_state_changed" ? { ...frame, generation: binding.generation } : frame);
+		} catch (failure) {
+			void this.#managedFailure?.(new RpcClientError("connection-lost",
+				failure instanceof Error ? failure.message : String(failure), "managed_irc"));
+		}
+	}
+
+	#closeIrc(reason: string): void {
+		this.#irc.close(reason);
+		this.#ircOutboundUnregister?.();
+		this.#ircOutboundUnregister = undefined;
+		this.#ircRosterUnsubscribe?.();
+		this.#ircRosterUnsubscribe = undefined;
+		this.#ircObservationUnsubscribe?.();
+		this.#ircObservationUnsubscribe = undefined;
+		this.#coordinatorPeers.clear();
+		for (const unregister of this.#ircRoutes.values()) unregister();
+		this.#ircRoutes.clear();
+		const binding = this.#irc.binding;
+		if (binding) {
+			const registry = AgentRegistry.global();
+			const current = registry.getManagedConnectionBinding(binding.ownerPeerId);
+			if (!current || current.generation === binding.generation) {
+				ManagedIrcObservationRelay.forRegistry(registry).removeSource(binding.ownerPeerId);
+			}
+			AgentRegistry.global().revokeManagedConnection(binding.ownerPeerId, binding.generation);
+		}
 	}
 
 	/**
@@ -478,6 +650,7 @@ export class RpcClient {
 		this.#peerLease = undefined;
 		this.#preparedContext = undefined;
 		this.#nativeAgentCapabilities = undefined;
+		this.#irc = this.#createIrcChannel();
 
 		const cliPath = this.options.cliPath ?? "dist/cli.js";
 		const args = ["--mode", "rpc"];
@@ -527,6 +700,7 @@ export class RpcClient {
 				}
 			}
 			this.#process = null;
+			this.#closeIrc(error.message);
 			this.#abortController.abort(error);
 			const pendingRequests = Array.from(this.#pendingRequests.values());
 			this.#pendingRequests.clear();
@@ -744,6 +918,7 @@ export class RpcClient {
 		child.kill(undefined, this.options.terminationGraceMs);
 		this.#abortController.abort(error);
 		this.#process = null;
+		this.#closeIrc(error.message);
 		for (const request of this.#pendingRequests.values()) request.reject(error);
 		this.#pendingRequests.clear();
 		for (const pendingCall of this.#pendingHostToolCalls.values()) {
@@ -885,6 +1060,44 @@ export class RpcClient {
 		return () => this.#managedRunListeners.delete(listener);
 	}
 
+	getIrcBinding(): ManagedIrcBinding | undefined {
+		return this.#irc.binding;
+	}
+
+	deliverIrc(envelope: IrcEnvelope, options: ManagedIrcSendOptions): Promise<DeliveryResult> {
+		if (!this.#syncIrcBinding()) return Promise.resolve({ to: envelope.to, outcome: "failed", error: "authorization-denied" });
+		this.#publishCoordinatorPeer(envelope.from);
+		return this.#irc.deliverIrc(envelope, options);
+	}
+
+	onIrcInbound(listener: IrcInboundListener): () => void {
+		if (this.#ircInboundListener) throw new Error("An IRC inbound delivery handler is already registered");
+		this.#ircInboundListener = listener;
+		return () => { if (this.#ircInboundListener === listener) this.#ircInboundListener = undefined; };
+	}
+
+	onManagedPeerFrame(listener: (frame: ManagedPeerFrame) => void): () => void {
+		this.#managedPeerListeners.add(listener);
+		return () => this.#managedPeerListeners.delete(listener);
+	}
+
+	onReplyDrainedBarrier(listener: (frame: ReplyDrainedBarrier) => void): () => void {
+		this.#replyDrainedListeners.add(listener);
+		return () => this.#replyDrainedListeners.delete(listener);
+	}
+
+	#syncIrcBinding(): boolean {
+		const bound = this.#irc.binding;
+		if (!bound) return false;
+		const current = AgentRegistry.global().getManagedConnectionBinding(bound.ownerPeerId);
+		if (!current || current.generation !== bound.generation) {
+			this.#closeIrc("IRC ownership revoked or superseded");
+			return false;
+		}
+		this.#irc.bind({ ...current, allowedDescendants: [...current.allowedDescendants] });
+		return true;
+	}
+
 	#setManagedLifecycle(lifecycle: RpcManagedLifecycle): void {
 		this.#managedLifecycle = lifecycle;
 		for (const listener of this.#managedLifecycleListeners) listener(lifecycle);
@@ -920,7 +1133,33 @@ export class RpcClient {
 		proposed: { heartbeatSeconds?: number; leaseSeconds?: number } = {},
 		metadata: RpcCorrelationFields = {},
 	): Promise<RpcPrepareResult> {
-		const context = this.options.prepare ?? {};
+		const registry = AgentRegistry.global();
+		const configured = this.options.prepare ?? {};
+		const established = this.#preparedContext?.ircBinding;
+		const allocation = established ? registry.getManagedConnectionBinding(established.ownerPeerId) ?? established :
+			configured.ircBinding ?? registry.allocateManagedRoot({ nativeId: MAIN_AGENT_ID, scope: randomUUID() }).binding;
+		const ircBinding: ManagedIrcBinding = { ...allocation, allowedDescendants: [...allocation.allowedDescendants] };
+		const generation = ircBinding.generation;
+		let rootId = registry.canonicalizeManagedPeerId(MAIN_AGENT_ID);
+		if (configured.coordinatorBinding === undefined && rootId === MAIN_AGENT_ID) {
+			const root = registry.allocateManagedRoot({ nativeId: MAIN_AGENT_ID, scope: `coordinator-${randomUUID()}` });
+			rootId = root.peerId;
+			registry.registerManagedLocalAlias({ identity: { canonicalId: rootId, nativeId: MAIN_AGENT_ID,
+				ownerPeerId: rootId, generation: root.binding.generation }, binding: root.binding });
+		}
+		const observationRelay = ManagedIrcObservationRelay.forRegistry(registry);
+		observationRelay.observeLocalPeers(configured.coordinatorBinding?.ownerPeerId ?? rootId);
+		const coordinatorBinding = configured.coordinatorBinding ?? {
+			ownerPeerId: rootId, generation,
+			allowedDescendants: registry.list().map(ref => registry.canonicalizeManagedPeerId(ref.id))
+				.filter(id => id !== rootId && id !== ircBinding.ownerPeerId &&
+					registry.managedPeerIdentity(id)?.ownerPeerId !== ircBinding.ownerPeerId),
+		};
+		if (coordinatorBinding.generation !== ircBinding.generation) {
+			throw new RpcClientError("authorization-denied", "Directional IRC bindings must share the connection generation", "prepare");
+		}
+		if (configured.coordinatorBinding === undefined) IrcBus.global().registerIdentity(rootId, MAIN_AGENT_ID);
+		const context: RpcPrepareOptions = { ...configured, ircBinding, coordinatorBinding };
 		const offered = negotiateLease(
 			createLeaseState(Date.now(), { ...this.options.managedLease, ...proposed }),
 			createLeaseState(Date.now(), this.#peerLease),
@@ -930,6 +1169,8 @@ export class RpcClient {
 			...(context.cwd === undefined ? {} : { cwd: context.cwd }),
 			...(context.profile === undefined ? {} : { profile: context.profile }),
 			...(context.agent === undefined ? {} : { agent: context.agent }),
+			ircBinding: context.ircBinding,
+			coordinatorBinding: context.coordinatorBinding,
 		});
 		const data = this.#getData<unknown>(response);
 		if (!isRecord(data)) throw new RpcClientError("protocol-incompatible", "Managed prepare answer carried no data", "prepare");
@@ -942,6 +1183,28 @@ export class RpcClient {
 		) throw new RpcClientError("protocol-incompatible", "Invalid managed lease negotiation", "prepare");
 		const applied = readPreparedContext(data, context);
 		this.#preparedContext = { ...this.#preparedContext, ...applied };
+		if (applied.ircBinding) {
+			if (!registry.bindManagedConnection(applied.ircBinding)) {
+				throw new RpcClientError("authorization-denied", "IRC ownership generation is stale or revoked", "prepare");
+			}
+			this.#irc.bind(applied.ircBinding);
+			registry.registerManagedPeer({
+				identity: { canonicalId: applied.ircBinding.ownerPeerId, nativeId: MAIN_AGENT_ID,
+					ownerPeerId: applied.ircBinding.ownerPeerId, generation: applied.ircBinding.generation },
+				reference: `rpc:${applied.ircBinding.ownerPeerId}`, displayName: MAIN_AGENT_ID,
+				parentId: coordinatorBinding.ownerPeerId, status: "idle",
+			});
+			this.#registerIrcRoute(applied.ircBinding.ownerPeerId);
+			for (const id of applied.ircBinding.allowedDescendants) this.#registerIrcRoute(id);
+		}
+		this.#coordinatorPeers = new Set([coordinatorBinding.ownerPeerId, ...coordinatorBinding.allowedDescendants]);
+		this.#ircOutboundUnregister ??= observationRelay.registerChannel(this.#irc);
+		this.#ircRosterUnsubscribe ??= registry.onChange(event => {
+			this.#publishCoordinatorPeer(event.ref.id, event.type === "removed");
+		});
+		this.#ircObservationUnsubscribe ??= observationRelay.subscribe(
+			(sourceOwnerPeerId, frame) => this.#forwardIrcObservation(sourceOwnerPeerId, frame),
+		);
 		this.#clearManagedTimers();
 		this.#lease = createLeaseState(Date.now(), { heartbeatSeconds, leaseSeconds });
 		this.#setManagedLifecycle({ status: "active", heartbeatSeconds, leaseSeconds });
@@ -968,6 +1231,7 @@ export class RpcClient {
 		const result = this.#getData<{ acknowledged: true }>(
 			await this.#send({ ...metadata, type: "terminate", ...(peerId === undefined ? {} : { peerId }) }),
 		);
+		this.#closeIrc("Managed peer terminated");
 		this.#clearManagedTimers();
 		this.#setManagedLifecycle({ status: "stopped" });
 		return result;
@@ -1463,6 +1727,15 @@ export class RpcClient {
 	// =========================================================================
 
 	#handleLine(data: unknown): void {
+		if (this.options.expectManagedBootstrap && isRecord(data) && data.type === "managed_irc") {
+			const wire = parseManagedIrcWireFrame(data);
+			this.#syncIrcBinding();
+			this.#renewManagedLease();
+			void this.#irc.handleFrame(wire).catch(error => {
+				void this.#managedFailure?.(new RpcClientError("remote-execution-failed", String(error), "managed_irc"));
+			});
+			return;
+		}
 		if (this.options.expectManagedBootstrap && isRecord(data) && data.type === "heartbeat") {
 			if (this.#managedLifecycle.status === "execution-unknown") return;
 			const correlation = readRpcCorrelation(data);
@@ -1477,6 +1750,7 @@ export class RpcClient {
 		}
 		// Check if it's a response to a pending request
 		if (isRpcResponse(data)) {
+			if (this.options.expectManagedBootstrap && this.#irc.handleResponse(data)) return;
 			if (this.options.expectManagedBootstrap) {
 				if (data.correlationId !== undefined && typeof data.correlationId !== "string") return;
 				if (!data.success && (!isRpcErrorCode(data.code) || typeof data.message !== "string"))
@@ -1487,6 +1761,7 @@ export class RpcClient {
 					this.#clearManagedTimers();
 					this.#setManagedLifecycle({ status: "execution-unknown", error });
 					for (const pending of this.#pendingRequests.values()) pending.reject(error);
+					this.#closeIrc(error.message);
 					this.#pendingRequests.clear();
 					// The peer announced cancellation, not completed cleanup. Keep
 					// reading until its drain/park closes stdout; do not kill it here.
@@ -1518,6 +1793,22 @@ export class RpcClient {
 				const event = parseManagedRunEvent(data);
 				if (!event)
 					throw new RpcClientError("protocol-incompatible", "Malformed managed run frame", data.type);
+				const ownerPeerId = this.#irc.binding?.ownerPeerId;
+				if (ownerPeerId && !this.#syncIrcBinding()) return;
+				if (ownerPeerId && event.type === "managed_run_start") IrcBus.global().markRemoteRunStarted(ownerPeerId, event.runId);
+				if (ownerPeerId) {
+					const binding = this.#irc.binding;
+					if (binding) {
+						const observation: Extract<ManagedPeerFrame, { kind: "peer_state_changed" }> = {
+							kind: "peer_state_changed", canonicalId: ownerPeerId, generation: binding.generation,
+							state: event.type === "managed_run_start" ? "running" : "idle", runId: event.runId,
+							...(event.type === "managed_run_end" && event.runStatusRevision !== undefined ?
+								{ runStatusRevision: event.runStatusRevision } : {}),
+						};
+						this.#irc.observePeerState(observation);
+						ManagedIrcObservationRelay.forRegistry(AgentRegistry.global()).publish(ownerPeerId, observation);
+					}
+				}
 				for (const listener of this.#managedRunListeners) listener(event);
 			}
 			return;
@@ -1712,7 +2003,7 @@ export class RpcClient {
 	}
 
 	#writeFrame(
-		frame: RpcCommand | RpcResponse | RpcExtensionUIResponse | RpcHostToolResult | RpcHostToolUpdate,
+		frame: RpcCommand | RpcResponse | RpcExtensionUIResponse | RpcHostToolResult | RpcHostToolUpdate | ManagedIrcWireFrame,
 		onError?: (error: Error) => void,
 	): void {
 		if (!this.#process?.stdin) {

@@ -13,6 +13,7 @@ import type { Effort, ImageContent, Model, ToolExample } from "@oh-my-pi/pi-ai";
 import { isRecord } from "@oh-my-pi/pi-utils/type-guards";
 import type { BashResult } from "../../exec/bash-executor";
 import type { ContextUsage } from "../../extensibility/extensions/types";
+import type { IrcEnvelope } from "../../irc/bus";
 import type { AgentSessionEvent, SessionStats } from "../../session/agent-session";
 import type { FileEntry } from "../../session/session-entries";
 import type { AvailableSlashCommandSource } from "../../slash-commands/available-commands";
@@ -46,12 +47,7 @@ export interface RpcCorrelationFields {
 	/** Client-minted correlation id; a UUID is preferred over matching `id`. */
 	correlationId?: string;
 	scope?: RpcCorrelationScope;
-	/**
-	 * Caller ownership generation, echoed back exactly as received. This slice
-	 * neither mints nor bumps it: an answer can only carry the generation its
-	 * request carried, and nothing here compares generations across connections.
-	 * Enforcing stale-connection rejection belongs to the remote-resume work.
-	 */
+	/** Connection ownership generation; managed IRC rejects stale generations. */
 	generation?: number;
 	operationId?: string;
 }
@@ -136,6 +132,10 @@ export interface RpcPrepareOptions {
 	profile?: string;
 	/** Agent definition the peer resolved for the session. */
 	agent?: string;
+	/** Canonical remote identity and its explicitly authorized descendants. */
+	ircBinding?: ManagedIrcBinding;
+	/** Coordinator sender scope, independent of the remote runtime's identity. */
+	coordinatorBinding?: ManagedIrcBinding;
 }
 
 /**
@@ -175,16 +175,16 @@ export type NativeAgentCapability =
  * and only those two values are ever valid.
  *
  * Every flag is present, so a reader never confuses "not implemented" with
- * "field missing". The nine flags this slice's protocol major requires are
+ * "field missing". The ten flags this slice's protocol major requires are
  * pinned to the literal `1`: a declaration that reports `0` for one of them is
  * not a weaker peer, it is a peer that cannot speak this protocol, and the type
- * system and {@link isNativeAgentCapabilitySet} both refuse it. The five
- * channel flags belong to later slices and are `0 | 1`.
+ * system and {@link isNativeAgentCapabilitySet} both refuse it. The four
+ * channel flags owned by later slices are `0 | 1`.
  */
 export interface NativeAgentCapabilitySet {
 	readonly sessionControl: 1;
 	readonly peerRoster: 1;
-	readonly ircBidirectional: 0 | 1;
+	readonly ircBidirectional: 1;
 	readonly replyQuiescence: 1;
 	readonly resultResource: 0 | 1;
 	readonly interactionUi: 0 | 1;
@@ -215,9 +215,9 @@ export const MANAGED_NATIVE_AGENT_CAPABILITIES: NativeAgentCapabilitySet = {
 	lease: 1,
 	resumeOwnership: 1,
 	errorTaxonomy: 1,
+	ircBidirectional: 1,
 	// Deferred to their owning slices; declared `0` rather than omitted, so a peer
 	// reads them as "not available" instead of "unknown".
-	ircBidirectional: 0,
 	resultResource: 0,
 	interactionUi: 0,
 	isolatedWorkspace: 0,
@@ -228,6 +228,7 @@ export const MANAGED_NATIVE_AGENT_CAPABILITIES: NativeAgentCapabilitySet = {
 const REQUIRED_NATIVE_AGENT_CAPABILITIES = [
 	"sessionControl",
 	"peerRoster",
+	"ircBidirectional",
 	"replyQuiescence",
 	"outputContract",
 	"workpoolBinding",
@@ -239,7 +240,6 @@ const REQUIRED_NATIVE_AGENT_CAPABILITIES = [
 
 /** Channel flags owned by later slices; both `0` and `1` are valid declarations. */
 const OPTIONAL_NATIVE_AGENT_CAPABILITIES = [
-	"ircBidirectional",
 	"resultResource",
 	"interactionUi",
 	"isolatedWorkspace",
@@ -266,6 +266,57 @@ export function isNativeAgentCapabilitySet(value: unknown): value is NativeAgent
 	}
 	return true;
 }
+
+/** An authenticated connection scope, never a display-name authority. */
+export interface ManagedIrcBinding {
+	ownerPeerId: string;
+	generation: number;
+	allowedDescendants: string[];
+}
+
+export function parseManagedIrcBinding(value: unknown): ManagedIrcBinding | undefined {
+	if (!isRecord(value) || typeof value.ownerPeerId !== "string" || !value.ownerPeerId ||
+		value.ownerPeerId.includes("\0") || typeof value.generation !== "number" ||
+		!Number.isSafeInteger(value.generation) || value.generation < 0 ||
+		!Array.isArray(value.allowedDescendants) ||
+		!value.allowedDescendants.every((id: unknown) => typeof id === "string" && id.length > 0 && !id.includes("\0"))) return undefined;
+	return { ownerPeerId: value.ownerPeerId, generation: value.generation, allowedDescendants: [...value.allowedDescendants] };
+}
+
+export interface ManagedIrcDeliveryOptions {
+	operationId: string;
+	generation: number;
+	expectsReply?: boolean;
+	suppressRelay?: boolean;
+	wake?: boolean;
+}
+
+export type ManagedControlOrUi =
+	| Extract<RpcCommand, { type: "get_state" | "abort" | "abort_bash" | "heartbeat" | "cancel_run" | "terminate" | "park" | "resume" }>
+	| RpcExtensionUIResponse
+	| RpcHostToolResult
+	| RpcHostToolUpdate
+	| RpcHostUriResult;
+
+export type ManagedIrcFrame =
+	| { kind: "peer_registration_request"; nativeId: string; parentId: string; displayName: string; roles: readonly string[]; generation: number }
+	| { kind: "peer_registered"; canonicalId: string; parentId?: string; displayName: string; roles: readonly string[]; generation: number }
+	| { kind: "peer_deregistered"; canonicalId: string; generation: number }
+	| { kind: "peer_state_changed"; canonicalId: string; state: "running" | "idle" | "parked" | "execution-unknown"; generation: number; runId?: string; runStatusRevision?: number }
+	| { kind: "irc_delivery"; envelope: IrcEnvelope; operationId: string; expectsReply?: boolean; suppressRelay?: boolean; wake?: boolean }
+	| { kind: "irc_receipt"; operationId: string; outcome: "injected" | "woken" | "revived" | "failed" | "indeterminate"; reason?: string }
+	| { kind: "reply_drained_barrier"; runId: string; runStatusRevision: number; outboundWatermark: number; peerId?: string }
+	| { kind: "control_or_ui"; payload: ManagedControlOrUi };
+
+export type ManagedPeerFrame = Extract<ManagedIrcFrame, { kind: "peer_registered" | "peer_deregistered" | "peer_state_changed" }>;
+export type ManagedPeerRegistrationRequest = Extract<ManagedIrcFrame, { kind: "peer_registration_request" }>;
+export type ReplyDrainedBarrier = Extract<ManagedIrcFrame, { kind: "reply_drained_barrier" }>;
+export type ManagedIrcWireFrame = RpcCorrelationFields & {
+	id?: string;
+	type: "managed_irc";
+	generation: number;
+	frame: ManagedIrcFrame;
+};
 
 // ============================================================================
 // RPC Commands (stdin)
@@ -357,6 +408,8 @@ type RpcCommandVariants =
 			cwd?: string;
 			profile?: string;
 			agent?: string;
+			ircBinding?: ManagedIrcBinding;
+			coordinatorBinding?: ManagedIrcBinding;
 	  }
 	| { id?: string; type: "heartbeat" }
 	| { id?: string; type: "cancel_run"; runId: string }
@@ -684,6 +737,7 @@ type RpcResponseVariants =
 	| { id?: string; type: "response"; command: "login"; success: true; data: { providerId: string } }
 
 	// Managed control (D4)
+	| { id?: string; type: "response"; command: "managed_irc"; success: true; data: { accepted: true; operationId?: string } }
 	| {
 			id?: string;
 			type: "response";
@@ -757,10 +811,9 @@ export type RpcSessionEventFrame = AgentSessionEvent | RpcSubagentFrame;
  * frame echoes the correlation envelope of the command that caused the run,
  * mirrored by {@link readRpcCorrelation} like every other managed frame.
  *
- * The terminal frame carries `replyDrained: true` as a literal: it is written
- * only after the run's replies are actually drained, so the flag is a fact the
- * frame asserts rather than a hint, and a frame claiming otherwise is malformed
- * wire data, not a slower success.
+ * Terminal status does not drain IRC replies. Managed peers emit `false` with
+ * the terminal revision, then a separate reply_drained_barrier after outbound
+ * receipts settle. `true` remains readable for older non-IRC event consumers.
  */
 export type RpcManagedRunEvent =
 	| ({
@@ -772,7 +825,8 @@ export type RpcManagedRunEvent =
 			type: "managed_run_end";
 			runId: string;
 			status: "completed" | "failed" | "cancelled";
-			replyDrained: true;
+			replyDrained: boolean;
+			runStatusRevision?: number;
 	  };
 
 // ============================================================================

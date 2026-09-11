@@ -157,7 +157,8 @@ describe("factory-opened managed SSH endpoint (issue #10 row 3)", () => {
 			const prepared = await endpoint.prepare();
 			expect(prepared.role).toEqual({ agent: AGENT, source: "remote" });
 			expect(prepared.capabilities).toContain("sessionControl");
-			expect(prepared.capabilities).not.toContain("ircBidirectional");
+			// #11: capability flipped to 1.
+			expect(prepared.capabilities).toContain("ircBidirectional");
 
 			// Live control on the same connection: typed state, then a real abort.
 			const state = await withinMs(client.getState(), 15_000, "get_state");
@@ -284,7 +285,12 @@ describe("factory-opened managed SSH endpoint (issue #10 row 3)", () => {
 			const outcome = await withinMs(endpoint.run(ack.runId), 30_000, "endpoint run");
 			expect(outcome.runId).toBe(ack.runId);
 			expect(outcome.status).toBe("completed");
-			expect(await withinMs(endpoint.waitReplyDrained(ack.runId), 15_000, "reply drain")).toEqual({ status: "drained" });
+			// #11 reports the independent reply barrier's revision and confirmed outbound watermark.
+			const drained = await withinMs(endpoint.waitReplyDrained(ack.runId), 15_000, "reply drain");
+			expect(drained.status).toBe("drained");
+			if (drained.status !== "drained") throw new Error("Reply drain was interrupted");
+			expect(typeof drained.runStatusRevision).toBe("number");
+			expect(typeof drained.outboundWatermark).toBe("number");
 
 			// The endpoint's own stream must carry the same identity the ACK minted.
 			const seen: EndpointEvent[] = [];
@@ -302,7 +308,13 @@ describe("factory-opened managed SSH endpoint (issue #10 row 3)", () => {
 			const startFrame = wireRuns.find(event => event.type === "managed_run_start");
 			expect(startFrame).toMatchObject({ runId: ack.runId, command: "prompt" });
 			const endFrame = wireRuns.find(event => event.type === "managed_run_end");
-			expect(endFrame).toMatchObject({ runId: ack.runId, status: "completed", replyDrained: true });
+			// #11: run_end.replyDrained is now false; barrier arrives independently.
+			expect(endFrame).toMatchObject({
+				runId: ack.runId,
+				status: "completed",
+				replyDrained: false,
+			});
+			expect(typeof endFrame?.runStatusRevision).toBe("number");
 
 			const state = await withinMs(endpoint.transport.client.getState(), 15_000, "get_state after run");
 			expect(state.managedRuns?.some(run => run.runId === ack.runId)).toBe(true);

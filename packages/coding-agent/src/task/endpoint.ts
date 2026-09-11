@@ -11,10 +11,13 @@
  * managed facts that surface carries — the receive-side lease events
  * (`heartbeat_received` / `lease_expired`), the opaque resume reference a park
  * may hand back, and the ownership refusals that stop a resume from starting a
- * second execution of a session whose owner has not let go. The methods whose
- * owning slice has not landed are *honest* stubs: they answer with a refusal
- * or an explicit not-implemented outcome that names the owning slice instead
- * of fabricating delivery, parking, or content.
+ * second execution of a session whose owner has not let go. Stage 4 (#11) turns
+ * `deliverIrc` into a real inbound boundary: an endpoint hands the frame's
+ * envelope to its own peer or to the connection that peer is reached through,
+ * and reports `indeterminate` when a transport cannot confirm the hand-over.
+ * The methods whose owning slice has not landed stay *honest* stubs: they
+ * answer with a refusal or an explicit not-implemented outcome that names the
+ * owning slice instead of fabricating delivery, parking, or content.
  *
  * Two invariants this module protects on its own:
  *
@@ -30,10 +33,17 @@
  */
 
 import type { Usage } from "@oh-my-pi/pi-ai";
-import type { IrcMessage } from "../irc/bus";
+import type { IrcDeliveryOptions, IrcMessage } from "../irc/bus";
 import type { AgentSession } from "../session/agent-session";
 import type { ReplyDrainedResult } from "./reply-drained";
 import type { StructuredSubagentOutput } from "./types";
+
+/**
+ * Delivery switches an inbound frame carries beside its envelope
+ * ({@link AgentEndpoint.deliverIrc}); the bus owns their meaning, this module
+ * just names them for the transports above it.
+ */
+export type { IrcDeliveryOptions, IrcEnvelope } from "../irc/bus";
 
 /** Transport family an endpoint belongs to; drives which verdicts it can report. */
 export type AgentEndpointKind = "local" | "remote";
@@ -156,7 +166,10 @@ export interface EndpointEventEnvelope {
  * - `run_ack`: an assignment was accepted; a receipt, never a result.
  * - `run_outcome`: the run's single verdict, reported verbatim.
  * - `reply_drained`: the run owes no more replies; the second half of the
- *   terminal-plus-drained pair the reply barrier waits for.
+ *   terminal-plus-drained pair the reply barrier waits for. The optional
+ *   `runStatusRevision` / `outboundWatermark` are the same facts
+ *   {@link ReplyDrainedResult} reports when the publisher observed them;
+ *   omitted, never defaulted, when it did not.
  * - `heartbeat_received`: a peer heartbeat renewed the receive-side lease (D4,
  *   #9); `timestamp` is the local instant the frame was observed, never the
  *   sender's clock. A viewer watching for liveness reads this as "the lease
@@ -174,7 +187,7 @@ export type EndpointEventDraft =
 	| { type: "activity_changed"; runId?: string; message: string }
 	| { type: "run_ack"; runId: string; acceptedAt: number }
 	| { type: "run_outcome"; runId: string; outcome: RunOutcome }
-	| { type: "reply_drained"; runId: string }
+	| { type: "reply_drained"; runId: string; runStatusRevision?: number; outboundWatermark?: number }
 	| { type: "heartbeat_received"; runId?: string; timestamp: number }
 	| { type: "lease_expired"; runId?: string; timestamp: number };
 
@@ -308,29 +321,26 @@ export class EndpointEventStream {
  *
  * The envelope keeps the sender's identity verbatim — `id`/`ts` are minted by
  * the sending bus and must never be regenerated in transit, or one message
- * becomes two. #11 implements the routing; #8 freezes the boundary.
+ * becomes two.
  */
 export type IrcInboundEnvelope = IrcMessage;
 
 /**
- * Result of {@link AgentEndpoint.deliverIrc}.
+ * Result of {@link AgentEndpoint.deliverIrc}: three states, and no fourth.
  *
- * `not-implemented` is the only variant produced while the negotiated
- * capability set advertises `ircBidirectional: 0` (#11 turns it on), and it is
- * a resolved answer rather than a thrown error: the boundary exists so the
- * caller above (the IRC routing under #11) has one place to call, and a stub
- * that cannot deliver must say so instead of borrowing the local bus receipt —
- * that receipt would claim a delivery the frame never left the process for.
- * `delivered` / `failed` are the shapes #11 fills in; neither may be inferred
- * from the other.
+ * `delivered` names how the peer's side took the message; `failed` says the
+ * hand-over did not happen and why. `indeterminate` is the transport verdict
+ * between them — the frame was handed to a connection that could not confirm
+ * it (a dropped link, a receipt that never came back). It exists because
+ * guessing would be worse than either answer: reporting `delivered` claims a
+ * hand-over nobody observed, and reporting `failed` marks as undelivered a
+ * message the peer may already hold. Callers propagate it as-is; nothing
+ * retries an unconfirmed frame on its own.
  */
 export type IrcDeliveryReceipt =
-	| { status: "not-implemented"; detail: string }
 	| { status: "delivered"; to: string; outcome: "injected" | "woken" | "revived" }
-	| { status: "failed"; to: string; error: string };
-
-/** Pinned detail for the inbound-IRC deferral; #11 replaces the stub. */
-export const IRC_TRANSPORT_DEFERRED = "IRC transport lands under mouriya-s-lab#11";
+	| { status: "failed"; to: string; error: string }
+	| { status: "indeterminate"; to: string; error: string };
 
 /** Pinned detail for the resource-read deferral; #13 replaces the stub. */
 export const RESOURCE_READ_DEFERRED = "resource reads land under mouriya-s-lab#13";
@@ -382,8 +392,6 @@ export interface UiResponse {
  * Honest stubs, and the slice that replaces each — the return shapes are real,
  * only the answers are deferred:
  *
- * - `deliverIrc` — inbound IRC routing: #11 (this slice negotiates
- *   `ircBidirectional: 0`, so no frame has a route to take).
  * - `readResource`, `respondUi` — peer-scoped resources and UI round trips: #13.
  *
  * The control pair carries real semantics from #9 on: `ensureLive` refuses a
@@ -425,16 +433,17 @@ export interface AgentEndpoint {
 	 */
 	subscribe(fromRevision?: number): AsyncIterable<EndpointEvent>;
 	/**
-	 * Deliver one inbound IRC frame to this endpoint's peer.
+	 * Deliver one inbound IRC frame to this endpoint's peer, forwarding the
+	 * envelope exactly as received (never re-minting its `id`/`ts`, never
+	 * rewriting its addresses) and answering with the receipt of that delivery.
 	 *
-	 * Not implemented here: the managed capability set negotiates
-	 * `ircBidirectional: 0` until #11, so no inbound routing exists to call and
-	 * this answer is a resolved `not-implemented` receipt carrying
-	 * {@link IRC_TRANSPORT_DEFERRED} — never a fabricated
-	 * `injected`/`woken`/`revived`, and never a silent fallback to the local
-	 * bus.
+	 * The optional {@link IrcDeliveryOptions} describe the hand-over, not the
+	 * message: the operation id a receiver deduplicates by (defaulting to the
+	 * envelope's own id), the delivery switches of this leg, and — where the
+	 * implementation can observe one — a timeout after which an unconfirmed
+	 * frame is reported `indeterminate` rather than assumed.
 	 */
-	deliverIrc(envelope: IrcInboundEnvelope): Promise<IrcDeliveryReceipt>;
+	deliverIrc(envelope: IrcInboundEnvelope, options?: IrcDeliveryOptions): Promise<IrcDeliveryReceipt>;
 	/**
 	 * Wait until `runId` is terminal *and* has drained its replies. The result
 	 * is about the wait: `aborted` means the caller's signal fired, not that

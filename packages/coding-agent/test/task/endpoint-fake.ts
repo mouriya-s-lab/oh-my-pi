@@ -32,6 +32,8 @@
  * Test-only: nothing under `src/` may import this module.
  */
 
+import type { IrcBus } from "@oh-my-pi/pi-coding-agent/irc/bus";
+import { deliverInboundEnvelope, toIrcDeliveryReceipt } from "@oh-my-pi/pi-coding-agent/irc/inbound";
 import { createLeaseState, isLeaseExpired, tickLease, type LeaseState } from "@oh-my-pi/pi-coding-agent/modes/rpc/lease";
 import {
 	type AgentEndpoint,
@@ -41,7 +43,7 @@ import {
 	EndpointEventStream,
 	type EndpointSnapshot,
 	type EndpointSnapshotResult,
-	IRC_TRANSPORT_DEFERRED,
+	type IrcDeliveryOptions,
 	type IrcDeliveryReceipt,
 	type IrcInboundEnvelope,
 	type PrepareResult,
@@ -53,7 +55,11 @@ import {
 	UI_RESPONSE_DEFERRED,
 	type UiResponse,
 } from "@oh-my-pi/pi-coding-agent/task/endpoint";
-import { ReplyDrainedBarrier, type ReplyDrainedResult } from "@oh-my-pi/pi-coding-agent/task/reply-drained";
+import {
+	ReplyDrainedBarrier,
+	type ReplyDrainedFacts,
+	type ReplyDrainedResult,
+} from "@oh-my-pi/pi-coding-agent/task/reply-drained";
 
 /** Opaque reference every instance opens its single peer session under. */
 const FAKE_REFERENCE = "fake-remote";
@@ -91,6 +97,7 @@ export class FakeRemoteEndpoint implements AgentEndpoint {
 	/** The opaque reference this peer is addressed by; the remote arm of `AgentEndpointHandle`. */
 	readonly handle: { kind: "remote"; reference: string } = { kind: "remote", reference: FAKE_REFERENCE };
 	readonly #simulate: FakeRemoteEndpointSimulate;
+	readonly #ircBus: IrcBus | undefined;
 	readonly #events: EndpointEventStream;
 	readonly #barrier = new ReplyDrainedBarrier();
 	readonly #sessions = new Map<string, FakeEndpointSession>();
@@ -117,9 +124,22 @@ export class FakeRemoteEndpoint implements AgentEndpoint {
 	 * resume gate reads this flag and not the barrier.
 	 */
 	#repliesDrained = false;
+	/** Reason every inbound delivery is refused with; `null` accepts frames. */
+	#deliveryRefusal: string | null = null;
+	/** True when the peer hands frames over but never sees the receipt come back. */
+	#deliveryIndeterminate = false;
+	/** Outcome a delivered frame reports; the peer's own hand-over semantics. */
+	#deliveryOutcome: "injected" | "woken" | "revived" = "injected";
+	/**
+	 * Receipts already produced, keyed by `generation\0operationId`. Never
+	 * evicted: the same operation must not be handed over twice, and a cached
+	 * refusal must not become a retry.
+	 */
+	readonly #delivered = new Map<string, IrcDeliveryReceipt>();
 
-	constructor(options: { simulate?: FakeRemoteEndpointSimulate } = {}) {
+	constructor(options: { simulate?: FakeRemoteEndpointSimulate; ircBus?: IrcBus } = {}) {
 		this.#simulate = options.simulate ?? {};
+		this.#ircBus = options.ircBus;
 		this.#events = new EndpointEventStream(this.handle.kind, () => this.#snapshot());
 	}
 
@@ -131,6 +151,26 @@ export class FakeRemoteEndpoint implements AgentEndpoint {
 	/** How many peer-side sessions the fake has opened; a resume must never raise it. */
 	get sessionsCreatedCount(): number {
 		return this.#sessionsCreated;
+	}
+
+	/** Inbound frames this peer took, in delivery order: the envelope verbatim plus the operation it arrived under. */
+	readonly frames: { envelope: IrcInboundEnvelope; options: IrcDeliveryOptions }[] = [];
+	/** How many times each `(generation, operationId)` was handed over; a replay must stay at one. */
+	readonly deliveries = new Map<string, number>();
+
+	/** Refuse every inbound delivery with this reason; `null` accepts them. */
+	setDeliveryRefusal(reason: string | null): void {
+		this.#deliveryRefusal = reason;
+	}
+
+	/** Make every unconfirmed inbound delivery report `indeterminate`; the state a lost receipt produces. */
+	setDeliveryIndeterminate(indeterminate: boolean): void {
+		this.#deliveryIndeterminate = indeterminate;
+	}
+
+	/** Outcome a delivered frame reports; set to `woken`/`revived` to model the peer's own hand-over. */
+	setDeliveryOutcome(outcome: "injected" | "woken" | "revived"): void {
+		this.#deliveryOutcome = outcome;
 	}
 
 	async prepare(): Promise<PrepareResult> {
@@ -226,15 +266,15 @@ export class FakeRemoteEndpoint implements AgentEndpoint {
 	 * the peer keeps owning the run, which is what keeps a resume out of it.
 	 * Together with the terminal verdict this is the ownership release.
 	 */
-	emitReplyDrained(runId: string): void {
+	emitReplyDrained(runId: string, facts?: ReplyDrainedFacts): void {
 		if (runId !== this.#currentRunId) {
 			throw new Error(
 				`FakeRemoteEndpoint.emitReplyDrained: unknown run ${JSON.stringify(runId)} (current run: ${this.#currentRunId ?? "none"}).`,
 			);
 		}
-		this.#barrier.markDrained(runId);
+		this.#barrier.markDrained(runId, facts);
 		this.#repliesDrained = true;
-		this.#events.emit({ type: "reply_drained", runId });
+		this.#events.emit({ type: "reply_drained", runId, ...facts });
 	}
 
 	/**
@@ -289,13 +329,63 @@ export class FakeRemoteEndpoint implements AgentEndpoint {
 	}
 
 	/**
-	 * Not implemented: the negotiated capability set advertises
-	 * `ircBidirectional: 0` until #11, so there is no inbound route to take and
-	 * the answer is a resolved not-implemented receipt naming the owning slice.
-	 * A fake that cannot deliver must not borrow the local bus receipt either.
+	 * Deliver one inbound frame to this peer through the configured in-memory
+	 * transport, recording it exactly as received.
+	 *
+	 * The receipt distinguishes the three states the contract allows: delivered
+	 * (the transport took it), failed (this peer refuses it,
+	 * {@link FakeRemoteEndpoint.setDeliveryRefusal}, or no
+	 * {@link FakeRemoteEndpoint} transport was configured), and indeterminate
+	 * (the transport never sees the receipt come back,
+	 * {@link FakeRemoteEndpoint.setDeliveryIndeterminate}). Without a configured
+	 * `ircBus` the answer is always an explicit failed
+	 * `inbound IRC transport not configured` — never a faked delivered.
+	 *
+	 * A repeated `(generation, operationId)` — the sender retrying, a transport
+	 * replaying — returns the first delivery's receipt and does not record or
+	 * hand over the message again, mirroring the real boundary's dedup.
 	 */
-	async deliverIrc(_envelope: IrcInboundEnvelope): Promise<IrcDeliveryReceipt> {
-		return { status: "not-implemented", detail: IRC_TRANSPORT_DEFERRED };
+	async deliverIrc(envelope: IrcInboundEnvelope, options?: IrcDeliveryOptions): Promise<IrcDeliveryReceipt> {
+		const generation = options?.generation ?? 0;
+		const operationId = options?.operationId ?? envelope.id;
+		const key = `${generation}\u0000${operationId}`;
+		const injected = this.#delivered.get(key);
+		if (injected) return injected;
+		const receipt = await this.#deliverFrame(envelope, options, generation, operationId);
+		this.#delivered.set(key, receipt);
+		return receipt;
+	}
+	/** Count one handed-over operation so a test can assert a replay never doubled it. */
+	#countDelivery(generation: number, operationId: string): void {
+		const key = `${generation}\u0000${operationId}`;
+		this.deliveries.set(key, (this.deliveries.get(key) ?? 0) + 1);
+	}
+	/**
+	 * One first-time delivery: refused without touching the transport, otherwise
+	 * handed to the configured bus through the shared inbound boundary and then
+	 * reported (unconfirmed when the indeterminate switch is set).
+	 */
+	async #deliverFrame(
+		envelope: IrcInboundEnvelope,
+		options: IrcDeliveryOptions | undefined,
+		generation: number,
+		operationId: string,
+	): Promise<IrcDeliveryReceipt> {
+		if (this.#deliveryRefusal !== null) {
+			return { status: "failed", to: envelope.to, error: this.#deliveryRefusal };
+		}
+		const bus = this.#ircBus;
+		if (!bus) {
+			return { status: "failed", to: envelope.to, error: "inbound IRC transport not configured" };
+		}
+		this.frames.push({ envelope, options: { ...options, generation, operationId } });
+		this.#countDelivery(generation, operationId);
+		if (this.#deliveryIndeterminate) {
+			await deliverInboundEnvelope(bus, envelope, operationId, generation, options);
+			return { status: "indeterminate", to: envelope.to, error: "fixed receipt never arrived" };
+		}
+		const result = await deliverInboundEnvelope(bus, envelope, operationId, generation, options);
+		return toIrcDeliveryReceipt(result);
 	}
 
 	/** Terminal-and-drained wait for this run; see {@link ReplyDrainedBarrier.await}. */

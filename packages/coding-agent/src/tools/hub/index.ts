@@ -375,11 +375,12 @@ export class HubTool implements AgentTool<typeof hubSchema, HubDetails> {
 		const messaging = this.#messaging();
 		const manager = this.session.asyncJobManager;
 		const ownerId = this.#ownerId();
-		const from = params.from?.trim() || undefined;
-		// D2: remote messaging awaits #11 even when this wait also watches local jobs.
-		if (messaging && from && messaging.registry.get(from)?.endpoint.kind === "remote") {
-			return hubErrorResult("Remote peer messaging is not implemented (pending #11).", { op: "wait", from });
-		}
+		// Canonical ids are addresses: a peer named by its canonical id is the same
+		// mailbox key every runtime in the domain uses, and a local id resolves to
+		// the id this runtime's own frames carry. Display names never participate.
+		const from = params.from?.trim()
+			? (messaging?.registry.canonicalizeManagedPeerId(params.from.trim()) ?? params.from.trim())
+			: undefined;
 
 		// A message already buffered on the session satisfies the wait first.
 		if (messaging) {

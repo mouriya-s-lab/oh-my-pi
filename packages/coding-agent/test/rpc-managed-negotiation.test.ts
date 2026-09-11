@@ -71,7 +71,8 @@ class ManagedPeer implements RpcAgentProcess {
 		if (command.type === "prepare") {
 			this.respond(command, {
 				type: "response", command: "prepare", success: true,
-				data: { heartbeatSeconds: command.heartbeatSeconds ?? 10, leaseSeconds: command.leaseSeconds ?? 30 },
+				data: { heartbeatSeconds: command.heartbeatSeconds ?? 10, leaseSeconds: command.leaseSeconds ?? 30,
+					ircBinding: command.ircBinding, coordinatorBinding: command.coordinatorBinding },
 			});
 			return;
 		}
@@ -116,6 +117,8 @@ describe("managed native-agent negotiation", () => {
 			{ ...createRpcReadyFrame(true), nativeAgent: { ...createRpcReadyFrame(true).nativeAgent, protocolMajor: 2 } },
 			{ ...createRpcReadyFrame(true), nativeAgent: { protocolMajor: 1, capabilities: { ...MANAGED_NATIVE_AGENT_CAPABILITIES, heartbeat: 0 } } },
 			{ ...createRpcReadyFrame(true), nativeAgent: { protocolMajor: 1, capabilities: { ...MANAGED_NATIVE_AGENT_CAPABILITIES, heartbeat: true } } },
+			// https://github.com/mouriya-s-lab/oh-my-pi/issues/11 makes bidirectional IRC mandatory.
+			{ ...createRpcReadyFrame(true), nativeAgent: { protocolMajor: 1, capabilities: { ...MANAGED_NATIVE_AGENT_CAPABILITIES, ircBidirectional: 0 } } },
 		]) {
 			const peer = new ManagedPeer(ready);
 			using client = new RpcClient({ spawn: () => peer, expectManagedBootstrap: true });

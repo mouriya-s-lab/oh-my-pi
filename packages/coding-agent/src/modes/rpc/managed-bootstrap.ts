@@ -30,6 +30,7 @@ import {
 import { claimRpcInput } from "./rpc-input";
 import {
 	MANAGED_NATIVE_AGENT_CAPABILITIES,
+	parseManagedIrcBinding,
 	readRpcCorrelation,
 	type RpcCommand,
 	type RpcErrorCode,
@@ -116,6 +117,16 @@ function parsePrepare(value: Record<string, unknown>): Extract<RpcCommand, { typ
 		}
 		prepare[field] = text;
 	}
+	for (const field of ["ircBinding", "coordinatorBinding"] as const) {
+		if (value[field] === undefined) continue;
+		const binding = parseManagedIrcBinding(value[field]);
+		if (!binding) throw new BootstrapError("protocol-incompatible", `Invalid managed prepare ${field}`);
+		prepare[field] = binding;
+	}
+	if (prepare.ircBinding && prepare.coordinatorBinding &&
+		prepare.ircBinding.generation !== prepare.coordinatorBinding.generation) {
+		throw new BootstrapError("authorization-denied", "IRC directional binding generations differ");
+	}
 	for (const field of ["heartbeatSeconds", "leaseSeconds"] as const) {
 		const seconds = value[field];
 		if (seconds === undefined) continue;
@@ -150,6 +161,8 @@ async function applyPreparedContext(prepare: RpcPrepareOptions): Promise<RpcPrep
 		cwd: getProjectDir(),
 		profile: getActiveProfile() ?? "default",
 		...(prepare.agent !== undefined ? { agent: prepare.agent } : {}),
+		...(prepare.ircBinding === undefined ? {} : { ircBinding: prepare.ircBinding }),
+		...(prepare.coordinatorBinding === undefined ? {} : { coordinatorBinding: prepare.coordinatorBinding }),
 	};
 }
 

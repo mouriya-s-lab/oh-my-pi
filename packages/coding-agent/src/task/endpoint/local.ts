@@ -32,6 +32,8 @@
  */
 
 import type { Usage } from "@oh-my-pi/pi-ai";
+import { IrcBus, type IrcDeliveryOptions } from "../../irc/bus";
+import { deliverInboundEnvelope, toIrcDeliveryReceipt } from "../../irc/inbound";
 import type { AgentSession } from "../../session/agent-session";
 import {
 	type AgentEndpoint,
@@ -42,7 +44,6 @@ import {
 	EndpointEventStream,
 	type EndpointSnapshot,
 	type EndpointSnapshotResult,
-	IRC_TRANSPORT_DEFERRED,
 	type IrcDeliveryReceipt,
 	type IrcInboundEnvelope,
 	type PrepareResult,
@@ -54,8 +55,14 @@ import {
 	UI_RESPONSE_DEFERRED,
 	type UiResponse,
 } from "../endpoint";
-import { ReplyDrainedBarrier, type ReplyDrainedResult } from "../reply-drained";
+import { ReplyDrainedBarrier, type ReplyDrainedFacts, type ReplyDrainedResult } from "../reply-drained";
 import type { StructuredSubagentOutput } from "../types";
+
+/**
+ * Dedup scope of a frame that never crossed a connection: a local delivery has
+ * no connection generation to belong to, and no second boundary replays it.
+ */
+const LOCAL_IRC_GENERATION = 0;
 
 /** Why a local endpoint refuses a park request; parking is not the endpoint's to perform. */
 const LOCAL_PARK_REFUSAL = "local endpoint has no park semantics";
@@ -97,6 +104,13 @@ export interface LocalAgentEndpointOptions {
 	cancelRun: (runId: string) => Promise<void>;
 	/** Releases the session's resources on `terminate()`. */
 	terminate: () => Promise<void>;
+	/**
+	 * Bus this endpoint delivers inbound IRC through. A local endpoint speaks for
+	 * the session it wraps, so delivery is the bus's own in-process pipeline
+	 * (waiter, aside, wake) with this endpoint's peer as the recipient. Tests
+	 * inject their own bus; production uses the process-global one.
+	 */
+	bus?: IrcBus;
 }
 
 /**
@@ -116,6 +130,7 @@ export class LocalAgentEndpoint implements AgentEndpoint {
 	readonly #terminateHook: () => Promise<void>;
 	readonly #events: EndpointEventStream;
 	readonly #barrier = new ReplyDrainedBarrier();
+	readonly #bus: IrcBus;
 	readonly #managed: boolean;
 	#currentRunId: string | null = null;
 	#currentStatus: EndpointSnapshot["status"] = "idle";
@@ -137,6 +152,7 @@ export class LocalAgentEndpoint implements AgentEndpoint {
 		this.#awaitTerminal = options.awaitTerminal;
 		this.#cancelHook = options.cancelRun;
 		this.#terminateHook = options.terminate;
+		this.#bus = options.bus ?? IrcBus.global();
 		this.#managed = options.managed === true;
 		this.#events = new EndpointEventStream(this.handle.kind, () => this.#snapshot());
 	}
@@ -187,8 +203,11 @@ export class LocalAgentEndpoint implements AgentEndpoint {
 			status: terminal.status,
 			...(message !== undefined ? { message } : {}),
 		});
-		this.#barrier.markTerminal(runId);
-		this.#markRepliesDrained(runId);
+		// The revision that made this run terminal, read from the stream that just
+		// issued it: the pair a reply barrier consumer reports beside the verdict.
+		const runStatusRevision = this.#events.revision;
+		this.#barrier.markTerminal(runId, { runStatusRevision });
+		this.#markRepliesDrained(runId, { runStatusRevision });
 		return outcome;
 	}
 
@@ -211,14 +230,28 @@ export class LocalAgentEndpoint implements AgentEndpoint {
 	}
 
 	/**
-	 * Not implemented: the negotiated capability set advertises
-	 * `ircBidirectional: 0` until #11, so no inbound route exists. In-process
-	 * delivery already happens through `IrcBus`; this method is the cross-host
-	 * inbound boundary, so the answer is a resolved not-implemented receipt
-	 * naming the owning slice.
+	 * Deliver one inbound frame to this endpoint's peer through the bus's
+	 * in-process pipeline. The envelope keeps the sender's identity: no id or
+	 * timestamp is minted here, and the frame is not re-sent anywhere — a
+	 * received message must never become a new one.
+	 *
+	 * Delivery goes through the bus's inbound boundary, so the operation id
+	 * (defaulting to the envelope's own id — the identity a sender repeats when
+	 * it retries) deduplicates the same way it does for every other receiving
+	 * boundary: a repeated `(generation, operationId)` returns the first
+	 * delivery's receipt instead of injecting twice. A delivery that never
+	 * crossed a connection carries the local generation, because no second
+	 * boundary will ever replay it.
 	 */
-	async deliverIrc(_envelope: IrcInboundEnvelope): Promise<IrcDeliveryReceipt> {
-		return { status: "not-implemented", detail: IRC_TRANSPORT_DEFERRED };
+	async deliverIrc(envelope: IrcInboundEnvelope, options?: IrcDeliveryOptions): Promise<IrcDeliveryReceipt> {
+		const result = await deliverInboundEnvelope(
+			this.#bus,
+			envelope,
+			options?.operationId ?? envelope.id,
+			options?.generation ?? LOCAL_IRC_GENERATION,
+			options,
+		);
+		return toIrcDeliveryReceipt(result);
 	}
 
 	/**
@@ -318,11 +351,11 @@ export class LocalAgentEndpoint implements AgentEndpoint {
 	 * observe the window between them (that window is exactly what the ownership
 	 * gate refuses), and the barrier's waiters are released on the pair.
 	 */
-	#markRepliesDrained(runId: string): void {
+	#markRepliesDrained(runId: string, facts?: ReplyDrainedFacts): void {
 		if (this.#repliesDrained) return;
 		this.#repliesDrained = true;
-		this.#barrier.markDrained(runId);
-		this.#events.emit({ type: "reply_drained", runId });
+		this.#barrier.markDrained(runId, facts);
+		this.#events.emit({ type: "reply_drained", runId, ...facts });
 	}
 
 	/**

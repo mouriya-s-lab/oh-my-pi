@@ -747,7 +747,7 @@ describe("IRC", () => {
 			expect(sub.delivered.map(msg => msg.body)).toEqual(["ping"]);
 		});
 
-		it("op=send to=all fans out to live peers and reports per-recipient receipts", async () => {
+		it("op=send to=all reports per-recipient receipts without waking parked peers", async () => {
 			const a = makeFakeSession();
 			registry.register({ id: "0-A", displayName: "task", kind: "sub", endpoint: { kind: "local", session: a.session, sessionFile: null }});
 			const b = makeFakeSession();
@@ -758,12 +758,15 @@ describe("IRC", () => {
 			const tool = new HubTool(makeToolSession(registry, "0-Main"));
 			const result = await tool.execute("call-1", { op: "send", to: "all", message: "anyone there?" });
 			const details = result.details as CoordinationDetails | undefined;
-			// Broadcast skips parked agents; one failure does not block the other delivery.
+			// #11 queues to parked peers; one failure does not block another recipient.
 			expect(details?.receipts).toEqual([
 				{ to: "0-A", outcome: "injected" },
 				{ to: "0-B", outcome: "failed", error: "kaput" },
+				{ to: "0-Parked", outcome: "injected" },
 			]);
 			expect(a.delivered.map(msg => msg.body)).toEqual(["anyone there?"]);
+			expect(registry.get("0-Parked")?.status).toBe("parked");
+			expect(bus.inbox("0-Parked").map(msg => msg.body)).toEqual(["anyone there?"]);
 		});
 
 		it("op=send to=all does not relay sibling legs when the broadcast also reaches main", async () => {

@@ -16,6 +16,9 @@ import { toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
 import { $env, isRecord, Snowflake, withTimeout } from "@oh-my-pi/pi-utils";
 import { reset as resetCapabilities } from "../../capability";
 import { clearPluginRootsAndCaches, resolveActiveProjectRegistryPath } from "../../discovery/helpers";
+import { IrcBus } from "../../irc/bus";
+import { deliverInboundEnvelope } from "../../irc/inbound";
+import { AgentRegistry, MAIN_AGENT_ID, type AgentRef } from "../../registry/agent-registry";
 import {
 	type ExtensionUIContext,
 	type ExtensionUIDialogOptions,
@@ -45,6 +48,7 @@ import { isRpcHostToolResult, isRpcHostToolUpdate, RpcHostToolBridge } from "./h
 import { isRpcHostUriResult, RpcHostUriBridge } from "./host-uris";
 import { createLeaseState, isLeaseExpired, negotiateLease, tickLease, type LeaseState } from "./lease";
 import { buildRpcReadyFrame, type ManagedRpcBootstrap } from "./managed-bootstrap";
+import { ManagedIrcChannel, ManagedIrcError, ManagedIrcSessionObserver, parseManagedIrcWireFrame } from "./managed-irc";
 import {
 	DEFAULT_RPC_FRAME_LIMITS,
 	negotiateRpcFrameLimits,
@@ -54,8 +58,10 @@ import {
 import { claimRpcInput, readRpcInputFrames } from "./rpc-input";
 import { pageRpcMessages, RPC_MESSAGES_PAGE_BUSY_ERROR, RpcMessagesPageError } from "./rpc-messages";
 import { RpcSubagentRegistry, readRpcSubagentTranscript } from "./rpc-subagents";
-import { isRpcErrorCode, readRpcCorrelation } from "./rpc-types";
+import { isRpcErrorCode, parseManagedIrcBinding, readRpcCorrelation } from "./rpc-types";
 import type {
+	ManagedIrcBinding,
+	ManagedIrcWireFrame,
 	RpcCommand,
 	RpcCancelRunResult,
 	RpcCorrelationFields,
@@ -361,6 +367,8 @@ export interface RpcInputFrameDeps {
 	onHostToolUpdate: (frame: RpcHostToolUpdate) => void;
 	onHostUriResult: (frame: RpcHostUriResult) => void;
 	managed?: boolean;
+	onManagedIrcFrame?: (frame: ManagedIrcWireFrame) => Promise<void>;
+	onManagedIrcResponse?: (response: RpcResponse) => void;
 	runOnCancelRun?: (runId: string) => Promise<RpcCancelRunResult>;
 	runOnTerminate?: (peerId?: string) => Promise<void>;
 	onControlFrame?: () => void;
@@ -465,6 +473,35 @@ async function dispatchManagedCommand(command: RpcCommand, deps: RpcInputFrameDe
 
 /** Dispatch side-channel frames that must overtake the serialized command queue. */
 export function dispatchRpcControlFrame(parsed: unknown, deps: RpcInputFrameDeps): boolean {
+	if (deps.managed && isRecord(parsed) && parsed.type === "managed_irc") {
+		try {
+			const wire = parseManagedIrcWireFrame(parsed);
+			if (!deps.onManagedIrcFrame) throw new ManagedIrcError("authorization-denied", "Managed IRC connection is unbound");
+			deps.onControlFrame?.();
+			const task = deps.onManagedIrcFrame(wire).catch((failure: unknown) => {
+				const message = failure instanceof Error ? failure.message : String(failure);
+				deps.output(managedErrorResponse(wire, "managed_irc", message,
+					failure instanceof ManagedIrcError ? failure.code : "remote-execution-failed"));
+			});
+			deps.trackBackgroundTask?.(task);
+		} catch (failure) {
+			const message = failure instanceof Error ? failure.message : String(failure);
+			deps.output(managedErrorResponse(parsed, "managed_irc", message,
+				failure instanceof ManagedIrcError ? failure.code : "protocol-incompatible"));
+		}
+		return true;
+	}
+	if (deps.managed && isRecord(parsed) && parsed.type === "response" && parsed.command === "managed_irc") {
+		const correlation = readRpcCorrelation(parsed);
+		if (parsed.success === true && isRecord(parsed.data) && parsed.data.accepted === true) {
+			deps.onManagedIrcResponse?.({ ...correlation, type: "response", command: "managed_irc", success: true,
+				data: { accepted: true, ...(typeof parsed.data.operationId === "string" ? { operationId: parsed.data.operationId } : {}) } });
+		} else if (parsed.success === false && typeof parsed.message === "string" && isRpcErrorCode(parsed.code)) {
+			deps.onManagedIrcResponse?.({ ...correlation, type: "response", command: "managed_irc", success: false,
+				message: parsed.message, error: parsed.message, code: parsed.code });
+		}
+		return true;
+	}
 	if (deps.managed && isRecord(parsed) && parsed.type === "response" &&
 		parsed.command === "heartbeat" && parsed.success === true) {
 		deps.onControlFrame?.();
@@ -1005,9 +1042,12 @@ interface ManagedRpcRun {
 	command: "bash" | "prompt";
 	endpoint: AgentEndpoint;
 	terminal: PromiseWithResolvers<LocalTerminalResult>;
+	terminalObserved: Promise<void>;
+	replyBarrier: PromiseWithResolvers<void>;
 	abortController: AbortController;
 	promptTasks?: Promise<unknown>[];
 	outcome?: LocalTerminalResult;
+	repliesDrained?: true;
 	cleanup?: Promise<RpcCancelRunResult>;
 }
 
@@ -1112,12 +1152,116 @@ export async function runRpcMode(
 	const hostToolBridge = new RpcHostToolBridge(output);
 	const hostUriBridge = new RpcHostUriBridge(output);
 	const subagentRegistry = subagentEventBus ? new RpcSubagentRegistry(subagentEventBus, output) : undefined;
+	const ircRegistry = AgentRegistry.global();
+	const ircBus = IrcBus.global();
+	const ircRoutes = new Map<string, () => void>();
+	let localIrcBinding: ManagedIrcBinding | undefined;
+	const localIrcRegistrations = new Map<string, Promise<string>>();
+	let localIrcState: "running" | "idle" | "parked" | "execution-unknown" | undefined;
+	const publishLocalIrcState = (state: "running" | "idle" | "parked" | "execution-unknown"): void => {
+		if (!localIrcBinding || state === localIrcState) return;
+		localIrcState = state;
+		ircChannel.emit({ kind: "peer_state_changed", canonicalId: localIrcBinding.ownerPeerId,
+			state, generation: localIrcBinding.generation });
+	};
+	const registerIrcRoute = (peerId: string): void => {
+		if (ircRoutes.has(peerId)) return;
+		ircRoutes.set(peerId, ircBus.registerOutboundRoute(peerId, {
+			deliver: (envelope, delivery) => ircChannel.deliverIrc(envelope, {
+				operationId: delivery.operationId ?? envelope.id, targetPeerId: envelope.to,
+				expectsReply: delivery.expectsReply, suppressRelay: delivery.suppressRelay, wake: delivery.wake,
+			}),
+		}));
+	};
+	const ircChannel = new ManagedIrcChannel({
+		output,
+		allowPeerRegistration: true,
+		inbound: (envelope, delivery) => deliverInboundEnvelope(ircBus, envelope, delivery.operationId, delivery.generation, delivery),
+		onControlOrUi: frame => { dispatchRpcControlFrame(frame, dispatchFrameDeps); },
+		onReplyDrainedBarrier: frame => {
+			const peerId = frame.peerId ?? ircChannel.binding?.ownerPeerId;
+			if (peerId) ircBus.markRemoteReplyDrained(peerId, frame.runId);
+		},
+		onPeerFrame: frame => {
+			if (frame.kind === "peer_state_changed" && frame.state === "running" && frame.runId) {
+				ircBus.markRemoteRunStarted(frame.canonicalId, frame.runId);
+			}
+			if (frame.kind === "peer_state_changed") ircRegistry.setStatus(frame.canonicalId, frame.state);
+			else if (frame.kind === "peer_deregistered") ircRegistry.unregister(frame.canonicalId);
+			else ircRegistry.registerManagedPeer({
+				identity: { canonicalId: frame.canonicalId, nativeId: frame.canonicalId,
+					ownerPeerId: ircChannel.binding?.ownerPeerId ?? frame.canonicalId, generation: frame.generation },
+				reference: `rpc:${frame.canonicalId}`, displayName: frame.displayName, parentId: frame.parentId, status: "idle",
+			});
+			if (frame.kind === "peer_registered") registerIrcRoute(frame.canonicalId);
+			if (frame.kind === "peer_deregistered") {
+				ircRoutes.get(frame.canonicalId)?.();
+				ircRoutes.delete(frame.canonicalId);
+			}
+		},
+	});
+	const registerLocalIrcPeer = (ref: AgentRef): Promise<string> => {
+		const binding = localIrcBinding;
+		if (!binding) return Promise.reject(new ManagedRpcError("authorization-denied", "Local IRC identity is unbound"));
+		const known = ircRegistry.managedCanonicalForNative(binding.ownerPeerId, ref.id);
+		if (known) return Promise.resolve(known);
+		const existing = localIrcRegistrations.get(ref.id);
+		if (existing) return existing;
+		const pending = Promise.resolve().then(async () => {
+			const parent = ref.parentId ? ircRegistry.get(ref.parentId) : undefined;
+			if (parent === ref) throw new ManagedRpcError("authorization-denied", "Peer cannot register itself as its parent");
+			const parentId = parent?.endpoint.kind === "local" ? await registerLocalIrcPeer(parent) : binding.ownerPeerId;
+			const granted = await ircChannel.requestPeerRegistration({
+				nativeId: ref.id, parentId, displayName: ref.displayName, roles: [ref.kind],
+			});
+			ircRegistry.registerManagedLocalAlias({ identity: { canonicalId: granted.canonicalId, nativeId: ref.id,
+				ownerPeerId: binding.ownerPeerId, generation: granted.generation } });
+			ircRegistry.grantManagedRoute(binding.ownerPeerId, granted.canonicalId);
+			return granted.canonicalId;
+		});
+		localIrcRegistrations.set(ref.id, pending);
+		ircBus.registerPendingIdentity(ref.id, pending);
+		return pending;
+	};
+	const childIrcObserver = new ManagedIrcSessionObserver({
+		identify: async ref => {
+			const binding = localIrcBinding;
+			if (!binding) throw new ManagedRpcError("authorization-denied", "Local IRC identity is unbound");
+			return { canonicalId: await registerLocalIrcPeer(ref), generation: binding.generation };
+		},
+		publish: frame => ircChannel.emit(frame),
+		waitForOutbound: peerId => ircChannel.waitForOutbound(peerId),
+		track: task => shutdownCoordinator.track(task.catch(failure => output(error(undefined, "managed_irc",
+			failure instanceof Error ? failure.message : String(failure), "connection-lost")))),
+	});
+	const announceLocalIrcPeer = (ref: AgentRef, removed = false): void => {
+		if (!localIrcBinding || ref.endpoint.kind !== "local") return;
+		if (!removed && ref.endpoint.session !== session) childIrcObserver.observe(ref);
+		void registerLocalIrcPeer(ref).then(async canonicalId => {
+			const binding = localIrcBinding;
+			if (!binding) return;
+			if (removed || ref.status === "aborted") {
+				await childIrcObserver.drainAndRemove(ref.id);
+				ircChannel.emit({ kind: "peer_deregistered", canonicalId, generation: binding.generation });
+			} else {
+				ircChannel.emit({ kind: "peer_registered", canonicalId,
+					parentId: ref.parentId ? ircRegistry.canonicalizeManagedPeerId(ref.parentId) : undefined,
+					displayName: ref.displayName, roles: [ref.kind], generation: binding.generation });
+				ircChannel.emit({ kind: "peer_state_changed", canonicalId, state: ref.status, generation: binding.generation });
+			}
+		}).catch(failure => output(error(undefined, "managed_irc",
+			failure instanceof Error ? failure.message : String(failure), "authorization-denied")));
+	};
+	const unsubscribeIrcRegistry = ircRegistry.onChange(event => {
+		announceLocalIrcPeer(event.ref, event.type === "removed");
+	});
 
 	// Shutdown request flag (wrapped in object to allow mutation with const)
 	const shutdownState = { requested: false };
 	const managedRuns = new Map<string, ManagedRpcRun>();
 	const managedCommandRuns = new WeakMap<RpcCommand, ManagedRpcRun>();
 	const resumeEndpoints = new Map<string, AgentEndpoint>();
+	let ircWakeRun: Promise<ManagedRpcRun> | undefined;
 	let managedClosing = false;
 	let managedLease: LeaseState | undefined;
 	let leaseTimer: NodeJS.Timeout | undefined;
@@ -1134,6 +1278,14 @@ export async function runRpcMode(
 			await session.dispose();
 			return true;
 		}
+		ircChannel.close("RPC session disposed");
+		unsubscribeIrcRegistry();
+		childIrcObserver.close();
+		localIrcBinding = undefined;
+		for (const unregister of ircRoutes.values()) unregister();
+		ircRoutes.clear();
+		const binding = ircChannel.binding;
+		if (binding) ircRegistry.revokeManagedConnection(binding.ownerPeerId, binding.generation);
 		managedDisposal ??= withTimeout(session.dispose(), MANAGED_CLEANUP_TIMEOUT_MS,
 			"Managed session disposal timed out").then(() => true, failure => {
 				output(error(undefined, "terminate", failure instanceof Error ? failure.message : String(failure), "timeout"));
@@ -1151,8 +1303,11 @@ export async function runRpcMode(
 		const result = await manager.waitForOwnerJobsAndReplies(ownerId, signal);
 		if (result.status !== "drained") throw new ManagedRpcError("timeout", "Owned job replies did not drain");
 	};
-	const beginManagedRun = async (command: RpcCommand, kind: "bash" | "prompt"): Promise<ManagedRpcRun> => {
+	const beginManagedRun = async (command: RpcCommand | undefined, kind: "bash" | "prompt"): Promise<ManagedRpcRun> => {
 		if (managedClosing) throw new ManagedRpcError("connection-lost", "Managed peer is shutting down");
+		if (kind === "prompt" && command && ircWakeRun) {
+			throw new ManagedRpcError("resource-unavailable", "An IRC wake turn still owns the session");
+		}
 		if (kind === "prompt" && [...managedRuns.values()].some(run =>
 			run.command === "prompt" && run.endpoint.asHandleSnapshot().status === "running")) {
 			throw new ManagedRpcError("resource-unavailable", "A model run still owns the session");
@@ -1175,24 +1330,40 @@ export async function runRpcMode(
 			terminate: () => session.dispose(),
 		});
 		const ack = await endpoint.start(kind);
-		const run: ManagedRpcRun = { runId: ack.runId, command: kind, endpoint, terminal, abortController };
+		const run: ManagedRpcRun = { runId: ack.runId, command: kind, endpoint, terminal, abortController,
+			terminalObserved: endpoint.run(ack.runId).then(() => {}), replyBarrier: Promise.withResolvers<void>() };
 		managedRuns.set(run.runId, run);
-		managedCommandRuns.set(command, run);
-		void endpoint.run(run.runId);
+		if (command) managedCommandRuns.set(command, run);
 		if (managedClosing) {
 			abortController.abort();
 			terminal.resolve({ status: "cancelled" });
 			throw new ManagedRpcError("connection-lost", "Managed peer closed before execution started");
 		}
 		output({ type: "managed_run_start", runId: run.runId, command: kind, ...readRpcCorrelation(command) });
+		publishLocalIrcState("running");
 		return run;
 	};
 	const finishManagedRun = async (run: ManagedRpcRun, outcome: LocalTerminalResult): Promise<void> => {
 		run.outcome = outcome;
-		await flushStdout();
 		run.terminal.resolve(outcome);
-		await run.endpoint.waitReplyDrained(run.runId);
-		output({ type: "managed_run_end", runId: run.runId, status: outcome.status, replyDrained: true });
+		await run.terminalObserved;
+		const drained = await run.endpoint.waitReplyDrained(run.runId);
+		if (drained.status !== "drained") throw new ManagedRpcError("connection-lost", "Run replies did not drain");
+		if (drained.runStatusRevision === undefined) throw new ManagedRpcError("protocol-incompatible", "Terminal status revision was not observed");
+		output({ type: "managed_run_end", runId: run.runId, status: outcome.status,
+			replyDrained: false, runStatusRevision: drained.runStatusRevision });
+		if (![...managedRuns.values()].some(candidate => candidate.endpoint.asHandleSnapshot().status === "running")) {
+			publishLocalIrcState("idle");
+		}
+		await session.waitForIrcReplies();
+		const outboundWatermark = await ircChannel.waitForOutbound();
+		await flushStdout();
+		if (ircChannel.binding) {
+			ircChannel.emit({ kind: "reply_drained_barrier", runId: run.runId,
+				runStatusRevision: drained.runStatusRevision, outboundWatermark });
+		}
+		run.repliesDrained = true;
+		run.replyBarrier.resolve();
 	};
 	const runOnCancelRun = async (runId: string): Promise<RpcCancelRunResult> => {
 		const run = managedRuns.get(runId);
@@ -1206,6 +1377,7 @@ export async function runRpcMode(
 					await run.endpoint.cancelRun(runId);
 					const drained = await run.endpoint.waitReplyDrained(runId, { signal: abort.signal });
 					if (drained.status !== "drained") throw new ManagedRpcError("timeout", `Reply cleanup timed out for ${runId}`);
+					await run.replyBarrier.promise;
 					await flushStdout();
 				})(), MANAGED_CLEANUP_TIMEOUT_MS, `Cancellation cleanup timed out for ${runId}`);
 				return { status: "cancelled", replyDrained: true };
@@ -1236,14 +1408,22 @@ export async function runRpcMode(
 		for (let index = 0; index < results.length; index++) {
 			output({ type: "managed_lifecycle", phase: "cleanup", reason, runId: active[index].runId, ...results[index] });
 		}
+		const ircDrained = await withTimeout(
+			Promise.all([...managedRuns.values()].map(run => run.replyBarrier.promise)),
+			MANAGED_CLEANUP_TIMEOUT_MS, "Outbound IRC replies did not drain",
+		).then(() => true, failure => {
+			output(error(undefined, "terminate", failure instanceof Error ? failure.message : String(failure), "timeout"));
+			return false;
+		});
 		if (reason === "lease") {
 			for (const run of managedRuns.values()) {
-				const ack = await run.endpoint.park(run.runId);
+				const ack = run.repliesDrained ? await run.endpoint.park(run.runId) :
+					{ acknowledged: false, reason: "Pending outbound IRC replies retain ownership" };
 				output({ type: "managed_lifecycle", phase: "park", reason, runId: run.runId, ...ack });
 			}
 		}
 		output({ type: "managed_lifecycle", phase: "drain", reason });
-		return ownedDrained && results.every(result => result.status === "cancelled");
+		return ownedDrained && ircDrained && results.every(result => result.status === "cancelled");
 	};
 	const runOnTerminate = async (peerId?: string): Promise<void> => {
 		if (peerId !== undefined && peerId !== session.getAgentId() && peerId !== session.sessionId) {
@@ -1470,6 +1650,33 @@ export async function runRpcMode(
 	// Output all agent events as JSON
 	session.subscribe(event => {
 		output(event);
+		if (event.type === "agent_start") {
+			publishLocalIrcState("running");
+			if (options.managed && localIrcBinding && !ircWakeRun &&
+				![...managedRuns.values()].some(run => run.command === "prompt" && run.endpoint.asHandleSnapshot().status === "running")) {
+				const pending = beginManagedRun(undefined, "prompt");
+				ircWakeRun = pending;
+				void pending.catch(failure => {
+					if (ircWakeRun === pending) ircWakeRun = undefined;
+					output(error(undefined, "managed_irc", failure instanceof Error ? failure.message : String(failure), "connection-lost"));
+				});
+			}
+		} else if (event.type === "agent_end" && event.isTerminal !== false) {
+			if (ircWakeRun) {
+				const pendingRun = ircWakeRun;
+				ircWakeRun = undefined;
+				const lastAssistant = event.messages.findLast(message => message.role === "assistant");
+				const status = lastAssistant?.stopReason === "aborted" ? "cancelled" :
+					lastAssistant?.stopReason === "error" ? "failed" : "completed";
+				const task = pendingRun.then(run => finishManagedRun(run, {
+					status: run.abortController.signal.aborted ? "cancelled" : status,
+				}));
+				shutdownCoordinator.track(task.catch(failure => output(error(undefined, "managed_irc",
+					failure instanceof Error ? failure.message : String(failure), "connection-lost"))));
+			} else if (![...managedRuns.values()].some(run => run.endpoint.asHandleSnapshot().status === "running")) {
+				publishLocalIrcState("idle");
+			}
+		}
 	});
 
 	const getAvailableCommands = async () => buildAvailableSlashCommands(session);
@@ -1522,6 +1729,31 @@ export async function runRpcMode(
 							`Managed prepare cannot change ${field} after session initialization`);
 					}
 				}
+				const binding = parseManagedIrcBinding(command.ircBinding);
+				const coordinator = parseManagedIrcBinding(command.coordinatorBinding);
+				if (command.ircBinding !== undefined || command.coordinatorBinding !== undefined) {
+					if (!binding || !coordinator || binding.generation !== coordinator.generation) {
+						throw new ManagedRpcError("authorization-denied", "Invalid directional IRC bindings");
+					}
+					if (localIrcBinding && (localIrcBinding.ownerPeerId !== binding.ownerPeerId || localIrcBinding.generation !== binding.generation)) {
+						throw new ManagedRpcError("authorization-denied", "Local IRC identity cannot be replaced");
+					}
+					if (!ircRegistry.bindManagedConnection(binding) || !ircRegistry.bindManagedConnection(coordinator)) {
+						throw new ManagedRpcError("authorization-denied", "IRC ownership generation is stale or revoked");
+					}
+					ircChannel.bind(coordinator);
+					localIrcBinding = binding;
+					ircRegistry.registerManagedLocalAlias({ identity: { canonicalId: binding.ownerPeerId,
+						nativeId: session.getAgentId() ?? MAIN_AGENT_ID, ownerPeerId: binding.ownerPeerId, generation: binding.generation }, binding });
+					ircBus.registerIdentity(binding.ownerPeerId, session.getAgentId() ?? MAIN_AGENT_ID);
+					for (const id of [coordinator.ownerPeerId, ...coordinator.allowedDescendants]) {
+						registerIrcRoute(id);
+						ircRegistry.registerManagedPeer({
+							identity: { canonicalId: id, nativeId: id, ownerPeerId: coordinator.ownerPeerId, generation: coordinator.generation },
+							reference: `rpc:${id}`, displayName: id, status: "idle",
+						});
+					}
+				}
 				const proposed = createLeaseState();
 				const negotiated = negotiateLease({
 					heartbeatSeconds: command.heartbeatSeconds ?? proposed.heartbeatSeconds,
@@ -1542,7 +1774,8 @@ export async function runRpcMode(
 						process.exit(0);
 					})();
 				}, Math.min(negotiated.heartbeatSeconds * 1_000, 250));
-				return success(id, "prepare", { ...negotiated, ...options.bootstrap?.preparedContext });
+				return success(id, "prepare", { ...negotiated, ...options.bootstrap?.preparedContext,
+					...(binding ? { ircBinding: binding } : {}), ...(coordinator ? { coordinatorBinding: coordinator } : {}) });
 			}
 
 			case "heartbeat": {
@@ -1558,6 +1791,9 @@ export async function runRpcMode(
 				if (!options.managed) return error(undefined, command.type, `Unknown command: ${command.type}`);
 				const run = managedRuns.get(command.runId);
 				if (!run) throw new ManagedRpcError("resource-unavailable", `Unknown managed run: ${command.runId}`);
+				if (!run.repliesDrained) return success(id, "park", {
+					acknowledged: false, reason: "Run still owns pending outbound IRC replies",
+				});
 				const acknowledgement = await run.endpoint.park(command.runId);
 				if (acknowledgement.acknowledged && acknowledgement.resumeReference) {
 					resumeEndpoints.set(acknowledgement.resumeReference, run.endpoint);
@@ -1569,6 +1805,9 @@ export async function runRpcMode(
 				if (!options.managed) return error(undefined, command.type, `Unknown command: ${command.type}`);
 				const endpoint = resumeEndpoints.get(command.reference);
 				if (!endpoint) throw new ManagedRpcError("resource-unavailable", `Unknown resume reference: ${command.reference}`);
+				if ([...managedRuns.values()].some(run => !run.repliesDrained)) {
+					return success(id, "resume", { status: "still-owned", detail: "Pending outbound IRC replies retain ownership" });
+				}
 				if ([...managedRuns.values()].some(run => run.endpoint.asHandleSnapshot().status === "running")) {
 					return success(id, "resume", { status: "still-owned", detail: "The existing session still owns active work" });
 				}
@@ -2117,13 +2356,35 @@ export async function runRpcMode(
 		errorResponse: error,
 		trackBackgroundTask: task => shutdownCoordinator.track(task),
 		pendingExtensionRequests,
-		onHostToolResult: frame => hostToolBridge.handleResult(frame),
+		onManagedIrcFrame: frame => {
+			if (managedClosing && (frame.frame.kind === "irc_delivery" || frame.frame.kind === "peer_registration_request")) {
+				throw new ManagedIrcError("authorization-denied", "Closing RPC connection cannot accept new IRC work");
+			}
+			const bound = ircChannel.binding;
+			if (bound) {
+				const current = ircRegistry.getManagedConnectionBinding(bound.ownerPeerId);
+				if (!current || current.generation !== bound.generation) ircChannel.close("IRC ownership revoked or superseded");
+				else ircChannel.bind({ ...current, allowedDescendants: [...current.allowedDescendants] });
+			}
+			return ircChannel.handleFrame(frame);
+		},
 		onHostToolUpdate: frame => hostToolBridge.handleUpdate(frame),
 		onHostUriResult: frame => hostUriBridge.handleResult(frame),
+		onHostToolResult: frame => hostToolBridge.handleResult(frame),
+		onManagedIrcResponse: response => { ircChannel.handleResponse(response); },
 		onControlFrame: () => {
 			if (managedLease && !managedClosing) managedLease = tickLease(managedLease);
 		},
 		afterResponse: async (command, response) => {
+			if (command.type === "prepare" && response.success && command.ircBinding) {
+				ircChannel.emit({ kind: "peer_registered", canonicalId: command.ircBinding.ownerPeerId,
+					displayName: "Main", roles: ["main"], generation: command.ircBinding.generation });
+				publishLocalIrcState(session.isStreaming ? "running" : "idle");
+				for (const ref of ircRegistry.list()) {
+					if (ref.id !== (session.getAgentId() ?? MAIN_AGENT_ID)) announceLocalIrcPeer(ref);
+				}
+				return;
+			}
 			const run = managedCommandRuns.get(command);
 			if (!run) return;
 			if (run.command === "bash" || !response.success) {

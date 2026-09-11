@@ -55,6 +55,66 @@ function isAddressablePeer(ref: { id: string; kind: string; status: string }, se
 	return ref.id !== senderId && ref.kind !== "advisor" && ref.status !== "aborted";
 }
 
+/** Outcomes that prove the recipient's runtime actually took the message. */
+function isDeliveredOutcome(outcome: IrcDeliveryReceipt["outcome"]): boolean {
+	return outcome === "injected" || outcome === "woken" || outcome === "revived";
+}
+
+/** One hub envelope on its way to a single canonical target. */
+interface HubDelivery {
+	from: string;
+	to: string;
+	body: string;
+	replyTo?: string;
+	expectsReply?: boolean;
+	suppressRelay?: boolean;
+	/**
+	 * Wake policy for a recipient that is not live: `false` queues the message
+	 * for a parked peer instead of reviving it. Broadcasts set it so one
+	 * broadcast never stampedes every parked agent back to life.
+	 */
+	wake?: boolean;
+}
+
+/**
+ * Send one hub envelope to its canonical target.
+ *
+ * The bus owns transport selection — a local recipient goes through the
+ * in-process pipeline, a peer of another runtime through its registered route
+ * or the endpoint it was registered with — and mints the envelope's identity
+ * exactly once, then carries that same envelope to the far side. The hub only
+ * decides what to send and how the hand-over behaves, so no second send and no
+ * regenerated `id`/`ts` can appear between here and the receiving runtime, and
+ * an unconfirmed hand-over stays `indeterminate` instead of reading as either
+ * outcome it is not.
+ */
+async function deliverToTarget(bus: IrcBus, delivery: HubDelivery): Promise<IrcDeliveryReceipt> {
+	return bus.send(
+		{ from: delivery.from, to: delivery.to, body: delivery.body, replyTo: delivery.replyTo },
+		{ expectsReply: delivery.expectsReply, suppressRelay: delivery.suppressRelay, wake: delivery.wake },
+	);
+}
+
+/**
+ * Enumerate a broadcast's targets from the current visible roster: the live
+ * peers a broadcast has always reached plus this root's parked agents, each
+ * addressed individually. Parked targets are queued, never revived (see
+ * {@link HubDelivery.wake}), so the parked set survives a broadcast intact.
+ */
+function broadcastTargets(
+	registry: AgentRegistry,
+	senderId: string,
+	rootSessionFile: string | undefined,
+): string[] {
+	const targets = registry.listVisibleTo(senderId).map(ref => ref.id);
+	for (const ref of registry.list()) {
+		if (ref.status !== "parked" || !isAddressablePeer(ref, senderId)) continue;
+		if (!isCurrentSessionRosterRef(ref, rootSessionFile)) continue;
+		targets.push(ref.id);
+	}
+	return targets;
+}
+
 function resolveHubListLimit(limit: number | undefined): number {
 	if (limit === undefined || !Number.isFinite(limit) || limit <= 0) return DEFAULT_HUB_LIST_LIMIT;
 	return Math.min(Math.max(1, Math.floor(limit)), MAX_HUB_LIST_LIMIT);
@@ -242,9 +302,6 @@ export async function executeSend(
 	if (!message) {
 		return hubErrorResult('`message` is required for op="send".', { op: "send", from: senderId });
 	}
-	if (to === senderId) {
-		return hubErrorResult("Cannot send a message to yourself.", { op: "send", from: senderId, to });
-	}
 	const isBroadcast = to === "all";
 	if (isBroadcast && params.await) {
 		return hubErrorResult('`await` is invalid with to:"all" — broadcasts have no single replier.', {
@@ -253,26 +310,26 @@ export async function executeSend(
 			to,
 		});
 	}
-	// A direct send may address a parked id that another root's scan (or a
-	// prior list) restored into this process-global registry. Refresh this
-	// caller's persisted roster once before the bus resolves the target, so a
-	// same-named parked ref (and the revival that follows it) targets this
-	// root's transcript — never requiring a prior `list`. Broadcasts address
-	// no id and fan out to live peers only, so they skip the refresh. A
-	// missing caller session hint keeps the existing in-memory behavior: no
-	// root is guessed from the registry or cwd.
-	if (!isBroadcast && sessionFileHint) {
-		await ensurePersistedRoster(registry, sessionFileHint);
-	}
-
-	// D2: remote IRC routing belongs to #11; do not revive or enqueue on the local bus.
-	if (registry.get(senderId)?.endpoint.kind === "remote" || (!isBroadcast && registry.get(to)?.endpoint.kind === "remote")) {
-		return hubErrorResult("Remote peer messaging is not implemented (pending #11).", {
-			op: "send",
-			from: senderId,
-			to,
-			receipts: [{ to, outcome: "failed", error: "Remote IRC delivery is not implemented (pending #11)." }],
-		});
+	// A direct send may address a parked id another root's scan (or a prior
+	// `list`) restored into this process-global registry, and a broadcast has to
+	// enumerate this root's parked agents before it can queue to them. Refresh
+	// this caller's persisted roster once, up front, so same-named parked refs
+	// resolve to this root's transcript — never requiring a prior `list`. With
+	// no hint the in-memory roster is used as-is; no root is guessed from the
+	// registry or the cwd.
+	const rootSessionFile = sessionFileHint
+		? await ensurePersistedRoster(registry, sessionFileHint)
+		: getLocalSessionFile(registry.get(senderId));
+	// Routing keys are canonical ids. A caller may name a peer the way this
+	// runtime does internally or by the canonical id the rest of the domain
+	// uses — both resolve to the same ref, and the wire address is always the
+	// canonical form. Display names never participate, so an unknown id fails
+	// lookup instead of guessing a peer.
+	const senderCanonicalId = registry.canonicalizeManagedPeerId(senderId);
+	const targetRefId = isBroadcast ? to : registry.resolveManagedLocalRefId(to);
+	const targetCanonicalId = isBroadcast ? to : registry.canonicalizeManagedPeerId(targetRefId);
+	if (targetCanonicalId === senderCanonicalId) {
+		return hubErrorResult("Cannot send a message to yourself.", { op: "send", from: senderId, to });
 	}
 	const bus = IrcBus.global();
 	let waited: IrcMessage | null | undefined;
@@ -282,9 +339,9 @@ export async function executeSend(
 	let removeAwaitAbortListener: (() => void) | undefined;
 	const waiting = params.await
 		? bus
-				.wait(senderId, { from: to }, timeoutMs ?? DEFAULT_IRC_TIMEOUT_MS, awaitAbort?.signal, {
+				.wait(senderId, { from: targetCanonicalId }, timeoutMs ?? DEFAULT_IRC_TIMEOUT_MS, awaitAbort?.signal, {
 					drainPending: false,
-					awaitTarget: { registry, target: to },
+					awaitTarget: { registry, target: targetCanonicalId },
 				})
 				.then(
 					message => ({ message, error: null as Error | null }),
@@ -307,36 +364,41 @@ export async function executeSend(
 	}
 
 	try {
-		// Broadcasts fan out to live peers only (running | idle); reviving every
-		// parked agent on a broadcast would be a stampede. Direct sends go
-		// through the bus unfiltered so parked recipients are revived.
-		const targets = isBroadcast ? registry.listVisibleTo(senderId).map(ref => ref.id) : [to];
+		// Broadcasts fan out to the current visible roster — live peers plus this
+		// root's parked agents — and address every target individually, each with
+		// its own receipt. Parked targets are queued rather than revived
+		// (wake:false), so one broadcast never stampedes the parked set back to
+		// life. Direct sends keep the default wake policy, where a parked target
+		// is revived exactly as it always was.
+		const targets = isBroadcast ? broadcastTargets(registry, senderId, rootSessionFile) : [targetRefId];
 		// A broadcast that also reaches the main agent delivers the body to it
 		// directly (its own incoming card); relaying the sibling legs to the
 		// main UI would then show the same body once per other recipient.
 		const suppressRelay = isBroadcast && targets.includes(MAIN_AGENT_ID);
 		const receipts = await Promise.all(
 			targets.map(target =>
-				registry.get(target)?.endpoint.kind === "remote"
-					? Promise.resolve<IrcDeliveryReceipt>({
-							to: target,
-							outcome: "failed",
-							error: "Remote IRC delivery is not implemented (pending #11).",
-						})
-					: bus.send(
-					{ from: senderId, to: target, body: message, replyTo: params.replyTo },
+				deliverToTarget(bus, {
+					from: senderCanonicalId,
+					to: target,
+					body: message,
+					replyTo: params.replyTo,
 					// Awaited sends mark the sender as blocked on an answer so a
 					// busy recipient that cannot reach a step boundary (async
 					// disabled) auto-replies instead of stranding the sender.
-					{ expectsReply: params.await || undefined, suppressRelay: suppressRelay || undefined },
-				),
+					expectsReply: params.await || undefined,
+					suppressRelay: suppressRelay || undefined,
+					wake: isBroadcast ? false : undefined,
+				}),
 			),
 		);
 
 		const lines: string[] = [];
-		const delivered = receipts.filter(receipt => receipt.outcome !== "failed");
+		const delivered = receipts.filter(receipt => isDeliveredOutcome(receipt.outcome));
+		const unconfirmed = receipts.filter(receipt => receipt.outcome === "indeterminate");
 		if (targets.length === 0) {
 			lines.push("No live peers to broadcast to.");
+		} else if (delivered.length === 0 && unconfirmed.length > 0) {
+			lines.push(`Delivery unconfirmed for ${unconfirmed.length} peer(s):`);
 		} else if (delivered.length === 0) {
 			lines.push("No recipients received the message.");
 		} else {
@@ -346,13 +408,28 @@ export async function executeSend(
 			lines.push(
 				receipt.outcome === "failed"
 					? `- ${receipt.to}: failed — ${receipt.error ?? "unknown error"}`
-					: `- ${receipt.to}: ${receipt.outcome}`,
+					: receipt.outcome === "indeterminate"
+						? `- ${receipt.to}: unconfirmed — ${receipt.error ?? "no receipt was confirmed"}`
+						: `- ${receipt.to}: ${receipt.outcome}`,
 			);
 		}
 
 		if (params.await && waiting && timeoutMs !== undefined) {
 			lines.push("");
-			if (delivered.length > 0) {
+			// Receipts carry the canonical target the bus minted, which is the form
+			// this send addressed regardless of the local alias the caller used.
+			const targetReceipt = receipts.find(receipt => receipt.to === targetCanonicalId);
+			if (targetReceipt?.outcome === "indeterminate") {
+				// The frame's fate is unknown, so neither "sent" nor "failed" is
+				// true: tear the waiter down with the send and report exactly what
+				// is known. A later reply still lands in the inbox.
+				awaitAbort?.abort(awaitCancelled);
+				await waiting;
+				lines.push(
+					`Delivery to ${to} is unconfirmed — the peer may never have received the message. ` +
+						"Not waiting for a reply; check `inbox` or `wait` before resending.",
+				);
+			} else if (delivered.length > 0) {
 				const reply = await waiting;
 				if (reply.error) {
 					if (reply.error instanceof IrcAwaitTargetStopped) {
@@ -403,7 +480,10 @@ export async function executeSend(
 				receipts,
 				...(waited !== undefined ? { waited } : {}),
 			},
-			isError: delivered.length === 0 && targets.length > 0,
+			// Nothing was delivered, but an unconfirmed frame is not a failure the
+			// caller may resend blindly — report the unknown state as its own
+			// outcome instead of folding it into either verdict.
+			isError: delivered.length === 0 && unconfirmed.length === 0 && targets.length > 0,
 		};
 	} finally {
 		awaitAbort?.abort(awaitCancelled);
@@ -418,10 +498,18 @@ export async function executeMessageWait(
 	signal?: AbortSignal,
 ): Promise<AgentToolResult<CoordinationDetails>> {
 	const { registry, senderId, settings } = deps;
-	const from = params.from?.trim() || undefined;
-	// D2: waiting on a remote peer must not route through the local IRC bus.
-	if (registry.get(senderId)?.endpoint.kind === "remote" || (from && registry.get(from)?.endpoint.kind === "remote")) {
-		return hubErrorResult("Remote peer messaging is not implemented (pending #11).", { op: "wait", from: senderId });
+	// A canonical id is an address, not a display key: the caller may name a peer
+	// the way every runtime in the domain does, and the filter is applied to the
+	// envelope's `from`, which is canonical on the wire and in this runtime's
+	// inbox. Local ids pass through unchanged.
+	const from = params.from?.trim() ? registry.canonicalizeManagedPeerId(params.from.trim()) : undefined;
+	// A peer this runtime only reaches through a connection has no local session
+	// to run the wait in; its own runtime owns that inbox.
+	if (registry.get(senderId)?.endpoint.kind === "remote") {
+		return hubErrorResult(`Agent "${senderId}" runs in another runtime; its inbox is not local.`, {
+			op: "wait",
+			from: senderId,
+		});
 	}
 	const timeoutMs = resolveMessageTimeoutMs(settings, params.timeoutMs);
 	try {
@@ -451,9 +539,13 @@ export function executeInbox(
 	senderId: string,
 	peek?: boolean,
 ): AgentToolResult<CoordinationDetails> {
-	// D2: no local mailbox is authoritative for a remote peer.
+	// A peer this runtime only reaches through a connection has no local mailbox
+	// to drain; its own runtime owns that inbox.
 	if (registry.get(senderId)?.endpoint.kind === "remote") {
-		return hubErrorResult("Remote peer messaging is not implemented (pending #11).", { op: "inbox", from: senderId });
+		return hubErrorResult(`Agent "${senderId}" runs in another runtime; its inbox is not local.`, {
+			op: "inbox",
+			from: senderId,
+		});
 	}
 	const busMessages = IrcBus.global().inbox(senderId, { peek });
 	const session = getLocalSession(registry.get(senderId));
@@ -498,6 +590,10 @@ function outcomeColor(outcome: IrcDeliveryReceipt["outcome"]): ToolUIColor {
 			return "accent";
 		case "failed":
 			return "error";
+		case "indeterminate":
+			// The frame left this runtime but no receipt came back, so neither the
+			// delivered nor the failed color may claim it.
+			return "warning";
 	}
 }
 
@@ -661,8 +757,9 @@ function renderSendResult(
 		];
 	}
 
-	const delivered = receipts.filter(receipt => receipt.outcome !== "failed");
-	const failedCount = receipts.length - delivered.length;
+	const delivered = receipts.filter(receipt => isDeliveredOutcome(receipt.outcome));
+	const unconfirmed = receipts.filter(receipt => receipt.outcome === "indeterminate");
+	const failedCount = receipts.filter(receipt => receipt.outcome === "failed").length;
 	const waited = details.waited;
 	const timedOut = waited === null;
 
@@ -675,6 +772,7 @@ function renderSendResult(
 		if (delivered.length > 0) meta.push(theme.fg("success", `${delivered.length} delivered`));
 		if (failedCount > 0) meta.push(theme.fg("error", `${failedCount} failed`));
 	}
+	if (unconfirmed.length > 0) meta.push(theme.fg("warning", `${unconfirmed.length} unconfirmed`));
 	if (timedOut) meta.push(theme.fg("warning", "no reply"));
 
 	const icon = result.isError

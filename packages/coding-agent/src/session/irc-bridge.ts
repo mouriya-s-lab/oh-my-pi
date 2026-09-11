@@ -157,6 +157,8 @@ export class IrcBridge {
 	/** Delivers an IRC message into the recipient session without awaiting any wake turn. */
 	async deliver(msg: IrcMessage, opts?: { expectsReply?: boolean }): Promise<"injected" | "woken"> {
 		if (this.#host.isDisposed()) throw new Error("Recipient session is disposed.");
+		const registry = AgentRegistry.global();
+		const recipientNativeId = registry.resolveManagedLocalRefId(msg.to);
 		const streaming = this.#host.isStreaming();
 		const planModeIdle = !streaming && this.#host.planModeEnabled();
 		const autoReply =
@@ -164,7 +166,7 @@ export class IrcBridge {
 		// An idle subagent runs a monitored wake turn whose output is relayed
 		// back to the sender (task executor `relayWakeTurnOutput`); the main
 		// agent and mid-turn asides have no such relay.
-		const relayOnStop = !streaming && !planModeIdle && msg.to !== MAIN_AGENT_ID && msg.wakeRelay !== true;
+		const relayOnStop = !streaming && !planModeIdle && recipientNativeId !== MAIN_AGENT_ID && msg.wakeRelay !== true;
 		const record: CustomMessage = {
 			role: "custom",
 			customType: "irc:incoming",
@@ -189,8 +191,10 @@ export class IrcBridge {
 		};
 		void this.#host.emitSessionEvent({ type: "irc_message", message: record });
 		if (streaming) {
-			const recipientParentId = AgentRegistry.global().get(msg.to)?.parentId;
-			if (recipientParentId === msg.from) {
+			const recipientParentId = registry.get(recipientNativeId)?.parentId;
+			const canonicalParentId =
+				recipientParentId === undefined ? undefined : registry.canonicalizeManagedPeerId(recipientParentId);
+			if (canonicalParentId === msg.from) {
 				this.#host.agent.steer({
 					role: "user",
 					content: prompt.render(parentIrcSteerTemplate, { from: msg.from, message: msg.body }),

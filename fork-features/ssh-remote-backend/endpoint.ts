@@ -41,9 +41,9 @@
  *
  * ## Deferrals
  *
- * `deliverIrc` / `readResource` / `respondUi` keep the honest stub answers the
- * contract pins (#11 and #13 own those channels); the endpoint invents no
- * delivery receipt, no bytes, and no acknowledgement.
+ * `deliverIrc` uses the managed bidirectional side-channel; only its delivery
+ * receipt settles delivery. Resource reads and UI responses remain explicit
+ * deferrals to #13, never fabricated bytes or acknowledgements.
  *
  * Direct control remains available through {@link SshBackendEndpoint.transport}:
  * `transport.client.getState()` / `.abort()` are diagnostics on the peer's own
@@ -53,8 +53,10 @@
 
 import type { Usage } from "@oh-my-pi/pi-ai";
 import { isRecord, untilAborted } from "@oh-my-pi/pi-utils";
+import { toIrcDeliveryReceipt } from "../../packages/coding-agent/src/irc/inbound";
 import { RpcClientError, type RpcClient } from "../../packages/coding-agent/src/modes/rpc/rpc-client";
 import type { RpcManagedRunEvent } from "../../packages/coding-agent/src/modes/rpc/rpc-types";
+import { AgentRegistry } from "../../packages/coding-agent/src/registry/agent-registry";
 import {
 	type AgentEndpoint,
 	type AgentEndpointHandle,
@@ -63,7 +65,7 @@ import {
 	EndpointEventStream,
 	type EndpointSnapshot,
 	type EndpointSnapshotResult,
-	IRC_TRANSPORT_DEFERRED,
+	type IrcDeliveryOptions,
 	type IrcDeliveryReceipt,
 	type IrcInboundEnvelope,
 	type PrepareResult,
@@ -138,13 +140,16 @@ export class SshBackendEndpoint implements AgentEndpoint {
 	readonly #events: EndpointEventStream;
 	readonly #barrier = new ReplyDrainedBarrier();
 	#unsubscribeRunEvents: (() => void) | undefined;
+	#unsubscribeReplyBarrier: (() => void) | undefined;
 	#unsubscribeLifecycle: (() => void) | undefined;
 	#unsubscribeCapture: (() => void) | undefined;
+	#detachIrcEndpoint: (() => void) | undefined;
 	#currentRunId: string | null = null;
 	#currentStatus: EndpointSnapshot["status"] = "idle";
 	#lastMessage: string | undefined;
 	/** The current run's single verdict; absent while it is still in flight. First writer wins. */
 	#verdict: RunOutcome | undefined;
+	#terminalRevision: number | undefined;
 	/** True once the peer reported the current run's replies drained; the other half of ownership. */
 	#repliesDrained = false;
 	/** In-flight `start()` waiting for the peer's `managed_run_start`; guards concurrent starts. */
@@ -167,6 +172,12 @@ export class SshBackendEndpoint implements AgentEndpoint {
 		this.handle = { kind: "remote", reference };
 		this.#events = new EndpointEventStream(this.handle.kind, () => this.#snapshot());
 		this.#observe();
+		const binding = this.#client.getIrcBinding();
+		if (binding) {
+			this.#detachIrcEndpoint = AgentRegistry.global().attachManagedEndpoint(
+				binding.ownerPeerId, binding.generation, this,
+			);
+		}
 	}
 
 	/** The role and capabilities the factory negotiated with the peer; nothing is probed here. */
@@ -278,21 +289,23 @@ export class SshBackendEndpoint implements AgentEndpoint {
 		return this.#events.subscribe(fromRevision);
 	}
 
-	/**
-	 * Not implemented: the managed capability set advertises `ircBidirectional: 0`
-	 * until #11, so no inbound route exists. A stub that cannot deliver says so
-	 * instead of borrowing a receipt from the local bus.
-	 */
-	async deliverIrc(_envelope: IrcInboundEnvelope): Promise<IrcDeliveryReceipt> {
-		return { status: "not-implemented", detail: IRC_TRANSPORT_DEFERRED };
+	/** Forward the existing envelope; the RPC receipt is distinct from the ACK and reply. */
+	async deliverIrc(envelope: IrcInboundEnvelope, options?: IrcDeliveryOptions): Promise<IrcDeliveryReceipt> {
+		const result = await this.#client.deliverIrc(envelope, {
+			operationId: options?.operationId ?? envelope.id,
+			targetPeerId: envelope.to,
+			generation: options?.generation,
+			expectsReply: options?.expectsReply,
+			suppressRelay: options?.suppressRelay,
+			wake: options?.wake,
+		});
+		return toIrcDeliveryReceipt(result);
 	}
 
 	/**
-	 * Wait for the peer's terminal frame, which carries the drain report with it:
-	 * the peer writes `replyDrained: true` only after the run's replies actually
-	 * drained, so the terminal-and-drained pair is a reported fact rather than an
-	 * inference. A lost connection reports neither, so the wait stays open —
-	 * ownership is not released by silence.
+	 * Wait for both the peer's terminal event and its separate reply-drained
+	 * barrier. `run_end` alone cannot prove that preceding outbound replies have
+	 * reached their receipt boundary; a lost connection never fabricates a drain.
 	 */
 	async waitReplyDrained(runId: string, opts?: { signal?: AbortSignal }): Promise<ReplyDrainedResult> {
 		return this.#barrier.await(runId, opts?.signal);
@@ -359,6 +372,11 @@ export class SshBackendEndpoint implements AgentEndpoint {
 	/** Subscribe to the peer's managed facts; live for the whole endpoint lifetime, before any write. */
 	#observe(): void {
 		this.#unsubscribeRunEvents = this.#client.onManagedRunEvent(event => this.#onManagedRunEvent(event));
+		this.#unsubscribeReplyBarrier = this.#client.onReplyDrainedBarrier(frame => {
+			if (frame.peerId !== undefined && frame.peerId !== this.#client.getIrcBinding()?.ownerPeerId) return;
+			if (frame.runId !== this.#currentRunId) return;
+			this.#markRepliesDrained(frame.runId, frame.runStatusRevision, frame.outboundWatermark);
+		});
 		this.#unsubscribeLifecycle = this.#client.onManagedLifecycle(lifecycle => {
 			if (lifecycle.status === "execution-unknown") this.#observeTransportLoss(lifecycle.error.message);
 			else if (lifecycle.status === "stopped") {
@@ -373,8 +391,8 @@ export class SshBackendEndpoint implements AgentEndpoint {
 	 * A `prompt` start is adopted only while a `start()` call is waiting for its
 	 * id: a run this endpoint did not accept must not be claimed by it. A
 	 * `bash` run is a direct control on the client, not an assignment, so it is
-	 * ignored. A terminal frame for the current run is settled verbatim, and its
-	 * `replyDrained: true` is the peer's drain fact.
+	 * ignored. A terminal frame settles the outcome only; reply ownership remains
+	 * outstanding until the independent reply-drained barrier arrives.
 	 */
 	#onManagedRunEvent(event: RpcManagedRunEvent): void {
 		if (event.type === "managed_run_start") {
@@ -385,8 +403,9 @@ export class SshBackendEndpoint implements AgentEndpoint {
 			return;
 		}
 		if (event.runId !== this.#currentRunId) return;
+		if (this.#verdict !== undefined) return;
+		this.#terminalRevision = event.runStatusRevision;
 		this.#settleRun(event.runId, event.status);
-		if (event.replyDrained) this.#markRepliesDrained(event.runId);
 	}
 
 	/** Record the peer's acceptance and hand the waiting `start()` its receipt. */
@@ -395,6 +414,7 @@ export class SshBackendEndpoint implements AgentEndpoint {
 		this.#currentRunId = runId;
 		this.#currentStatus = "running";
 		this.#verdict = undefined;
+		this.#terminalRevision = undefined;
 		this.#repliesDrained = false;
 		this.#runWaiter = undefined;
 		this.#capturedText = [];
@@ -439,18 +459,19 @@ export class SshBackendEndpoint implements AgentEndpoint {
 			status,
 			...(message !== undefined ? { message } : {}),
 		});
-		this.#barrier.markTerminal(runId);
+		this.#barrier.markTerminal(runId, { runStatusRevision: this.#terminalRevision });
 		const waiter = this.#runWaiter;
 		this.#runWaiter = undefined;
 		waiter?.resolve(outcome);
 	}
 
 	/** Record the peer's drain report for the current run; ownership releases on the pair. */
-	#markRepliesDrained(runId: string): void {
-		if (this.#repliesDrained) return;
+	#markRepliesDrained(runId: string, runStatusRevision: number, outboundWatermark: number): void {
+		if (this.#repliesDrained || this.#verdict === undefined) return;
+		if (this.#terminalRevision !== undefined && runStatusRevision !== this.#terminalRevision) return;
 		this.#repliesDrained = true;
-		this.#barrier.markDrained(runId);
-		this.#events.emit({ type: "reply_drained", runId });
+		this.#barrier.markDrained(runId, { runStatusRevision, outboundWatermark });
+		this.#events.emit({ type: "reply_drained", runId, runStatusRevision, outboundWatermark });
 	}
 
 	/**
@@ -512,9 +533,13 @@ export class SshBackendEndpoint implements AgentEndpoint {
 	/** Stop every client subscription; idempotent, so teardown can call it once. */
 	#stopObserving(): void {
 		this.#unsubscribeRunEvents?.();
+		this.#unsubscribeReplyBarrier?.();
 		this.#unsubscribeLifecycle?.();
+		this.#detachIrcEndpoint?.();
+		this.#detachIrcEndpoint = undefined;
 		this.#stopCapture();
 		this.#unsubscribeRunEvents = undefined;
+		this.#unsubscribeReplyBarrier = undefined;
 		this.#unsubscribeLifecycle = undefined;
 	}
 

@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
+import { IrcBus, type IrcEnvelope } from "@oh-my-pi/pi-coding-agent/irc/bus";
+import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
-import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import type { AgentSession, AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import type { RunAck, RunOutcome } from "@oh-my-pi/pi-coding-agent/task/endpoint";
 import { LocalAgentEndpoint, type LocalAgentEndpointOptions } from "@oh-my-pi/pi-coding-agent/task/endpoint/local";
 import { FakeRemoteEndpoint } from "./endpoint-fake";
@@ -43,7 +45,39 @@ function localEndpoint(hooks: Partial<LocalAgentEndpointOptions> = {}): LocalAge
 		awaitTerminal: hooks.awaitTerminal ?? (async () => ({ status: "completed" })),
 		cancelRun: hooks.cancelRun ?? (async () => {}),
 		terminate: hooks.terminate ?? (async () => {}),
+		...(hooks.bus !== undefined ? { bus: hooks.bus } : {}),
 	});
+}
+
+/**
+ * A bus over its own registry with `peer` as a recording local session — the
+ * minimum a behavioral delivery row needs, without touching the global bus the
+ * rest of the suite shares.
+ */
+function deliveryBus(peer: string): {
+	bus: IrcBus;
+	registry: AgentRegistry;
+	delivered: { envelope: IrcEnvelope; expectsReply: boolean | undefined }[];
+} {
+	const registry = new AgentRegistry();
+	const delivered: { envelope: IrcEnvelope; expectsReply: boolean | undefined }[] = [];
+	const session = {
+		async deliverIrcMessage(envelope: IrcEnvelope, opts?: { expectsReply?: boolean }) {
+			delivered.push({ envelope, expectsReply: opts?.expectsReply });
+			return "injected" as const;
+		},
+		subscribe: (_listener: (event: AgentSessionEvent) => void) => () => {},
+		waitForIrcReplies: async () => {},
+		emitIrcRelayObservation: () => {},
+	} as unknown as AgentSession;
+	registry.register({
+		id: peer,
+		displayName: peer,
+		kind: "sub",
+		status: "running",
+		endpoint: { kind: "local", session, sessionFile: null },
+	});
+	return { bus: new IrcBus(registry), registry, delivered };
 }
 
 describe("AgentEndpoint contract", () => {
@@ -152,5 +186,103 @@ describe("AgentEndpoint contract", () => {
 
 		await expect(endpoint.cancelRun(crypto.randomUUID())).rejects.toThrow(/unknown run/);
 		await endpoint.cancelRun(ack.runId);
+	});
+});
+
+// The inbound boundary is behavioural, not a stub check: an endpoint reports
+// how *its peer's* side took the frame, keeps the sender's envelope verbatim,
+// and collapses a replayed operation into the one hand-over it already had.
+
+const PEER = "peer:local-child";
+
+function frame(overrides: Partial<IrcEnvelope> = {}): IrcEnvelope {
+	return {
+		id: "msg-1",
+		from: "peer:local-main",
+		to: PEER,
+		body: "hand this over",
+		ts: 1_700_000_000_000,
+		...overrides,
+	};
+}
+
+describe("inbound IRC delivery", () => {
+	it("delivers one frame to the peer and hands the envelope over verbatim", async () => {
+		const { bus, delivered } = deliveryBus(PEER);
+		const endpoint = localEndpoint({ bus });
+		const envelope = frame({ replyTo: "msg-0" });
+
+		const receipt = await endpoint.deliverIrc(envelope, { operationId: "op-7", generation: 3 });
+
+		expect(receipt).toEqual({ status: "delivered", to: PEER, outcome: "injected" });
+		expect(delivered).toHaveLength(1);
+		// Same identity in and out: no id/ts re-minted, no address rewritten.
+		expect(delivered[0]!.envelope).toEqual(envelope);
+		expect(delivered[0]!.envelope.id).toBe("msg-1");
+		expect(delivered[0]!.envelope.ts).toBe(1_700_000_000_000);
+		expect(delivered[0]!.envelope.from).toBe("peer:local-main");
+	});
+
+	it("injects a replayed operation once and returns the same receipt to the replay", async () => {
+		const { bus, delivered } = deliveryBus(PEER);
+		const endpoint = localEndpoint({ bus });
+
+		const first = await endpoint.deliverIrc(frame(), { operationId: "op-7", generation: 3 });
+		const replay = await endpoint.deliverIrc(frame(), { operationId: "op-7", generation: 3 });
+
+		expect(delivered).toHaveLength(1);
+		expect(replay).toEqual(first);
+		// A different generation is a different operation scope: it delivers.
+		const otherGeneration = await endpoint.deliverIrc(frame(), { operationId: "op-7", generation: 4 });
+		expect(delivered).toHaveLength(2);
+		expect(otherGeneration).toEqual(first);
+	});
+
+	it("reports failed for a peer this endpoint's bus cannot reach, and never fakes a hand-over", async () => {
+		const { bus } = deliveryBus(PEER);
+		const endpoint = localEndpoint({ bus });
+
+		const receipt = await endpoint.deliverIrc(frame({ to: "peer:remote-main" }));
+
+		expect(receipt.status).toBe("failed");
+		if (receipt.status !== "failed") throw new Error("expected a failed receipt");
+		expect(receipt.to).toBe("peer:remote-main");
+		expect(receipt.error).toContain("peer:remote-main");
+	});
+
+	it("reports indeterminate — neither delivered nor failed — when a transport cannot confirm the frame", async () => {
+		const { bus, delivered } = deliveryBus(PEER);
+		const endpoint = new FakeRemoteEndpoint({ ircBus: bus });
+		await endpoint.start(REMOTE_ASSIGNMENT);
+		endpoint.setDeliveryIndeterminate(true);
+		const receipt = await endpoint.deliverIrc(frame(), { operationId: "op-9", generation: 1 });
+		expect(receipt.status).toBe("indeterminate");
+		if (receipt.status !== "indeterminate") throw new Error("expected an indeterminate receipt");
+		expect(receipt.to).toBe(PEER);
+		expect(endpoint.frames).toHaveLength(1);
+		expect(delivered).toHaveLength(1);
+	});
+	it("records a frame the fake peer took, and collapses a replayed operation into one hand-over", async () => {
+		const { bus, delivered } = deliveryBus(PEER);
+		const endpoint = new FakeRemoteEndpoint({ ircBus: bus });
+		await endpoint.start(REMOTE_ASSIGNMENT);
+		const envelope = frame();
+		const first = await endpoint.deliverIrc(envelope, { operationId: "op-9", generation: 1 });
+		const replay = await endpoint.deliverIrc(envelope, { operationId: "op-9", generation: 1 });
+		expect(first).toEqual({ status: "delivered", to: PEER, outcome: "injected" });
+		expect(replay).toEqual(first);
+		expect(endpoint.frames).toHaveLength(1);
+		expect(endpoint.frames[0]!.envelope).toEqual(envelope);
+		expect(endpoint.deliveries.get("1\u0000op-9")).toBe(1);
+		expect(delivered).toHaveLength(1);
+	});
+	it("fails without a configured transport instead of faking a delivery", async () => {
+		const endpoint = new FakeRemoteEndpoint();
+		await endpoint.start(REMOTE_ASSIGNMENT);
+		const receipt = await endpoint.deliverIrc(frame(), { operationId: "op-9", generation: 1 });
+		expect(receipt.status).toBe("failed");
+		if (receipt.status !== "failed") throw new Error("expected a failed receipt");
+		expect(receipt.error).toContain("inbound IRC transport not configured");
+		expect(endpoint.frames).toHaveLength(0);
 	});
 });

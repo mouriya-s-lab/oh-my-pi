@@ -58,6 +58,7 @@ import type {
 	RpcHostUriCancelRequest,
 	RpcHostUriRequest,
 	RpcHostUriResult,
+	RpcReadyFrame,
 	RpcResponse,
 	RpcSessionState,
 	RpcSubagentSubscriptionLevel,
@@ -425,10 +426,12 @@ export class RpcInputDispatcher {
 	#tasks = new Set<Promise<void>>();
 	readonly #deps: RpcInputFrameDeps;
 	readonly #afterSerialCommand: (() => Promise<void>) | undefined;
+	readonly #managed: boolean;
 
-	constructor(options: { deps: RpcInputFrameDeps; afterSerialCommand?: () => Promise<void> }) {
+	constructor(options: { deps: RpcInputFrameDeps; afterSerialCommand?: () => Promise<void>; managed?: boolean }) {
 		this.#deps = options.deps;
 		this.#afterSerialCommand = options.afterSerialCommand;
+		this.#managed = options.managed === true;
 	}
 
 	/** Accept a parsed input frame without blocking the stdin reader. */
@@ -442,11 +445,16 @@ export class RpcInputDispatcher {
 				return;
 			}
 
-			const task = this.#tail.then(
-				() => this.#dispatchSerialCommand(command),
-				() => this.#dispatchSerialCommand(command),
-			);
-			this.#tail = task.catch(() => {});
+			const isManagedControl =
+				this.#managed &&
+				(command.type === "get_state" || command.type === "abort" || command.type === "abort_bash");
+			const task = isManagedControl
+				? this.#dispatchCommand(command)
+				: this.#tail.then(
+						() => this.#dispatchCommand(command),
+						() => this.#dispatchCommand(command),
+					);
+			if (!isManagedControl) this.#tail = task.catch(() => {});
 			this.#tasks.add(task);
 			void task.finally(() => {
 				this.#tasks.delete(task);
@@ -457,14 +465,14 @@ export class RpcInputDispatcher {
 		}
 	}
 
-	/** Await every accepted serial command, including commands queued before EOF. */
+	/** Await serial and managed control commands, including commands queued before EOF. */
 	async drain(): Promise<void> {
 		while (this.#tasks.size > 0) {
 			await Promise.allSettled(Array.from(this.#tasks));
 		}
 	}
 
-	async #dispatchSerialCommand(command: RpcCommand): Promise<void> {
+	async #dispatchCommand(command: RpcCommand): Promise<void> {
 		try {
 			const awaited = dispatchRpcInputFrame(command, this.#deps);
 			if (awaited) await awaited;
@@ -494,10 +502,19 @@ export class RpcShutdownCoordinator {
 	#shutdown: Promise<void> | undefined;
 	readonly #isShutdownRequested: () => boolean;
 	readonly #performShutdown: () => Promise<void>;
+	readonly #managed: boolean;
+	readonly #runOnManagedEof: (() => void) | undefined;
 
-	constructor(options: { isShutdownRequested: () => boolean; performShutdown: () => Promise<void> }) {
+	constructor(options: {
+		isShutdownRequested: () => boolean;
+		performShutdown: () => Promise<void>;
+		managed?: boolean;
+		runOnManagedEof?: () => void;
+	}) {
 		this.#isShutdownRequested = options.isShutdownRequested;
 		this.#performShutdown = options.performShutdown;
+		this.#managed = options.managed === true;
+		this.#runOnManagedEof = options.runOnManagedEof;
 	}
 
 	/**
@@ -514,6 +531,15 @@ export class RpcShutdownCoordinator {
 			// and background tasks catch their own dispatch errors.
 			void this.checkShutdownRequested();
 		});
+	}
+
+	/** Cancel managed work before draining; legacy EOF still only drains. */
+	async handleEof(dispatcher: RpcInputDispatcher): Promise<void> {
+		// Cancel-then-drain proves issue #4 acceptance #3 wiring. Heartbeat,
+		// lease and the full cleanup taxonomy remain Stage-2 (issue #9).
+		if (this.#managed) this.#runOnManagedEof?.();
+		await dispatcher.drain();
+		await this.drain();
 	}
 
 	/** Await every tracked task, including tasks tracked while draining. */
@@ -765,6 +791,24 @@ export function requestRpcDialog<T>(
 	output({ type: "extension_ui_request", id, ...request } as RpcExtensionUIRequest);
 	return promise;
 }
+/** Construct the bootstrap declaration without adding any keys to legacy ready frames. */
+export function createRpcReadyFrame(managed = false): RpcReadyFrame {
+	const frame: RpcReadyFrame = {
+		type: "ready",
+		protocolVersion: 1,
+		supportedProtocolVersions: [1, 2],
+		maxFrameBytes: MAX_RPC_FRAME_BYTES,
+		maxReassembledFrameBytes: MAX_RPC_REASSEMBLED_BYTES,
+	};
+	if (managed) {
+		frame.nativeAgent = {
+			protocolMajor: 1,
+			capabilities: ["managed-bootstrap/v0", "control-side-channel/v0"],
+		};
+	}
+	return frame;
+}
+
 /**
  * Run in RPC mode.
  * Listens for JSON commands on stdin, outputs events and responses on stdout.
@@ -774,6 +818,7 @@ export async function runRpcMode(
 	setToolUIContext?: (uiContext: ExtensionUIContext, hasUI: boolean) => void,
 	subagentEventBus?: EventBus,
 	input: ReadableStream<Uint8Array> = claimRpcInput(),
+	options: { managed?: boolean } = {},
 ): Promise<never> {
 	// Signal to RPC clients that the server is ready to accept commands
 	// Suppress terminal notifications: they write \x07 (BEL) or OSC sequences directly to
@@ -797,15 +842,7 @@ export async function runRpcMode(
 			// stdout gone (host exited) — nothing left to deliver; keep the queue alive.
 			.catch(() => {});
 	};
-	writeFrames(
-		frameEncoder.encodeFrames({
-			type: "ready",
-			protocolVersion: 1,
-			supportedProtocolVersions: [1, 2],
-			maxFrameBytes: MAX_RPC_FRAME_BYTES,
-			maxReassembledFrameBytes: MAX_RPC_REASSEMBLED_BYTES,
-		}),
-	);
+	writeFrames(frameEncoder.encodeFrames(createRpcReadyFrame(options.managed)));
 	const output = (obj: RpcResponse | RpcExtensionUIRequest | object) => {
 		writeFrames(frameEncoder.encodeFrames(obj));
 		if (isRecord(obj) && obj.type === "response" && obj.command === "negotiate_protocol" && obj.success === true)
@@ -1571,6 +1608,8 @@ export async function runRpcMode(
 	// re-checks the request as each task settles.
 	const shutdownCoordinator = new RpcShutdownCoordinator({
 		isShutdownRequested: () => shutdownState.requested,
+		managed: options.managed,
+		runOnManagedEof: () => inputDispatcher.dispatch({ type: "abort" }),
 		performShutdown: async () => {
 			// Route through the idempotent session.dispose() so the browser
 			// reaper (releaseTabsForOwner) and other bounded teardown run before
@@ -1595,6 +1634,7 @@ export async function runRpcMode(
 
 	const inputDispatcher = new RpcInputDispatcher({
 		deps: dispatchFrameDeps,
+		managed: options.managed,
 		afterSerialCommand: () => shutdownCoordinator.checkShutdownRequested(),
 	});
 
@@ -1615,8 +1655,7 @@ export async function runRpcMode(
 	pendingExtensionRequests.rejectAll("RPC client disconnected before extension UI response completed");
 	hostToolBridge.close("RPC client disconnected before host tool execution completed");
 	hostUriBridge.clear("RPC client disconnected before host URI request completed");
-	await inputDispatcher.drain();
-	await shutdownCoordinator.drain();
+	await shutdownCoordinator.handleEof(inputDispatcher);
 	subagentRegistry?.dispose();
 	// Dispose the main session before exiting so the browser reaper and other
 	// bounded teardown run on the stdin-EOF path too (#5643). Idempotent: a

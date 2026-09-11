@@ -141,12 +141,21 @@ export interface RpcPromptResultFrame {
 	agentInvoked: boolean;
 }
 
+export interface NativeAgentReadyDeclaration {
+	/** Native-agent protocol major (see RFC #1 §8 D5). This slice ships major = 1. */
+	protocolMajor: 1;
+	/** Capabilities implemented in this build. Freeform strings; stable identifiers only. */
+	capabilities: readonly string[];
+}
+
 export interface RpcReadyFrame {
 	type: "ready";
 	protocolVersion: 1;
 	supportedProtocolVersions: [1, 2];
 	maxFrameBytes: number;
 	maxReassembledFrameBytes: number;
+	/** Managed-bootstrap-only. Absent for legacy `--mode rpc`. */
+	nativeAgent?: NativeAgentReadyDeclaration;
 }
 
 export interface RpcChunkFrame {

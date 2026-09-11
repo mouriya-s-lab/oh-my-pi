@@ -89,6 +89,14 @@ export interface RpcClientOptions {
 	terminationGraceMs?: number;
 	/** Custom tools owned by the embedding host and exposed over the RPC transport */
 	customTools?: RpcClientCustomTool[];
+	/**
+	 * Require the remote `ready` frame to declare a managed native-agent bootstrap
+	 * (a `nativeAgent` object with `protocolMajor === 1`). Without that declaration
+	 * `start()` rejects and the child is reaped before any protocol negotiation or
+	 * custom-tool registration. This only validates the handshake the embedding
+	 * host already arranged; it does not add CLI arguments. Default: false.
+	 */
+	expectManagedBootstrap?: boolean;
 }
 
 export type ModelInfo = Pick<Model, "provider" | "id" | "contextWindow" | "reasoning" | "thinking">;
@@ -178,6 +186,14 @@ function supportsRpcProtocolV2(value: Record<string, unknown>): boolean {
 		value.maxFrameBytes === MAX_RPC_FRAME_BYTES &&
 		value.maxReassembledFrameBytes === MAX_RPC_REASSEMBLED_BYTES
 	);
+}
+
+/** True when a `ready` frame declares a managed native-agent bootstrap at protocol major 1. */
+function declaresManagedNativeAgentBootstrap(value: Record<string, unknown>): boolean {
+	if (!("nativeAgent" in value)) return false;
+	const nativeAgent = value.nativeAgent;
+	if (!isRecord(nativeAgent)) return false;
+	return typeof nativeAgent.protocolMajor === "number" && nativeAgent.protocolMajor === 1;
 }
 
 function isAgentEvent(value: unknown): value is AgentEvent {
@@ -369,8 +385,15 @@ export class RpcClient {
 		void (async () => {
 			for await (const line of lines) {
 				if (!readySettled && isRecord(line) && line.type === "ready") {
-					protocolV2Supported = supportsRpcProtocolV2(line);
 					readySettled = true;
+					if (this.options.expectManagedBootstrap && !declaresManagedNativeAgentBootstrap(line)) {
+						// Reject and stop reading so no later frame or response is processed;
+						// the startup failure path in start() reaps the child before any
+						// protocol negotiation or custom-tool write.
+						readyReject(new Error("remote did not declare a managed native-agent bootstrap"));
+						return;
+					}
+					protocolV2Supported = supportsRpcProtocolV2(line);
 					readyResolve();
 					continue;
 				}

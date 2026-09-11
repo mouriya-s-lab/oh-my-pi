@@ -18,3 +18,10 @@ This directory records fork-specific changes that live in trunk source rather th
 - Boundary: nothing consumes the endpoint yet. `AsyncJob.status` and `AgentRegistry`'s `AgentStatus` are deliberately not widened, `TaskTool.execute` is not rewired, and the three `as*Snapshot()` views are not read by the `hub` job/list renderers. `mouriya-s-lab/oh-my-pi#8` owns that migration plus the status-union widening; the surface still unowned by any slice (`deliverIrc`, `replyQuiescence`, `park`, `ensureLive`, `readResource`, `respondUi`, `snapshot`, `subscribe`) is listed in the `AgentEndpoint` doc comment and lands under #8/#9/#11/#13.
 - Why in trunk: the contract must be importable by both the executor path and the monitor/registry path, which live in `src/task/` and `src/async/` — no extension seam spans them, and a fork-side shim would only add a copy that drifts.
 - Slice: `mouriya-s-lab/oh-my-pi#3` (skeleton); #7 gates `prepare`/`start`, #8 migrates monitor/registry consumers.
+
+## packages/coding-agent/src/modes/rpc/ — managed bootstrap flag (issue #4)
+
+- Files touched: `cli/args.ts`, `main.ts`, `modes/rpc/rpc-mode.ts`, `modes/rpc/rpc-types.ts`, `modes/rpc/rpc-client.ts`.
+- Change: `--rpc-subagent` (rejected unless `--mode rpc`) passes `{ managed }` as the fifth `runRpcMode` argument; managed bootstrap declares a `nativeAgent` block on the `ready` frame, fast-paths `get_state`/`abort`/`abort_bash` off the serial command queue, and initiates in-flight cancellation on stdin EOF instead of draining silently. Legacy path unchanged when the flag is absent.
+- Why in trunk: the managed bootstrap rides the existing native RPC `ready`/command-queue/stdin lifecycle so hosts see one shape; no current extension seam lets a fork extend the RPC bootstrap without editing the mode runner.
+- Slice: `mouriya-s-lab/oh-my-pi#4` (skeleton, https://github.com/mouriya-s-lab/oh-my-pi/issues/4); heartbeat/lease/resume/full errors land under https://github.com/mouriya-s-lab/oh-my-pi/issues/9.

@@ -57,6 +57,7 @@ export interface Args {
 	version?: boolean;
 	mode?: Mode;
 	noSession?: boolean;
+	rpcSubagent?: boolean;
 	sessionDir?: string;
 	providerSessionId?: string;
 	providerPromptCacheKey?: string;
@@ -246,6 +247,8 @@ export function parseArgs(inputArgs: string[], extensionFlags?: Map<string, { ty
 			result.fromCodex = true;
 		} else if (arg === "--no-session") {
 			result.noSession = true;
+		} else if (arg === "--rpc-subagent") {
+			result.rpcSubagent = true;
 		} else if (arg === "--no-tools") {
 			result.noTools = true;
 		} else if (arg === "--no-lsp") {

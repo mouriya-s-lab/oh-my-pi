@@ -33,6 +33,7 @@ import {
 } from "./rpc-messages";
 import { isNativeAgentCapabilitySet, isRpcErrorCode, readRpcCorrelation } from "./rpc-types";
 import type {
+	NativeAgentCapabilitySet,
 	RpcAvailableCommandsUpdateFrame,
 	RpcAvailableSlashCommand,
 	RpcCancelRunResult,
@@ -47,6 +48,9 @@ import type {
 	RpcHostToolDefinition,
 	RpcHostToolResult,
 	RpcHostToolUpdate,
+	RpcManagedRunEvent,
+	RpcPrepareOptions,
+	RpcPrepareResult,
 	RpcResponse,
 	RpcResumeResult,
 	RpcSessionState,
@@ -116,6 +120,14 @@ export interface RpcClientOptions {
 	managedFrameLimits?: RpcFrameLimits;
 	/** Proposed managed heartbeat and receive-side lease durations, in seconds. */
 	managedLease?: { heartbeatSeconds?: number; leaseSeconds?: number };
+	/**
+	 * Bootstrap context the peer applies during the automatic `prepare` that
+	 * follows protocol negotiation: remote working directory, profile, and
+	 * agent. The peer echoes the values it actually applied; read them back
+	 * with {@link RpcClient.getPreparedContext}, which reports only confirmed
+	 * fields. Ignored outside managed mode.
+	 */
+	prepare?: RpcPrepareOptions;
 }
 
 export type ModelInfo = Pick<Model, "provider" | "id" | "contextWindow" | "reasoning" | "thinking">;
@@ -126,6 +138,7 @@ export type RpcSubagentLifecycleListener = (payload: RpcSubagentLifecycleFrame["
 export type RpcSubagentProgressListener = (payload: RpcSubagentProgressFrame["payload"]) => void;
 export type RpcSubagentEventListener = (payload: RpcSubagentEventFrame["payload"]) => void;
 export type RpcAvailableCommandsUpdateListener = (commands: RpcAvailableSlashCommand[]) => void;
+export type RpcManagedRunEventListener = (event: RpcManagedRunEvent) => void;
 
 export interface RpcClientToolContext<TDetails = unknown> {
 	toolCallId: string;
@@ -257,6 +270,74 @@ function isRpcAvailableCommandsUpdateFrame(value: unknown): value is RpcAvailabl
 	return value.type === "available_commands_update" && Array.isArray(value.commands);
 }
 
+/** True for the two managed run boundary frames; unrelated frames are left to the legacy routing. */
+function isManagedRunEventFrame(
+	value: unknown,
+): value is { type: "managed_run_start" | "managed_run_end" } & Record<string, unknown> {
+	if (!isRecord(value)) return false;
+	return value.type === "managed_run_start" || value.type === "managed_run_end";
+}
+
+/**
+ * Parse a managed run boundary frame, or reject it.
+ *
+ * There is no permissive middle: a boundary is either complete and consistent
+ * or it is malformed. A start must name its run and one of the two permitted
+ * commands; a terminal boundary must carry one of the three permitted statuses
+ * and `replyDrained: true`, because that flag is written only after the run's
+ * replies actually drained. Accepting anything looser would let a forged frame
+ * present a non-fact as a terminal one.
+ *
+ * The optional correlation envelope is read with {@link readRpcCorrelation},
+ * the same reader every other frame uses, so malformed correlation fields are
+ * dropped rather than surfaced and no identifier is ever invented here.
+ */
+function parseManagedRunEvent(value: Record<string, unknown>): RpcManagedRunEvent | undefined {
+	const runId = value.runId;
+	if (typeof runId !== "string" || runId.length === 0) return undefined;
+	if (value.type === "managed_run_start") {
+		const command = value.command;
+		if (command !== "bash" && command !== "prompt") return undefined;
+		return { type: "managed_run_start", runId, command, ...readRpcCorrelation(value) };
+	}
+	if (value.type === "managed_run_end") {
+		const status = value.status;
+		if (status !== "completed" && status !== "failed" && status !== "cancelled") return undefined;
+		if (value.replyDrained !== true) return undefined;
+		return { type: "managed_run_end", runId, status, replyDrained: true };
+	}
+	return undefined;
+}
+
+/**
+ * Read the applied bootstrap context off a `prepare` answer.
+ *
+ * Every field the request carried must come back as a non-empty string, but
+ * the value is not compared for equality: the peer reports what it resolved
+ * (a normalized profile name, a canonical directory path, the agent definition
+ * name it selected), and an equal-looking string is not the contract. An
+ * omitted requested field is: it means the peer did not apply the request.
+ */
+function readPreparedContext(data: Record<string, unknown>, requested: RpcPrepareOptions): RpcPrepareOptions {
+	const context: RpcPrepareOptions = {};
+	for (const field of ["cwd", "profile", "agent"] as const) {
+		const applied = data[field];
+		if (applied === undefined) {
+			if (requested[field] !== undefined)
+				throw new RpcClientError(
+					"protocol-incompatible",
+					`Managed peer did not apply the requested prepare ${field}`,
+					"prepare",
+				);
+			continue;
+		}
+		if (typeof applied !== "string" || applied.length === 0)
+			throw new RpcClientError("protocol-incompatible", `Managed peer reported an invalid prepared ${field}`, "prepare");
+		context[field] = applied;
+	}
+	return context;
+}
+
 function isRpcHostToolCallRequest(value: unknown): value is RpcHostToolCallRequest {
 	if (!isRecord(value)) return false;
 	return (
@@ -345,6 +426,7 @@ export class RpcClient {
 	#subagentProgressListeners = new Set<RpcSubagentProgressListener>();
 	#subagentEventListeners = new Set<RpcSubagentEventListener>();
 	#availableCommandsUpdateListeners = new Set<RpcAvailableCommandsUpdateListener>();
+	#managedRunListeners = new Set<RpcManagedRunEventListener>();
 	#pendingRequests: Map<string, { id: string; resolve: (response: RpcResponse) => void; reject: (error: Error) => void }> =
 		new Map();
 	#customTools: RpcClientCustomTool[] = [];
@@ -362,6 +444,10 @@ export class RpcClient {
 	#managedEncoder = new RpcFrameEncoder();
 	#frameLimits: RpcFrameLimits | undefined;
 	#peerLease: { heartbeatSeconds?: number; leaseSeconds?: number } | undefined;
+	/** Bootstrap context the peer confirmed applying; reset per connection. */
+	#preparedContext: RpcPrepareOptions | undefined;
+	/** Capability flags read from the peer's own ready declaration. */
+	#nativeAgentCapabilities: NativeAgentCapabilitySet | undefined;
 
 	constructor(private options: RpcClientOptions = {}) {
 		this.#customTools = [...(options.customTools ?? [])];
@@ -390,6 +476,8 @@ export class RpcClient {
 		this.#managedEncoder = new RpcFrameEncoder();
 		this.#frameLimits = undefined;
 		this.#peerLease = undefined;
+		this.#preparedContext = undefined;
+		this.#nativeAgentCapabilities = undefined;
 
 		const cliPath = this.options.cliPath ?? "dist/cli.js";
 		const args = ["--mode", "rpc"];
@@ -474,6 +562,8 @@ export class RpcClient {
 						readyReject(new RpcClientError("protocol-incompatible", "remote did not declare a managed native-agent bootstrap with the full capability contract"));
 						return;
 					}
+					if (isRecord(line.nativeAgent) && isNativeAgentCapabilitySet(line.nativeAgent.capabilities))
+						this.#nativeAgentCapabilities = { ...line.nativeAgent.capabilities };
 					if (this.options.expectManagedBootstrap) {
 						try {
 							if (!Array.isArray(line.supportedProtocolVersions) || !line.supportedProtocolVersions.includes(2))
@@ -762,6 +852,39 @@ export class RpcClient {
 		return () => this.#managedLifecycleListeners.delete(listener);
 	}
 
+	/**
+	 * Bootstrap context the peer acknowledged applying.
+	 *
+	 * Only fields the peer echoed are present, so a defined result is never a
+	 * local echo of {@link RpcClientOptions.prepare}: a requested field the peer
+	 * ignored fails the prepare that carried it. Reset on every start; a fresh
+	 * connection reports `undefined` until its prepare is acknowledged.
+	 */
+	getPreparedContext(): RpcPrepareOptions | undefined {
+		return this.#preparedContext;
+	}
+
+	/**
+	 * Capability flags read from the peer's own ready declaration and validated
+	 * during the handshake. This is what the peer says it implements; the local
+	 * build's constant is never substituted for it.
+	 */
+	getNativeAgentCapabilities(): NativeAgentCapabilitySet | undefined {
+		return this.#nativeAgentCapabilities;
+	}
+
+	/**
+	 * Subscribe to managed run boundaries emitted by the server.
+	 *
+	 * Each event carries the server-minted run id and the facts the server
+	 * wrote; the client forwards them verbatim and mints nothing, so a consumer
+	 * addresses runs by the same identifiers the peer tracks.
+	 */
+	onManagedRunEvent(listener: RpcManagedRunEventListener): () => void {
+		this.#managedRunListeners.add(listener);
+		return () => this.#managedRunListeners.delete(listener);
+	}
+
 	#setManagedLifecycle(lifecycle: RpcManagedLifecycle): void {
 		this.#managedLifecycle = lifecycle;
 		for (const listener of this.#managedLifecycleListeners) listener(lifecycle);
@@ -783,37 +906,58 @@ export class RpcClient {
 	// Command Methods
 	// =========================================================================
 
+	/**
+	 * Negotiate the managed lease pair and apply the bootstrap context.
+	 *
+	 * The command carries {@link RpcClientOptions.prepare} so the peer can
+	 * relocate the session before it builds one, and the answer echoes back the
+	 * context the peer actually applied. A requested field the answer omits is
+	 * not a weaker confirmation but a missing one: the peer ignored the
+	 * request, so the lease is never activated and the connection fails as
+	 * protocol-incompatible instead of running in the wrong place.
+	 */
 	async prepare(
 		proposed: { heartbeatSeconds?: number; leaseSeconds?: number } = {},
 		metadata: RpcCorrelationFields = {},
-	): Promise<{ heartbeatSeconds: number; leaseSeconds: number }> {
+	): Promise<RpcPrepareResult> {
+		const context = this.options.prepare ?? {};
 		const offered = negotiateLease(
 			createLeaseState(Date.now(), { ...this.options.managedLease, ...proposed }),
 			createLeaseState(Date.now(), this.#peerLease),
 		);
-		const response = await this.#send({ ...metadata, type: "prepare", ...offered });
-		const data = this.#getData<{ heartbeatSeconds: number; leaseSeconds: number }>(response);
+		const response = await this.#send({
+			...metadata, type: "prepare", ...offered,
+			...(context.cwd === undefined ? {} : { cwd: context.cwd }),
+			...(context.profile === undefined ? {} : { profile: context.profile }),
+			...(context.agent === undefined ? {} : { agent: context.agent }),
+		});
+		const data = this.#getData<unknown>(response);
+		if (!isRecord(data)) throw new RpcClientError("protocol-incompatible", "Managed prepare answer carried no data", "prepare");
+		const heartbeatSeconds = data.heartbeatSeconds;
+		const leaseSeconds = data.leaseSeconds;
 		if (
-			!Number.isFinite(data.heartbeatSeconds) || data.heartbeatSeconds <= 0 ||
-			!Number.isFinite(data.leaseSeconds) || data.leaseSeconds <= 0 ||
-			data.heartbeatSeconds > offered.heartbeatSeconds || data.leaseSeconds > offered.leaseSeconds
+			typeof heartbeatSeconds !== "number" || !Number.isFinite(heartbeatSeconds) || heartbeatSeconds <= 0 ||
+			typeof leaseSeconds !== "number" || !Number.isFinite(leaseSeconds) || leaseSeconds <= 0 ||
+			heartbeatSeconds > offered.heartbeatSeconds || leaseSeconds > offered.leaseSeconds
 		) throw new RpcClientError("protocol-incompatible", "Invalid managed lease negotiation", "prepare");
+		const applied = readPreparedContext(data, context);
+		this.#preparedContext = { ...this.#preparedContext, ...applied };
 		this.#clearManagedTimers();
-		this.#lease = createLeaseState(Date.now(), data);
-		this.#setManagedLifecycle({ status: "active", ...data });
+		this.#lease = createLeaseState(Date.now(), { heartbeatSeconds, leaseSeconds });
+		this.#setManagedLifecycle({ status: "active", heartbeatSeconds, leaseSeconds });
 		this.#heartbeatTimer = setInterval(() => {
 			void this.#send({ type: "heartbeat", scope: "control" }).catch(error => {
 				if (error instanceof RpcClientError && error.code === "connection-lost")
 					void this.#managedFailure?.(error);
 			});
-		}, data.heartbeatSeconds * 1000);
+		}, heartbeatSeconds * 1000);
 		this.#leaseTimer = setInterval(() => {
 			if (this.#lease && isLeaseExpired(this.#lease))
 				void this.#managedFailure?.(new RpcClientError("connection-lost", "Managed receive lease expired"));
-		}, Math.min(data.heartbeatSeconds, data.leaseSeconds) * 1000);
+		}, Math.min(heartbeatSeconds, leaseSeconds) * 1000);
 		this.#heartbeatTimer.unref();
 		this.#leaseTimer.unref();
-		return data;
+		return { heartbeatSeconds, leaseSeconds, ...applied };
 	}
 
 	async cancelRun(runId: string, metadata: RpcCorrelationFields = {}): Promise<RpcCancelRunResult> {
@@ -1367,6 +1511,16 @@ export class RpcClient {
 				pending.resolve(data);
 				return;
 			}
+		}
+
+		if (isManagedRunEventFrame(data)) {
+			if (this.options.expectManagedBootstrap) {
+				const event = parseManagedRunEvent(data);
+				if (!event)
+					throw new RpcClientError("protocol-incompatible", "Malformed managed run frame", data.type);
+				for (const listener of this.#managedRunListeners) listener(event);
+			}
+			return;
 		}
 
 		if (isRpcHostToolCallRequest(data)) {

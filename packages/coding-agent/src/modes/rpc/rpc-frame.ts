@@ -1,5 +1,5 @@
 import { isDeepStrictEqual } from "node:util";
-import { isRecord } from "@oh-my-pi/pi-utils";
+import { isRecord } from "@oh-my-pi/pi-utils/type-guards";
 import { readRpcCorrelation, type RpcChunkFrame, type RpcErrorCode, type RpcFrameLimits } from "./rpc-types";
 
 export type { RpcFrameLimits };

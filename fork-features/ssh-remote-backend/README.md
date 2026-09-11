@@ -1,32 +1,44 @@
-# SSH remote backend (issue #5)
+# SSH remote backend
 
-Fork-side SSH launcher: looks up a known host via the existing SSH capability, builds an argv-only remote command, and returns a transport spec the managed RPC client can consume. Skeleton for [mouriya-s-lab#5](https://github.com/mouriya-s-lab/oh-my-pi/issues/5), on the fork side of the [RFC #1](https://github.com/mouriya-s-lab/oh-my-pi/issues/1) §5/§9 boundary (core keeps the public seams; the fork owns the SSH backend).
+The directly invocable backend for [mouriya-s-lab#10](https://github.com/mouriya-s-lab/oh-my-pi/issues/10) consumes the native SSH discovery, managed RPC and endpoint interfaces. It does not create a second task executor or copy local configuration onto a peer.
 
-## Public API (`src/index.ts`)
+## Public API
 
-- `lookupSshHost(name)` — resolves `name` against the existing SSH capability (`loadCapability`). Discovery ordering and source retention are unchanged: entries dedupe by name with first (highest-priority) winning, and the record keeps `source` mapped from `_source`.
-- `buildRemoteCommand({ host, cwd, ... })` — argv-only remote command (`--mode rpc --rpc-subagent`); task text is never joined into argv. Extra SSH args are placed *before* the shared helper defaults because OpenSSH uses first-value-wins for `-o`: strict host-key pinning (`StrictHostKeyChecking=yes`) and the temp ControlPath override the helper's `accept-new`/shared path. Stdin is always kept (never `-n`) so the RPC protocol survives.
-- `createManagedRpcTransport(...)` — composes lookup + command into a transport spec; throws with `availableNames` on unknown host. `keepMasterOpen` means the consumer must never terminate the shared master.
+- `factory.ts`: `createSshBackendEndpoint(target, params?, deps?)` and `createSshBackendFactory(deps?).prepare(target, params?)` open a managed peer and return a concrete `AgentEndpoint`. `sshEndpointFactory` implements the public callback type from `task/dispatch.ts`; it accepts only SSH targets.
+- `lookup.ts`: `resolveSshHost(alias, context?)` performs one existing capability load and returns the untouched record plus its project/user-agent/legacy-project source. A missing user agent directory or unknown alias is an explicit error. The discovery context is local; the remote target's cwd/profile never changes local host discovery.
+- `command.ts`: `buildSshBackendCommand` returns separate local SSH and remote argv. The remote words are exactly the executable plus `--mode rpc --rpc-subagent`. `buildCommonArgs` receives `allowStdin: true`, and `StrictHostKeyChecking=yes` takes precedence over the helper's first-contact default.
+- `executable-probe.ts`: absolute executables incur no probe. Other names use non-interactive `command -v`; only a single absolute, shell-inert result is accepted. Missing executables never produce a fabricated installation path.
+- `transport.ts`: `openSshBackendTransport` owns one local SSH child and exposes its managed `RpcClient`, actual exit promise and resolved executable metadata. `endInput()` closes stdin and waits for the SSH exit; `close()` releases only that peer. OpenSSH owns the shared control socket, and production teardown never issues master `-O exit`.
 
-## Upstream rule
+The upstream barrel `packages/coding-agent/src/fork/ssh-remote-backend.ts` re-exports the factory. The complete upstream delta, including the pre-profile bootstrap hook and managed-event listener, is recorded in [`../trunk-patches.md`](../trunk-patches.md).
 
-Exactly one barrel line lives upstream, in `packages/coding-agent/src/fork/ssh-remote-backend.ts`:
-
-```ts
-export * from "../../../../fork-features/ssh-remote-backend/src";
-```
-
-The only other upstream touch is the `export` keyword on `buildCommonArgs` (`packages/coding-agent/src/ssh/connection-manager.ts`), a minimal reuse seam with no behavioural change. No `TaskTool` wiring — that lands under [#7](https://github.com/mouriya-s-lab/oh-my-pi/issues/7).
-
-## Consuming it
+## Direct invocation
 
 ```ts
-const transport = await createManagedRpcTransport({ name: "fishbox", cwd: "/tmp/work" });
-const client = new RpcClient({ command: () => [...transport.command], expectManagedBootstrap: true });
+const endpoint = await createSshBackendEndpoint({
+  kind: "ssh",
+  host: "build-host",
+  cwd: "/srv/work",
+  executable: "/opt/bin/omp",
+});
+try {
+  const prepared = await endpoint.prepare();
+  const ack = await endpoint.start(assignment);
+  const outcome = await endpoint.run(ack.runId, signal);
+  await endpoint.waitReplyDrained(ack.runId, { signal });
+} finally {
+  await endpoint.terminate();
+}
 ```
 
-`command` as an array is an argv *prefix* (the client appends its RPC args), so pass the builder form returning a copy — never the array itself — to avoid appended args.
+The peer applies cwd/profile and resolves its starting role before session construction. Prepare returns the role the peer actually selected and capabilities from its ready frame. Assignment text travels only through RPC stdin. Run IDs and terminal/reply-drained facts come from the peer; transport loss is `execution-unknown`, never a fabricated task failure or local retry.
 
-## Tests
+## Current integration boundary
 
-`test/loopback.integration.test.ts` proves ready + `get_state` + `abort` against an isolated loopback sshd. That is transport verification only; the full heterogeneous OS/version matrix lands under [#10](https://github.com/mouriya-s-lab/oh-my-pi/issues/10).
+Native task/eval/workpool callers still reject SSH targets. Migrating those execution drivers to the endpoint callback, including mixed batches and persistent follow-ups, is a core-owned [#8](https://github.com/mouriya-s-lab/oh-my-pi/issues/8) follow-up. Exporting the factory does not claim that task-tool routing is enabled. Heterogeneous host/PATH/version verification remains under [#14](https://github.com/mouriya-s-lab/oh-my-pi/issues/14).
+
+The `src/` launcher is retained for the frozen [#6](https://github.com/mouriya-s-lab/oh-my-pi/issues/6) evidence. Its historical loopback test is not the production factory entry point, and the frozen evidence is not regenerated here.
+
+## Verification
+
+`test/lookup.test.ts` and `test/command.test.ts` cover discovery/error/argv/probe boundaries. `test/factory.integration.test.ts` and `test/transport-single-peer-release.test.ts` invoke the factory against the real isolated sshd helper, pinned host keys and an absolute-Bun wrapper for the actual CLI. They check remote cwd, named-profile `.env` selection before initialization, control responses, endpoint lifecycle, stdin EOF and shared-master survival. `test/hygiene.test.ts` checks forbidden direct internal references with a TypeScript AST, the re-export-only barrel and the trunk-patches ledger.

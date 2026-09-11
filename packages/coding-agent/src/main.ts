@@ -36,10 +36,15 @@ import { ModelRegistry } from "./config/model-registry";
 import {
 	DEFAULT_PREWALK_TARGET,
 	expandRoleAlias,
+	extractExplicitThinkingSelector,
 	formatModelSelectorValue,
 	getModelMatchPreferences,
+	resolveAgentAdvisorSelection,
+	resolveAgentModelSelection,
+	resolveAgentPrewalkPattern,
 	resolveCliModel,
 	resolveModelRoleValue,
+	resolveModelOverride,
 	resolveModelScope,
 	type ScopedModel,
 } from "./config/model-resolver";
@@ -59,12 +64,15 @@ import { loadExtensions } from "./extensibility/extensions/loader";
 import { ExtensionRunner } from "./extensibility/extensions/runner";
 import type { ExtensionUIContext } from "./extensibility/extensions/types";
 import { scheduleMarketplaceAutoUpdate } from "./extensibility/plugins/marketplace-auto-update";
+import { buildSkillPromptMessage } from "./extensibility/skills";
 import { registerDaemonProjectPresence } from "./launch/presence";
 import { discoverStartupLspServers } from "./lsp/servers";
 import type { MCPManager } from "./mcp";
 import { InteractiveMode } from "./modes/interactive-mode";
 import type { PrintModeOptions } from "./modes/print-mode";
+import { getManagedRpcBootstrap, type ManagedRpcBootstrap } from "./modes/rpc/managed-bootstrap";
 import { claimRpcInput } from "./modes/rpc/rpc-input";
+import type { RpcErrorCode } from "./modes/rpc/rpc-types";
 import { CURRENT_SETUP_VERSION } from "./modes/setup-version";
 import type * as SetupWizardModule from "./modes/setup-wizard";
 import type { SetupScene } from "./modes/setup-wizard";
@@ -97,15 +105,20 @@ import {
 	persistForeignSession,
 } from "./session/foreign-session-import";
 import type { ForeignSessionInfo, ForeignSessionSource, ForeignSessionStore } from "./session/foreign-session-store";
+import { SKILL_PROMPT_MESSAGE_TYPE } from "./session/messages";
 import { resolveResumableSession, type SessionInfo } from "./session/session-listing";
 import { SessionManager } from "./session/session-manager";
 import { executeBuiltinSlashCommand } from "./slash-commands/builtin-registry";
 import { shouldShowStartupSplash } from "./startup-splash";
 import { discoverTitleSystemPromptFile, resolvePromptInput } from "./system-prompt";
+import { discoverAgents, getAgent } from "./task/discovery";
 import { createPersistedSubagentReviverFactory } from "./task/persisted-revive";
+import { resolveAgentPrewalkDefault } from "./task/prewalk";
+import { resolveSpawnPolicy } from "./task/spawn-policy";
 import { createTelemetryExportConfig, initTelemetryExport, isTelemetryExportEnabled } from "./telemetry-export";
 import { concreteThinkingLevel, parseConfiguredThinkingLevel } from "./thinking";
 import type { LspStartupServerInfo } from "./tools";
+import { resolveEvalBackends } from "./tools/eval-backends";
 import { getChangelogPath, resolveStartupChangelogForDisplay, type StartupChangelogSelection } from "./utils/changelog";
 import { EventBus } from "./utils/event-bus";
 
@@ -116,7 +129,7 @@ type RunRpcMode = (
 	setToolUIContext?: (uiContext: ExtensionUIContext, hasUI: boolean) => void,
 	subagentEventBus?: EventBus,
 	input?: ReadableStream<Uint8Array>,
-	options?: { managed?: boolean },
+	options?: { managed?: boolean; bootstrap?: ManagedRpcBootstrap },
 ) => Promise<never>;
 
 export function writeStartupNotice(parsedArgs: Pick<Args, "mode">, text: string): void {
@@ -1168,6 +1181,7 @@ export async function buildSessionOptions(
 				// (extensions may register additional providers/models via registerProvider)
 				options.modelPattern = parsed.model;
 			} else {
+				if (parsed.rpcSubagent && getManagedRpcBootstrap()) throw new Error(resolved.error);
 				process.stderr.write(`${chalk.red(resolved.error)}\n`);
 				process.exit(1);
 			}
@@ -1401,6 +1415,13 @@ export async function runRootCommand(
 	rawArgs: string[],
 	deps: RunRootCommandDependencies = DEFAULT_RUN_ROOT_DEPENDENCIES,
 ): Promise<void> {
+	const bootstrap = parsed.rpcSubagent ? getManagedRpcBootstrap() : undefined;
+	let bootstrapFailureCode: RpcErrorCode = "config-missing";
+	let rpcStarted = false;
+	const parsedArgs = parsed;
+	if (bootstrap?.prepare.cwd !== undefined) {
+		parsedArgs.cwd = bootstrap.preparedContext.cwd;
+	}
 	logger.startTiming();
 	startStartupWatchdog();
 	try {
@@ -1408,10 +1429,12 @@ export async function runRootCommand(
 		// already initialized its cached theme synchronously for the first frame.
 		await logger.time("initTheme:initial", ensureTheme);
 
-		const parsedArgs = parsed;
+		// Early managed bootstrap has already applied the selected cwd and profile.
 		try {
 			await logger.time("applyStartupCwd", applyStartupCwd, parsedArgs);
+			if (bootstrap) bootstrap.preparedContext.cwd = getProjectDir();
 		} catch (error: unknown) {
+			if (bootstrap) throw error;
 			const message = error instanceof Error ? error.message : String(error);
 			process.stderr.write(`${chalk.red(`Error: ${message}`)}\n`);
 			process.exit(1);
@@ -1440,16 +1463,18 @@ export async function runRootCommand(
 		}
 
 		if ((parsedArgs.mode === "rpc" || parsedArgs.mode === "rpc-ui") && parsedArgs.fileArgs.length > 0) {
+			if (bootstrap) throw new Error("@file arguments are not supported in RPC mode");
 			process.stderr.write(`${chalk.red("Error: @file arguments are not supported in RPC mode")}\n`);
 			process.exit(1);
 		}
 		const mode = parsedArgs.mode || "text";
 		if (parsedArgs.rpcSubagent && mode !== "rpc") {
+			if (bootstrap) throw new Error("--rpc-subagent requires --mode rpc");
 			process.stderr.write(`${chalk.red("Error: --rpc-subagent requires --mode rpc")}\n`);
 			process.exit(1);
 		}
 		// RPC owns stdin. Claim its singleton stream before plugin/extension discovery can load an in-process consumer.
-		const rpcInput = mode === "rpc" || mode === "rpc-ui" ? claimRpcInput() : undefined;
+		const rpcInput = bootstrap?.input ?? (mode === "rpc" || mode === "rpc-ui" ? claimRpcInput() : undefined);
 
 		// Kick off plugin-root preload in parallel with the remaining startup work.
 		// Awaited later (before extension/skill discovery in createAgentSession needs it).
@@ -1508,6 +1533,7 @@ export async function runRootCommand(
 		} catch (error) {
 			const message = await describeAuthBrokerStartupError(error);
 			if (message === null) throw error;
+			if (bootstrap) throw new Error(message, { cause: error });
 			process.stderr.write(`${chalk.red(`Error: ${message}`)}\n`);
 			process.exit(1);
 		}
@@ -1701,6 +1727,7 @@ export async function runRootCommand(
 				);
 			}
 		} catch (error: unknown) {
+			if (bootstrap) throw error;
 			if (error instanceof SessionResolutionError) {
 				process.stderr.write(`${chalk.red(`Error: ${error.message}`)}\n`);
 				if (error.hint) {
@@ -1835,6 +1862,114 @@ export async function runRootCommand(
 		sessionOptions.modelRegistry = modelRegistry;
 		sessionOptions.hasUI = isInteractive || mode === "rpc-ui";
 		sessionOptions.settings = settingsInstance;
+		let managedAutoloadSkills: string[] | undefined;
+
+		if (bootstrap) {
+			if (bootstrap.prepare.cwd !== undefined && cwd !== bootstrap.preparedContext.cwd) {
+				throw new Error("Session resume changed the prepared remote working directory");
+			}
+			bootstrap.preparedContext.cwd = cwd;
+			const requestedAgent = bootstrap.prepare.agent ?? resolveSpawnPolicy(sessionOptions.spawns).defaultAgent;
+			const { agents } = await discoverAgents(cwd, home, {
+				explicit: sessionOptions.additionalExtensionPaths ?? [],
+				mode: sessionOptions.disableExtensionDiscovery ? "explicit-only" : "merge",
+				configured: settingsInstance.get("extensions"),
+				configuredLevel: settingsInstance.extensionsSourceLevel(),
+			});
+			const agent = getAgent(agents, requestedAgent);
+			if (!agent) {
+				bootstrapFailureCode = bootstrap.prepare.agent === undefined ? "protocol-incompatible" : "config-missing";
+				throw new Error(`Unknown agent "${requestedAgent}" in remote configuration`);
+			}
+			if (settingsInstance.get("task.disabledAgents").includes(agent.name)) {
+				throw new Error(`Agent "${agent.name}" is disabled in remote settings`);
+			}
+			// Keep the harness blocks, adding the already-parsed role prompt before
+			// the dynamic context block, just like the native task session builder.
+			sessionOptions.systemPrompt = defaultPrompt =>
+				defaultPrompt.length === 0
+					? [agent.systemPrompt]
+					: [...defaultPrompt.slice(0, -1), agent.systemPrompt, defaultPrompt[defaultPrompt.length - 1]];
+			sessionOptions.agentName = agent.name;
+			sessionOptions.agentDisplayName = agent.name;
+			sessionOptions.spawns = agent.spawns === "*" ? "*" : (agent.spawns?.join(",") ?? "");
+			sessionOptions.toolNames = agent.tools;
+			if (agent.tools && agent.spawns !== undefined && !agent.tools.includes("task")) {
+				sessionOptions.toolNames = [...agent.tools, "task"];
+			}
+			if (sessionOptions.toolNames && !sessionOptions.toolNames.includes("hub")) {
+				sessionOptions.toolNames = [...sessionOptions.toolNames, "hub"];
+			}
+			if (sessionOptions.toolNames?.includes("exec")) {
+				const backends = resolveEvalBackends({
+					cwd,
+					hasUI: false,
+					settings: settingsInstance,
+					getSessionFile: () => sessionOptions.sessionManager?.getSessionFile() ?? null,
+					getSessionSpawns: () => sessionOptions.spawns ?? "*",
+				});
+				const toolNames = sessionOptions.toolNames.filter(name => name !== "exec");
+				if (backends.python || backends.js) toolNames.push("eval");
+				toolNames.push("bash");
+				sessionOptions.toolNames = [...new Set(toolNames)];
+			}
+			managedAutoloadSkills = agent.autoloadSkills;
+			sessionOptions.outputSchema = agent.output;
+			sessionOptions.requireYieldTool = true;
+			if (agent.readSummarize === false) {
+				settingsInstance.override("read.summarize.enabled", false);
+			}
+			if (parsedArgs.model === undefined && parsedArgs.models === undefined) {
+				const { patterns } = resolveAgentModelSelection({
+					settingsOverride: settingsInstance.get("task.agentModelOverrides")[agent.name],
+					agentModel: agent.model,
+					settings: settingsInstance,
+				});
+				if (patterns.length > 0) {
+					sessionOptions.model = undefined;
+					// Encode the role's default effort per candidate, leaving explicit
+					// selector effort intact. SDK resolution happens after extensions.
+					sessionOptions.modelPattern = patterns.map(pattern =>
+						extractExplicitThinkingSelector(pattern, settingsInstance, {
+							isLiteralModelId: (provider, id) => modelRegistry.find(provider, id) !== undefined,
+						})
+							? pattern
+							: formatModelSelectorValue(pattern, agent.thinkingLevel),
+					);
+					sessionOptions.thinkingLevel = parsedArgs.thinking;
+				} else {
+					sessionOptions.thinkingLevel ??= agent.thinkingLevel;
+				}
+			} else {
+				sessionOptions.thinkingLevel ??= agent.thinkingLevel;
+			}
+			const advisor = resolveAgentAdvisorSelection({
+				settingsOverride: settingsInstance.get("task.agentAdvisor")[agent.name],
+				agentAdvisor: agent.advisor,
+			});
+			settingsInstance.override("advisor.enabled", advisor !== undefined);
+			if (advisor?.model) {
+				settingsInstance.overrideModelRoles({ advisor: advisor.model });
+			}
+			const prewalkPattern = resolveAgentPrewalkPattern({
+				settingsOverride: settingsInstance.get("task.agentPrewalk")[agent.name],
+				agentPrewalk: resolveAgentPrewalkDefault(agent, settingsInstance.get("task.prewalk")),
+			});
+			sessionOptions.prewalk = undefined;
+			if (prewalkPattern) {
+				const resolved = resolveModelOverride([prewalkPattern], modelRegistry, settingsInstance);
+				if (resolved.model && modelRegistry.hasConfiguredAuth(resolved.model)) {
+					sessionOptions.prewalk = { target: resolved.model, thinkingLevel: resolved.thinkingLevel };
+				} else {
+					logger.warn("Remote agent prewalk target unavailable; skipping prewalk", {
+						agent: agent.name,
+						pattern: prewalkPattern,
+						warning: resolved.warning,
+					});
+				}
+			}
+			bootstrap.preparedContext.agent = agent.name;
+		}
 
 		// OTEL: register global OTLP exporters when an endpoint is configured via
 		// env, then switch on the agent loop's telemetry hooks so traces, run-level
@@ -1848,6 +1983,7 @@ export async function runRootCommand(
 		// Handle CLI --api-key as runtime override (not persisted)
 		if (parsedArgs.apiKey) {
 			if (!sessionOptions.model && !sessionOptions.modelPattern) {
+				if (bootstrap) throw new Error("--api-key requires a model to be specified");
 				process.stderr.write(
 					`${chalk.red("--api-key requires a model to be specified via --model, --provider/--model, or --models")}\n`,
 				);
@@ -1927,6 +2063,7 @@ export async function runRootCommand(
 			// tool calls (issue #2459). Exit code 2 matches the conventional
 			// "command line usage error" convention.
 			if (reportUnrecognizedFlags(initialArgs)) {
+				if (bootstrap) throw new Error("Unrecognized CLI flags");
 				process.exit(2);
 			}
 			const processedFiles =
@@ -1982,6 +2119,22 @@ export async function runRootCommand(
 
 			try {
 				validateToolNames(initialArgs.tools, session.getAllToolNames());
+				// Native task autoload is hidden context, not a user prompt or a
+				// model turn. Complete it before handing prepare to the RPC runner.
+				for (const name of managedAutoloadSkills ?? []) {
+					const skill = session.skills.find(candidate => candidate.name === name);
+					if (!skill) continue;
+					const { message } = await buildSkillPromptMessage(skill, "", "autoload");
+					await session.sendCustomMessage(
+						{
+							customType: SKILL_PROMPT_MESSAGE_TYPE,
+							content: message,
+							display: false,
+							details: { name: skill.name, path: skill.filePath },
+						},
+						{ triggerTurn: false },
+					);
+				}
 			} catch (error) {
 				await session.dispose();
 				throw error;
@@ -2033,6 +2186,10 @@ export async function runRootCommand(
 			}
 
 			if (!isInteractive && !session.model) {
+				if (bootstrap) {
+					await session.dispose();
+					throw new Error(modelRegistryError?.message ?? modelFallbackMessage ?? "No models available.");
+				}
 				if (modelRegistryError) {
 					process.stderr.write(`${chalk.red(modelRegistryError.message)}\n\n`);
 				}
@@ -2051,7 +2208,11 @@ export async function runRootCommand(
 				// Branch-only protocol runner: keep RPC host code out of normal interactive startup.
 				const runRpcMode: RunRpcMode = (await import("./modes/rpc/rpc-mode")).runRpcMode;
 				stopStartupWatchdog();
-				await runRpcMode(session, mode === "rpc-ui" ? setToolUIContext : undefined, subagentEventBus, rpcInput, { managed: parsedArgs.rpcSubagent });
+				rpcStarted = true;
+				await runRpcMode(session, mode === "rpc-ui" ? setToolUIContext : undefined, subagentEventBus, rpcInput, {
+					managed: parsedArgs.rpcSubagent,
+					bootstrap,
+				});
 			} else if (isInteractive) {
 				const versionCheckPromise = checkForNewVersion(VERSION).catch(() => undefined);
 				const startupChangelog = await startupChangelogPromise;
@@ -2124,6 +2285,11 @@ export async function runRootCommand(
 	} catch (error) {
 		stopPendingStartupComposer();
 		stopStartupWatchdog();
+		if (bootstrap && !rpcStarted) {
+			await bootstrap.fail(bootstrapFailureCode, error instanceof Error ? error.message : String(error));
+			stopThemeWatcher();
+			process.exit(1);
+		}
 		throw error;
 	}
 }

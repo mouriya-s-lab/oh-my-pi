@@ -36,6 +36,7 @@ import { DAEMON_BROKER_WORKER_ARG } from "./launch/protocol";
 import { TERMINAL_OUTPUT_WORKER_ARG } from "./launch/terminal-output-worker-protocol";
 import { LSP_MUX_WORKER_ARG } from "./lsp/mux/protocol";
 import { STATS_ACTIVITY_WORKER_ARG } from "./stats/activity-protocol";
+import { beginManagedRpcBootstrap, requestsManagedRpcBootstrap } from "./modes/rpc/managed-bootstrap";
 import rootLicense from "./tools/browser/relay/extension-assets/LICENSE.txt" with { type: "text" };
 import thirdPartyNotices from "./tools/browser/relay/extension-assets/THIRD-PARTY-NOTICES.txt" with { type: "text" };
 import { COMPUTER_WORKER_ARG } from "./tools/computer/protocol";
@@ -414,6 +415,13 @@ export async function runCli(argv: string[]): Promise<void> {
 	// poison `workerHostEntry()` for the whole test process, forcing eval/stats/
 	// browser workers onto the same-realm inline fallback.
 	if (isProcessEntry) declareWorkerHostEntry();
+
+	// A managed peer selects cwd/profile over stdin before profile-scoped env,
+	// command discovery, settings or session construction can read their state.
+	if (requestsManagedRpcBootstrap(resolvedArgv)) {
+		const bootstrap = await beginManagedRpcBootstrap();
+		if (!bootstrap) return;
+	}
 
 	// `PI_PROXY` must reach the bare global `fetch` before any provider call:
 	// OAuth refresh/login and usage probes never pass through

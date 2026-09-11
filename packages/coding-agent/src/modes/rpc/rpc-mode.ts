@@ -44,11 +44,9 @@ import { initializeExtensions } from "../runtime-init";
 import { isRpcHostToolResult, isRpcHostToolUpdate, RpcHostToolBridge } from "./host-tools";
 import { isRpcHostUriResult, RpcHostUriBridge } from "./host-uris";
 import { createLeaseState, isLeaseExpired, negotiateLease, tickLease, type LeaseState } from "./lease";
+import { buildRpcReadyFrame, type ManagedRpcBootstrap } from "./managed-bootstrap";
 import {
 	DEFAULT_RPC_FRAME_LIMITS,
-	MAX_RPC_FRAME_BYTES,
-	MAX_RPC_REASSEMBLED_BYTES,
-	MAX_RPC_RESOURCE_CHUNK_BYTES,
 	negotiateRpcFrameLimits,
 	RpcFrameDecoder,
 	RpcFrameEncoder,
@@ -56,7 +54,7 @@ import {
 import { claimRpcInput, readRpcInputFrames } from "./rpc-input";
 import { pageRpcMessages, RPC_MESSAGES_PAGE_BUSY_ERROR, RpcMessagesPageError } from "./rpc-messages";
 import { RpcSubagentRegistry, readRpcSubagentTranscript } from "./rpc-subagents";
-import { isRpcErrorCode, MANAGED_NATIVE_AGENT_CAPABILITIES, readRpcCorrelation } from "./rpc-types";
+import { isRpcErrorCode, readRpcCorrelation } from "./rpc-types";
 import type {
 	RpcCommand,
 	RpcCancelRunResult,
@@ -973,23 +971,9 @@ export function requestRpcDialog<T>(
 }
 /** Construct the bootstrap declaration without adding any keys to legacy ready frames. */
 export function createRpcReadyFrame(managed = false): RpcReadyFrame {
-	const frame: RpcReadyFrame = {
-		type: "ready",
-		protocolVersion: 1,
-		supportedProtocolVersions: [1, 2],
-		maxFrameBytes: MAX_RPC_FRAME_BYTES,
-		maxReassembledFrameBytes: MAX_RPC_REASSEMBLED_BYTES,
-	};
-	if (managed) {
-		const lease = createLeaseState();
-		frame.maxResourceChunkBytes = MAX_RPC_RESOURCE_CHUNK_BYTES;
-		frame.nativeAgent = {
-			protocolMajor: 1,
-			capabilities: MANAGED_NATIVE_AGENT_CAPABILITIES,
-			proposed: { heartbeatSeconds: lease.heartbeatSeconds, leaseSeconds: lease.leaseSeconds },
-		};
-	}
-	return frame;
+	if (!managed) return buildRpcReadyFrame(false);
+	const lease = createLeaseState();
+	return buildRpcReadyFrame(true, { heartbeatSeconds: lease.heartbeatSeconds, leaseSeconds: lease.leaseSeconds });
 }
 
 /** Resume the endpoint's existing session, never allocate a replacement session. */
@@ -1038,7 +1022,7 @@ export async function runRpcMode(
 	setToolUIContext?: (uiContext: ExtensionUIContext, hasUI: boolean) => void,
 	subagentEventBus?: EventBus,
 	input: ReadableStream<Uint8Array> = claimRpcInput(),
-	options: { managed?: boolean } = {},
+	options: { managed?: boolean; bootstrap?: ManagedRpcBootstrap } = {},
 ): Promise<never> {
 	// Signal to RPC clients that the server is ready to accept commands
 	// Suppress terminal notifications: they write \x07 (BEL) or OSC sequences directly to
@@ -1049,7 +1033,12 @@ export async function runRpcMode(
 
 	const frameEncoder = new RpcFrameEncoder();
 	const frameDecoder = new RpcFrameDecoder();
-	let managedFrameLimits = DEFAULT_RPC_FRAME_LIMITS;
+	let managedFrameLimits = options.bootstrap?.frameLimits ?? DEFAULT_RPC_FRAME_LIMITS;
+	if (options.bootstrap) {
+		frameEncoder.setProtocolVersion(options.bootstrap.protocolVersion);
+		frameEncoder.setLimits(managedFrameLimits);
+		frameDecoder.setLimits(managedFrameLimits);
+	}
 	if (options.managed) frameEncoder.setManagedEnvelope(true);
 	// Ordered stdout writer honoring backpressure: chunked v2 frames are produced
 	// lazily by the encoder and written one physical line at a time, so a near-limit
@@ -1065,7 +1054,7 @@ export async function runRpcMode(
 			// stdout gone (host exited) — nothing left to deliver; keep the queue alive.
 			.catch(() => {});
 	};
-	writeFrames(frameEncoder.encodeFrames(createRpcReadyFrame(options.managed)));
+	if (!options.bootstrap) writeFrames(frameEncoder.encodeFrames(createRpcReadyFrame(options.managed)));
 	const flushStdout = async (): Promise<void> => {
 		await stdoutQueue;
 		if (process.stdout.destroyed) return;
@@ -1526,6 +1515,13 @@ export async function runRpcMode(
 
 			case "prepare": {
 				if (!options.managed) return error(undefined, command.type, `Unknown command: ${command.type}`);
+				for (const field of ["cwd", "profile", "agent"] as const) {
+					if (command[field] === undefined) continue;
+					if (!options.bootstrap || command[field] !== options.bootstrap.prepare[field]) {
+						throw new ManagedRpcError("protocol-incompatible",
+							`Managed prepare cannot change ${field} after session initialization`);
+					}
+				}
 				const proposed = createLeaseState();
 				const negotiated = negotiateLease({
 					heartbeatSeconds: command.heartbeatSeconds ?? proposed.heartbeatSeconds,
@@ -1546,7 +1542,7 @@ export async function runRpcMode(
 						process.exit(0);
 					})();
 				}, Math.min(negotiated.heartbeatSeconds * 1_000, 250));
-				return success(id, "prepare", negotiated);
+				return success(id, "prepare", { ...negotiated, ...options.bootstrap?.preparedContext });
 			}
 
 			case "heartbeat": {

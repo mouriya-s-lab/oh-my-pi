@@ -76,11 +76,39 @@ interface LocalRpcProcess {
 	exit(): Promise<number>;
 }
 
-function spawnRpc(cwd: string, managed: boolean, env: Record<string, string> = {}): LocalRpcProcess {
+/** Child-only environment: operator profiles, extensions, credentials and shell rc files must not affect this fixture. */
+async function isolatedRpcEnvironment(cwd: string, overrides: Record<string, string>): Promise<Record<string, string>> {
+	const home = path.join(cwd, "home");
+	const directories = {
+		HOME: home,
+		USERPROFILE: home,
+		PI_CODING_AGENT_DIR: path.join(home, ".omp", "agent"),
+		XDG_CONFIG_HOME: path.join(home, ".config"),
+		XDG_DATA_HOME: path.join(home, ".local", "share"),
+		XDG_STATE_HOME: path.join(home, ".local", "state"),
+		XDG_CACHE_HOME: path.join(home, ".cache"),
+	};
+	await Promise.all([...new Set(Object.values(directories))].map(directory => fs.mkdir(directory, { recursive: true })));
+	const inherited: Record<string, string> = {};
+	for (const name of ["PATH", "TMPDIR", "TMP", "TEMP", "SystemRoot", "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "LANG", "LC_ALL"]) {
+		const value = Bun.env[name];
+		if (value !== undefined) inherited[name] = value;
+	}
+	return {
+		...inherited,
+		...directories,
+		PI_NO_TITLE: "1",
+		PI_SKIP_VERSION_CHECK: "1",
+		PI_NOTIFICATIONS: "off",
+		...overrides,
+	};
+}
+
+async function spawnRpc(cwd: string, managed: boolean, env: Record<string, string> = {}): Promise<LocalRpcProcess> {
 	const argv = [process.execPath, cliPath, ...baseArgs, ...(managed ? ["--rpc-subagent"] : [])];
 	const child = Bun.spawn(argv, {
 		cwd,
-		env: { ...Bun.env, PI_NO_TITLE: "1", PI_SKIP_VERSION_CHECK: "1", ...env },
+		env: await isolatedRpcEnvironment(cwd, env),
 		stdin: "pipe", stdout: "pipe", stderr: "pipe",
 	});
 	const commands: RpcCommand[] = [];
@@ -129,7 +157,7 @@ function shellMarkers(dir: string, name: string, seconds: number): { started: st
 describe("managed RPC local process lifecycle", () => {
 	test("row 3: state and targeted cancellation overtake sleep without cancelling a companion run", async () => {
 		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "rpc-managed-control-"));
-		const rpc = spawnRpc(cwd, true);
+		const rpc = await spawnRpc(cwd, true);
 		const slow = shellMarkers(cwd, "slow", 5);
 		const companion = shellMarkers(cwd, "companion", 1);
 		try {
@@ -187,9 +215,13 @@ describe("managed RPC local process lifecycle", () => {
 	test("row 4: EOF drains legacy work naturally but cancels every managed run before drain", async () => {
 		for (const managed of [false, true]) {
 			const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "rpc-managed-eof-"));
-			const rpc = spawnRpc(cwd, managed);
+			const rpc = await spawnRpc(cwd, managed);
 			const marker = shellMarkers(cwd, "eof", 3);
 			try {
+				if (managed) {
+					await rpc.send({ id: "prepare", type: "prepare" });
+					await rpc.response("prepare");
+				}
 				await rpc.send({ id: "eof-bash", type: "bash", command: marker.command });
 				await waitForMarker(marker.started);
 				const started = await Bun.file(marker.started).text();
@@ -220,6 +252,7 @@ describe("managed RPC local process lifecycle", () => {
 		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "rpc-managed-lease-"));
 		// Test-only compressed timing; production defaults remain heartbeat=10s, lease=30s.
 		const env = { PI_MANAGED_LEASE_SECONDS: "2", PI_MANAGED_HEARTBEAT_SECONDS: "1" };
+		const childEnv = await isolatedRpcEnvironment(cwd, env);
 		const wire: unknown[] = [];
 		const commands: unknown[] = [];
 		const suppressed: unknown[] = [];
@@ -235,7 +268,7 @@ describe("managed RPC local process lifecycle", () => {
 		using client = new RpcClient({
 			expectManagedBootstrap: true,
 			spawn: (): RpcAgentProcess => {
-				const proc = Bun.spawn(argv, { cwd, env: { ...Bun.env, PI_NO_TITLE: "1", ...env }, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+				const proc = Bun.spawn(argv, { cwd, env: childEnv, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
 				child = proc;
 				stdin = proc.stdin;
 				const [clientStream, observerStream] = proc.stdout.tee();

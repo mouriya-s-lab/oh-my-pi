@@ -7,7 +7,10 @@
 import type { AgentMessage, AgentToolResult, ThinkingLevel, ToolLoadMode } from "@oh-my-pi/pi-agent-core";
 import type { CompactionResult } from "@oh-my-pi/pi-agent-core/compaction";
 import type { Effort, ImageContent, Model, ToolExample } from "@oh-my-pi/pi-ai";
-import { isRecord } from "@oh-my-pi/pi-utils";
+// Subpath import on purpose: the managed bootstrap loads this module before the
+// profile `.env` is applied, so it must stay off the `@oh-my-pi/pi-utils` barrel
+// (which eagerly imports `./env`). `type-guards` is dependency-free.
+import { isRecord } from "@oh-my-pi/pi-utils/type-guards";
 import type { BashResult } from "../../exec/bash-executor";
 import type { ContextUsage } from "../../extensibility/extensions/types";
 import type { AgentSessionEvent, SessionStats } from "../../session/agent-session";
@@ -115,6 +118,36 @@ export interface RpcFrameLimits {
 	maxReassembledFrameBytes: number;
 	/** Maximum payload bytes one resource chunk may carry. */
 	maxResourceChunkBytes: number;
+}
+
+/**
+ * Managed bootstrap context a peer applies before it builds any session state.
+ *
+ * The client sends these on `prepare` and the server echoes exactly the fields
+ * it applied, so "the request was sent" and "the request took effect" stay
+ * distinguishable. A field the request carried but the answer omitted means
+ * the peer ignored it; a client treats that as protocol-incompatible instead of
+ * assuming relocation happened.
+ */
+export interface RpcPrepareOptions {
+	/** Remote working directory to enter; absolute and existing on the peer host. */
+	cwd?: string;
+	/** Profile to activate through the peer's profile mechanism. */
+	profile?: string;
+	/** Agent definition the peer resolved for the session. */
+	agent?: string;
+}
+
+/**
+ * `prepare` acknowledgement: the negotiated lease pair plus the bootstrap
+ * context the peer actually applied. The applied fields echo what the peer
+ * resolved, which may be a canonical form of the request (normalized profile
+ * name, canonical directory path), including defaults the peer selected when
+ * optional request fields were omitted. The client never fabricates them.
+ */
+export interface RpcPrepareResult extends RpcPrepareOptions {
+	heartbeatSeconds: number;
+	leaseSeconds: number;
 }
 
 /** One managed capability flag; a declaration enumerates the whole set (D5). */
@@ -315,7 +348,16 @@ type RpcCommandVariants =
 
 	// Managed control (D4): heartbeat, cancel, terminate, park and resume bypass
 	// the serialized command queue so a long run cannot block them.
-	| { id?: string; type: "prepare"; heartbeatSeconds?: number; leaseSeconds?: number }
+	| {
+			id?: string;
+			type: "prepare";
+			heartbeatSeconds?: number;
+			leaseSeconds?: number;
+			/** Bootstrap context to apply; omitted by a legacy client and by a client needing no relocation. */
+			cwd?: string;
+			profile?: string;
+			agent?: string;
+	  }
 	| { id?: string; type: "heartbeat" }
 	| { id?: string; type: "cancel_run"; runId: string }
 	| { id?: string; type: "terminate"; peerId?: string }
@@ -647,7 +689,7 @@ type RpcResponseVariants =
 			type: "response";
 			command: "prepare";
 			success: true;
-			data: { heartbeatSeconds: number; leaseSeconds: number };
+			data: RpcPrepareResult;
 	  }
 	| { id?: string; type: "response"; command: "heartbeat"; success: true }
 	| { id?: string; type: "response"; command: "cancel_run"; success: true; data: RpcCancelRunResult }
@@ -700,6 +742,38 @@ export interface RpcSubagentEventFrame {
 export type RpcSubagentFrame = RpcSubagentLifecycleFrame | RpcSubagentProgressFrame | RpcSubagentEventFrame;
 
 export type RpcSessionEventFrame = AgentSessionEvent | RpcSubagentFrame;
+
+// ============================================================================
+// Managed Run Events (stdout)
+// ============================================================================
+
+/**
+ * One boundary of a managed run, exactly as the server emits it: the start
+ * frame opening a run and the terminal frame closing one.
+ *
+ * `runId` is the server-minted identifier the peer's endpoint returned; the
+ * client forwards it verbatim and never mints or rewrites one, so a consumer
+ * addressing a run by this id reaches the same run the server tracks. The start
+ * frame echoes the correlation envelope of the command that caused the run,
+ * mirrored by {@link readRpcCorrelation} like every other managed frame.
+ *
+ * The terminal frame carries `replyDrained: true` as a literal: it is written
+ * only after the run's replies are actually drained, so the flag is a fact the
+ * frame asserts rather than a hint, and a frame claiming otherwise is malformed
+ * wire data, not a slower success.
+ */
+export type RpcManagedRunEvent =
+	| ({
+			type: "managed_run_start";
+			runId: string;
+			command: "bash" | "prompt";
+	  } & RpcCorrelationFields & { id?: string })
+	| {
+			type: "managed_run_end";
+			runId: string;
+			status: "completed" | "failed" | "cancelled";
+			replyDrained: true;
+	  };
 
 // ============================================================================
 // Extension UI Events (stdout)

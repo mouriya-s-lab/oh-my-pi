@@ -53,6 +53,7 @@ import { mapWithConcurrencyLimitAllSettled, Semaphore } from "./parallel";
 import { renderResult, renderCall as renderTaskCall } from "./render";
 import { repairTaskParams } from "./repair-args";
 import { resolveEffectiveSubagentPolicy, runStructuredSubagent, StructuredSubagentError } from "./structured-subagent";
+import { validateExecutionTarget } from "./target";
 
 function renderSubagentUserPrompt(assignment: string): string {
 	return prompt.render(subagentUserPromptTemplate, {
@@ -273,6 +274,7 @@ function resolveSpawnItems(params: TaskParams): TaskItem[] {
 	if ("tools" in params) item.tools = params.tools;
 	if ("effort" in params) item.effort = params.effort;
 	if ("isolated" in params) item.isolated = params.isolated;
+	if ("target" in params) item.target = params.target;
 	return [item];
 }
 
@@ -693,6 +695,19 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		}
 
 		const spawnItems = resolveSpawnItems(params);
+		// Validate the execution target before anything else can run: illegal
+		// input and unsupported (`ssh`) targets must fail here, before eval-tool
+		// or agent discovery, preflight resolution, or the async job manager
+		// observes the call (stage-1 skeleton for issue #2).
+		const targetResult = await validateExecutionTarget(params.target, { cwd: this.session.cwd });
+		if ("error" in targetResult) {
+			return createTaskModeError(`Task execution failed: ${targetResult.error.message}`);
+		}
+		if (targetResult.target.kind === "ssh") {
+			return createTaskModeError(
+				`Task execution failed: target ${JSON.stringify(targetResult.target.host)} is an SSH endpoint; SSH execution is not yet implemented in this build (issue #7).`,
+			);
+		}
 		const evalToolNames = spawnItems.flatMap(item => item.tools ?? []);
 		if (evalToolNames.length > 0) {
 			if (this.session.getPlanModeState?.()?.enabled === true) {

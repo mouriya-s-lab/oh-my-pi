@@ -3,6 +3,7 @@ import type { Usage } from "@oh-my-pi/pi-ai";
 import { $env } from "@oh-my-pi/pi-utils";
 import type { AgentSessionEvent } from "../session/agent-session";
 import type { ConfiguredThinkingLevel, TaskEffort } from "../thinking";
+import type { ExecutionTarget } from "./target";
 import type { NestedRepoPatch } from "./worktree";
 
 /** Source of an agent definition */
@@ -108,6 +109,19 @@ export const LABEL_MAX = 80;
 
 // Keep this explicit: ArkType serializes `unknown` as a boolean subschema, which llama.cpp grammars reject.
 const outputSchemaInputSchema = type("object | boolean | string | null");
+// Discriminated execution target for the flat `task` form. Both branches are
+// closed (`delete`) so undeclared keys are dropped instead of smuggled into a
+// spawn; batch variants stay target-free until per-item routing (#7).
+const targetInputSchema = type({ kind: "'local'", "+": "delete" }).or(
+	type({
+		kind: "'ssh'",
+		host: "string",
+		cwd: "string",
+		"executable?": "string",
+		"profile?": "string",
+		"+": "delete",
+	}),
+);
 // Coarse per-spawn thinking effort; must stay in sync with TASK_EFFORTS in ../thinking.
 const effortRule = '"lo" | "med" | "hi"' as const;
 
@@ -149,6 +163,8 @@ export interface TaskItem {
 	tools?: string[];
 	/** Run this spawn in an isolated worktree (batch form; flat form carries it top-level). */
 	isolated?: boolean;
+	/** Execution target for this spawn. Only the flat form carries it in this slice; batch per-item routing lands with #7. */
+	target?: ExecutionTarget;
 }
 
 export const taskSchema = type({
@@ -158,6 +174,7 @@ export const taskSchema = type({
 	"outputSchema?": outputSchemaInputSchema,
 	"schemaMode?": '"permissive" | "strict"',
 	"tools?": "string[]",
+	"target?": targetInputSchema,
 	"isolated?": "boolean",
 	"+": "delete",
 });
@@ -168,6 +185,7 @@ const taskSchemaNoIsolation = type({
 	"outputSchema?": outputSchemaInputSchema,
 	"schemaMode?": '"permissive" | "strict"',
 	"tools?": "string[]",
+	"target?": targetInputSchema,
 	"+": "delete",
 });
 const taskSchemaBatch = type({
@@ -252,6 +270,7 @@ function createTaskSchema(options: {
 			"outputSchema?": outputSchemaInputSchema,
 			"schemaMode?": '"permissive" | "strict"',
 			...toolsField,
+			"target?": targetInputSchema,
 			"isolated?": "boolean",
 			"+": "delete",
 		});
@@ -264,6 +283,7 @@ function createTaskSchema(options: {
 		"outputSchema?": outputSchemaInputSchema,
 		"schemaMode?": '"permissive" | "strict"',
 		...toolsField,
+		"target?": targetInputSchema,
 		"+": "delete",
 	});
 }
@@ -319,6 +339,8 @@ export interface TaskParams {
 	context?: string;
 	/** Run in an isolated worktree (flat form; per-item in batch form). */
 	isolated?: boolean;
+	/** Execution target for the flat form: omitted / `{ kind: "local" }` keeps the local path; `ssh` is validated before any spawn and rejected until the endpoint lands (#7). */
+	target?: ExecutionTarget;
 }
 
 /**

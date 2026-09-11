@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- `task` tool accepts an optional `target` field with a discriminated `{ kind: "local" | "ssh", ... }` shape. Omitting it (or `kind: "local"`) preserves the existing local execution path; `kind: "ssh"` is validated (known host, absolute `cwd`, shell-metachar-free `executable`) before any remote start and today returns a "not yet implemented" error (skeleton for [mouriya-s-lab#2](https://github.com/mouriya-s-lab/oh-my-pi/issues/2); the SSH endpoint lands under [#7](https://github.com/mouriya-s-lab/oh-my-pi/issues/7)).
+
 ## [18.1.12] - 2026-09-06
 
 - Fixed edit and write results to report the formatted bytes actually committed by LSP writethrough.

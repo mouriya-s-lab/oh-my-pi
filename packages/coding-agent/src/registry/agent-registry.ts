@@ -11,6 +11,7 @@
 
 import { logger } from "@oh-my-pi/pi-utils";
 import type { AgentSession } from "../session/agent-session";
+import type { AgentEndpoint } from "../task/endpoint";
 import { oneLineLabel } from "../task/types";
 
 export const MAIN_AGENT_ID = "Main";
@@ -28,8 +29,23 @@ export function getAgentTombstonePath(sessionFile: string): string {
  *   `idle`, not removed.
  * - `parked`: session disposed; AgentRef + sessionFile retained, revivable.
  * - `aborted`: hard-killed, terminal.
+ * - `execution-unknown`: observation ended without a trustworthy run outcome; the remote reference remains usable.
  */
-export type AgentStatus = "running" | "idle" | "parked" | "aborted";
+export type AgentStatus = "running" | "idle" | "parked" | "aborted" | "execution-unknown";
+
+/** Terminal observation does not imply that the agent cannot be revived. */
+export function isTerminalAgentStatus(status: AgentStatus): boolean {
+	return status === "parked" || status === "aborted" || status === "execution-unknown";
+}
+
+export function isAgentUnknown(status: AgentStatus): boolean {
+	return status === "execution-unknown";
+}
+
+// D2 dependency: local session ownership and opaque remote identity are disjoint.
+export type AgentRefEndpoint =
+	| { kind: "local"; session: AgentSession | null; sessionFile: string | null }
+	| { kind: "remote"; reference: string; endpoint: AgentEndpoint | null };
 /** Provenance of a displayed duration: active runtime, transcript span, or unavailable. */
 type AgentDurationKind = "active" | "span" | "unknown";
 /**
@@ -75,15 +91,21 @@ export interface AgentRef {
 	kind: AgentKind;
 	parentId?: string;
 	status: AgentStatus;
-	/** Null exactly when parked/aborted. */
-	session: AgentSession | null;
-	sessionFile: string | null;
+	endpoint: AgentRefEndpoint;
 	createdAt: number;
 	lastActivity: number;
 	/** Short gist of what the agent is currently doing (latest intent or tool), for the work-aware roster. Display-only. */
 	activity?: string;
 	/** Persisted identity and telemetry restored after the live observer is gone. */
 	history?: AgentHistorySummary;
+}
+
+export function getLocalSession(ref: AgentRef | null | undefined): AgentSession | null {
+	return ref?.endpoint.kind === "local" ? ref.endpoint.session : null;
+}
+
+export function getLocalSessionFile(ref: AgentRef | null | undefined): string | null {
+	return ref?.endpoint.kind === "local" ? ref.endpoint.sessionFile : null;
 }
 
 export type AgentRefExpectation = AgentRef | AgentSession;
@@ -101,8 +123,7 @@ export interface RegisterInput {
 	displayName: string;
 	kind: AgentKind;
 	parentId?: string;
-	session: AgentSession | null;
-	sessionFile?: string | null;
+	endpoint: AgentRefEndpoint;
 	status?: AgentStatus;
 	/** Last persisted task summary, when restoring a historical agent. */
 	activity?: string;
@@ -133,7 +154,7 @@ export class AgentRegistry {
 	readonly #listeners = new Set<RegistryListener>();
 
 	#matchesExpected(ref: AgentRef, expected?: AgentRefExpectation): boolean {
-		return expected === undefined || ref === expected || ref.session === expected;
+		return expected === undefined || ref === expected || getLocalSession(ref) === expected;
 	}
 
 	#rejectStatusUpdate(id: string, status: AgentStatus, reason: string): false {
@@ -149,8 +170,7 @@ export class AgentRegistry {
 			kind: input.kind,
 			parentId: input.parentId,
 			status: input.status ?? "running",
-			session: input.session,
-			sessionFile: input.sessionFile ?? null,
+			endpoint: input.endpoint,
 			createdAt: input.createdAt ?? now,
 			lastActivity: input.lastActivity ?? now,
 			activity: input.activity,
@@ -170,13 +190,14 @@ export class AgentRegistry {
 	registerIfAvailable(input: RegisterInput, expected: AgentRef | null): AgentRef | undefined {
 		const current = this.#refs.get(input.id);
 		if (expected === null) return current ? undefined : this.register(input);
-		return current === expected && current.status === "parked" && !current.session ? current : undefined;
+		return current === expected && current.endpoint.kind === "local" && input.endpoint.kind === "local" &&
+			current.status === "parked" && !getLocalSession(current) ? current : undefined;
 	}
 
 	/** Attach transcript-derived identity and telemetry without changing lifecycle state. */
 	setHistory(id: string, history: AgentHistorySummary, expectedSessionFile?: string): boolean {
 		const ref = this.#refs.get(id);
-		if (!ref || (expectedSessionFile !== undefined && ref.sessionFile !== expectedSessionFile)) return false;
+		if (!ref || (expectedSessionFile !== undefined && getLocalSessionFile(ref) !== expectedSessionFile)) return false;
 		const definedHistory = Object.fromEntries(
 			Object.entries(history).filter(([, value]) => value !== undefined),
 		) as AgentHistorySummary;
@@ -240,17 +261,19 @@ export class AgentRegistry {
 		// Never attach a late-created session to a hard-killed tombstone. This
 		// closes the race between a parked reviver claiming the ref and finishing
 		// createAgentSession after an explicit kill.
-		if (!ref || ref.status === "aborted" || !this.#matchesExpected(ref, expected)) return false;
-		ref.session = session;
-		if (sessionFile !== undefined) ref.sessionFile = sessionFile;
+		if (!ref || ref.endpoint.kind !== "local" || ref.status === "aborted" || !this.#matchesExpected(ref, expected)) {
+			return false;
+		}
+		ref.endpoint.session = session;
+		if (sessionFile !== undefined) ref.endpoint.sessionFile = sessionFile;
 		ref.lastActivity = Date.now();
 		return true;
 	}
 
 	detachSession(id: string, expected?: AgentRefExpectation): boolean {
 		const ref = this.#refs.get(id);
-		if (!ref || !this.#matchesExpected(ref, expected)) return false;
-		ref.session = null;
+		if (!ref || ref.endpoint.kind !== "local" || !this.#matchesExpected(ref, expected)) return false;
+		ref.endpoint.session = null;
 		return true;
 	}
 
@@ -271,20 +294,24 @@ export class AgentRegistry {
 	}
 
 	/**
-	 * Returns every alive agent (running | idle) except the caller. Advisor refs
+	 * Returns live or execution-unknown agents except the caller. Advisor refs
 	 * are observability-only transcripts, never peers, so they are excluded.
 	 * Flat namespace: every other agent is visible.
 	 */
 	listVisibleTo(id: string): AgentRef[] {
 		return this.list().filter(
-			ref => ref.id !== id && ref.kind !== "advisor" && (ref.status === "running" || ref.status === "idle"),
+			ref => ref.id !== id && ref.kind !== "advisor" &&
+				(ref.status === "running" || ref.status === "idle" || isAgentUnknown(ref.status)),
 		);
 	}
 
 	/** Whether a ref's claimed running state is corroborated by its attached live session. */
 	isRunning(ref: AgentRef): boolean {
 		if (ref.status !== "running") return false;
-		return ref.session?.isStreaming === true;
+		// D2 dependency: remote liveness comes from the endpoint, never a fabricated session.
+		return ref.endpoint.kind === "remote"
+			? ref.endpoint.endpoint?.asRosterSnapshot().status === "running"
+			: getLocalSession(ref)?.isStreaming === true;
 	}
 
 	/** Mirror a session's authoritative run-state notifications into its owned registry ref. */

@@ -113,7 +113,7 @@ describe("runIsolatedSubprocess", () => {
 			id: "PreserveBranchFailure",
 			displayName: "PreserveBranchFailure",
 			kind: "sub",
-			session: null,
+			endpoint: { kind: "local", session: null, sessionFile: null },
 			status: "parked",
 		});
 		// No branch was ever created, so the rescue probe finds nothing to keep.
@@ -198,7 +198,7 @@ describe("runIsolatedSubprocess", () => {
 			id: "RescueBranchCommits",
 			displayName: "RescueBranchCommits",
 			kind: "sub",
-			session: null,
+			endpoint: { kind: "local", session: null, sessionFile: null },
 			status: "parked",
 		});
 		const rangeSpy = vi.fn(async () => {

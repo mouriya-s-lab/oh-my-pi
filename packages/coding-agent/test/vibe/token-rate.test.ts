@@ -34,7 +34,7 @@ function registerWorker(id: string, session: AgentSession | null, ownerId = OWNE
 			id,
 			displayName: id,
 			kind: "sub",
-			session,
+			endpoint: { kind: "local", session: session, sessionFile: null },
 			status: "running",
 		});
 	}

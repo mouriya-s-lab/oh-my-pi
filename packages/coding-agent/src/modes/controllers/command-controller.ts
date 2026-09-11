@@ -1681,6 +1681,8 @@ function formatJobStatus(status: AsyncJobSnapshotItem["status"]): string {
 	if (status === "running") return theme.fg("warning", "running");
 	if (status === "completed") return theme.fg("success", "completed");
 	if (status === "cancelled") return theme.fg("dim", "cancelled");
+	// D2: preserve the remote transport verdict in the plain job label.
+	if (status === "execution-unknown") return theme.fg("warning", "execution-unknown");
 	return theme.fg("error", "failed");
 }
 

@@ -91,7 +91,7 @@ export interface SubagentLifecyclePayload {
 	agent: string;
 	agentSource: AgentSource;
 	description?: string;
-	status: "started" | "completed" | "failed" | "aborted";
+	status: "started" | "completed" | "failed" | "aborted" | "execution-unknown";
 	sessionFile?: string;
 	parentToolCallId?: string;
 	index: number;
@@ -440,7 +440,7 @@ export interface AgentProgress {
 	id: string;
 	agent: string;
 	agentSource: AgentSource;
-	status: "pending" | "running" | "completed" | "failed" | "aborted";
+	status: "pending" | "running" | "completed" | "failed" | "aborted" | "execution-unknown";
 	task: string;
 	assignment?: string;
 	description?: string;
@@ -520,7 +520,7 @@ export interface SingleResult {
 	assignment?: string;
 	description?: string;
 	lastIntent?: string;
-	exitCode: number;
+	exitCode: number | null;
 	output: string;
 	stderr: string;
 	truncated: boolean;
@@ -590,7 +590,7 @@ export interface TaskToolDetails {
 	outputPaths?: string[];
 	progress?: AgentProgress[];
 	async?: {
-		state: "running" | "completed" | "failed";
+		state: "running" | "completed" | "failed" | "execution-unknown";
 		jobId: string;
 		type: "task";
 	};

@@ -8,7 +8,7 @@ export interface ObservableSession {
 	label: string;
 	agent?: string;
 	description?: string;
-	status: "active" | "completed" | "failed" | "aborted";
+	status: "active" | "completed" | "failed" | "aborted" | "execution-unknown";
 	sessionFile?: string;
 	parentToolCallId?: string;
 	/**
@@ -32,6 +32,8 @@ const STATUS_MAP: Record<string, ObservableSession["status"]> = {
 	completed: "completed",
 	failed: "failed",
 	aborted: "aborted",
+	// D2 dependency: lost execution observation is terminal for the observer, not a local abort.
+	"execution-unknown": "execution-unknown",
 };
 
 export class SessionObserverRegistry {
@@ -215,6 +217,7 @@ export class SessionObserverRegistry {
 						const sortOrder = this.#ensureSortOrder(id);
 						this.#ensureParentSortOrder(payload.parentToolCallId, sortOrder);
 						if (existing) {
+							if (progress.status === "execution-unknown") existing.status = "execution-unknown";
 							existing.lastUpdate = Date.now();
 							existing.index = payload.index;
 							existing.parentToolCallId = payload.parentToolCallId ?? existing.parentToolCallId;
@@ -229,7 +232,7 @@ export class SessionObserverRegistry {
 								label: progress.description ?? `Subagent #${payload.index}`,
 								agent: payload.agent,
 								description: progress.description,
-								status: "active",
+								status: progress.status === "execution-unknown" ? "execution-unknown" : "active",
 								sessionFile: payload.sessionFile,
 								parentToolCallId: payload.parentToolCallId,
 								detached: payload.detached,

@@ -17,7 +17,7 @@
 
 import { logger, Snowflake } from "@oh-my-pi/pi-utils";
 import { AgentLifecycleManager } from "../registry/agent-lifecycle";
-import { AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
+import { AgentRegistry, getLocalSession, MAIN_AGENT_ID } from "../registry/agent-registry";
 import type { AgentSession } from "../session/agent-session";
 import type { AgentSessionEvent } from "../session/agent-session-events";
 import type { CustomMessage } from "../session/messages";
@@ -177,6 +177,10 @@ export class IrcBus {
 				error: `Agent "${message.to}" is a read-only advisor transcript and cannot be messaged.`,
 			};
 		}
+		// D2 dependency: remote IRC delivery is blocked on #11; never fake a local injection or revive.
+		if (ref.endpoint.kind === "remote") {
+			return { to: message.to, outcome: "failed", error: "Remote IRC delivery is not implemented (#11)." };
+		}
 
 		// A `parked` recipient always needs the lifecycle to revive it — this is
 		// read from *this* bus's registry, so it holds for any registry. The
@@ -192,14 +196,15 @@ export class IrcBus {
 			ref.status === "parked" ||
 			(lifecycleOwnsRegistry && (lifecycle.isParking(message.to) || lifecycle.has(message.to)));
 
-		const priorSession = ref.session;
+		const priorSession = getLocalSession(ref);
 		let revived = false;
 		if (needsLifecycleGate) {
 			try {
-				const liveSession = await lifecycle.ensureLive(message.to);
+				const live = await lifecycle.ensureLive(message.to);
+				if (live.kind !== "local") throw new Error("Remote IRC delivery is not implemented (#11).");
 				// Revival = we did not keep the same live instance (parked start, or
 				// park completed and a fresh session was rebuilt).
-				revived = !priorSession || liveSession !== priorSession;
+				revived = !priorSession || live.session !== priorSession;
 			} catch (error) {
 				// Not revivable / released / revive failed. Do not buffer: a permanent
 				// failure must not inflate unread counts or pretend delivery is pending.
@@ -221,7 +226,7 @@ export class IrcBus {
 			return { to: message.to, outcome: revived ? "revived" : "injected" };
 		}
 
-		const session = this.#registry.get(message.to)?.session;
+		const session = getLocalSession(this.#registry.get(message.to));
 		if (!session) {
 			return { to: message.to, outcome: "failed", error: `Agent "${message.to}" has no live session.` };
 		}
@@ -374,12 +379,17 @@ export class IrcBus {
 					return;
 				}
 				void session.waitForIrcReplies().then(() => {
-					if (!active || registry.get(target)?.session !== session) return;
+					if (!active || getLocalSession(registry.get(target)) !== session) return;
 					settle({ kind: "abort", error: new IrcAwaitTargetStopped(target) });
 				});
 			};
 			const sync = (): void => {
 				const ref = registry.get(target);
+				// D2 dependency: loss of observation ends this wait without claiming the peer stopped.
+				if (ref?.status === "execution-unknown") {
+					settle({ kind: "abort", error: new Error(`Awaited peer "${target}" has execution-unknown status.`) });
+					return;
+				}
 				// Gone or hard-aborted: no reply will ever come.
 				if (!ref || ref.status === "aborted") {
 					settle({ kind: "abort", error: new IrcAwaitTargetStopped(target) });
@@ -387,7 +397,7 @@ export class IrcBus {
 				}
 				// Follow the live session across a park→revive rebuild; tolerate a
 				// parked peer with no session yet (the send is about to revive it).
-				const session = ref.session;
+				const session = getLocalSession(ref);
 				if (session && session !== subscribedSession) {
 					unsubscribeSession?.();
 					subscribedSession = session;
@@ -486,7 +496,7 @@ export class IrcBus {
 	 */
 	#relayToMainUi(message: IrcMessage): void {
 		if (message.to === MAIN_AGENT_ID || message.from === MAIN_AGENT_ID) return;
-		const mainSession = this.#registry.get(MAIN_AGENT_ID)?.session;
+		const mainSession = getLocalSession(this.#registry.get(MAIN_AGENT_ID));
 		if (!mainSession) return;
 		const record: CustomMessage = {
 			role: "custom",

@@ -21,6 +21,8 @@ function renderLines(resultText: string): string {
 					id: "SpawnProbe",
 					type: "task" as const,
 					status: "completed" as const,
+					endpointKind: "local",
+					exitCode: 0,
 					label: "SpawnProbe",
 					durationMs: 8_700,
 					resultText,
@@ -118,6 +120,8 @@ describe("job renderer task-result preview", () => {
 				id: "Job1",
 				type: "task" as const,
 				status: "running" as const,
+				endpointKind: "local",
+				exitCode: null,
 				label: "Job1 running",
 				durationMs: 1200,
 			},
@@ -125,6 +129,8 @@ describe("job renderer task-result preview", () => {
 				id: "Job2",
 				type: "task" as const,
 				status: "completed" as const,
+				endpointKind: "local",
+				exitCode: 0,
 				label: "Job2 completed",
 				durationMs: 3400,
 				resultText: "Job2 result",
@@ -133,6 +139,8 @@ describe("job renderer task-result preview", () => {
 				id: "Job3",
 				type: "task" as const,
 				status: "running" as const,
+				endpointKind: "local",
+				exitCode: null,
 				label: "Job3 running",
 				durationMs: 500,
 			},
@@ -180,6 +188,8 @@ describe("job renderer task-result preview", () => {
 					id: "Job1",
 					type: "task" as const,
 					status: "running" as const,
+					endpointKind: "local",
+					exitCode: null,
 					label: "Job1 running",
 					durationMs: 1200,
 				},
@@ -240,7 +250,17 @@ describe("job renderer task-result preview", () => {
 				details: {
 					op: "jobs" as const,
 					jobs: [],
-					agents: [{ id: "Worker", parentId: "Main", activity: "grepping the tree", ageMs: 65_000, live: true }],
+					agents: [
+						{
+							id: "Worker",
+							endpointKind: "local",
+							status: "running",
+							parentId: "Main",
+							activity: "grepping the tree",
+							ageMs: 65_000,
+							live: true,
+						},
+					],
 				},
 			};
 			const component = hubToolRenderer.renderResult(
@@ -258,7 +278,11 @@ describe("job renderer task-result preview", () => {
 		it("keeps a sealed bare-poll result visible when it carries an agent roster", () => {
 			const result = {
 				content: [{ type: "text" as const, text: "No running background jobs to wait for." }],
-				details: { op: "wait" as const, jobs: [], agents: [{ id: "Worker", ageMs: 1_000, live: false }] },
+				details: {
+					op: "wait" as const,
+					jobs: [],
+					agents: [{ id: "Worker", endpointKind: "local", status: "running", ageMs: 1_000, live: false }],
+				},
 			};
 			const component = hubToolRenderer.renderResult(
 				result,

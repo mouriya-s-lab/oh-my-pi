@@ -453,7 +453,7 @@ describe("runEvalAgent", () => {
 				id: options.id,
 				displayName: options.id,
 				kind: "sub",
-				session: cleanupSession,
+				endpoint: { kind: "local", session: cleanupSession, sessionFile: null },
 				status: "idle",
 			});
 			await taskExecutor.finalizeSubagentLifecycle({

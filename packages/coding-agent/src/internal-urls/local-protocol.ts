@@ -2,7 +2,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { isEnoent } from "@oh-my-pi/pi-utils";
-import { AgentRegistry } from "../registry/agent-registry";
+import { AgentRegistry, getLocalSession } from "../registry/agent-registry";
 import { isMarkdownPath } from "../utils/lang-from-path";
 import { buildDirectoryResource } from "./filesystem-resource";
 import { parseInternalUrl } from "./parse";
@@ -473,7 +473,8 @@ export class LocalProtocolHandler implements ProtocolHandler {
 		const main = AgentRegistry.global()
 			.list()
 			.find(ref => ref.kind === "main");
-		const sessionManager = main?.session?.sessionManager;
+		// D2 dependency: the local:// context cannot use a remote endpoint as a session.
+		const sessionManager = getLocalSession(main)?.sessionManager;
 		if (!sessionManager) return undefined;
 		return {
 			getArtifactsDir: () => sessionManager.getArtifactsDir(),

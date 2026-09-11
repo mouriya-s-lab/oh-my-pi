@@ -7,7 +7,13 @@ import { HistoryProtocolHandler } from "@oh-my-pi/pi-coding-agent/internal-urls/
 import { parseInternalUrl } from "@oh-my-pi/pi-coding-agent/internal-urls/parse";
 import { IrcBus } from "@oh-my-pi/pi-coding-agent/irc/bus";
 import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
-import { AgentRegistry, getAgentTombstonePath, MAIN_AGENT_ID } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import {
+	AgentRegistry,
+	getAgentTombstonePath,
+	getLocalSession,
+	getLocalSessionFile,
+	MAIN_AGENT_ID,
+} from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { ensurePersistedRoster, registerPersistedSubagents } from "@oh-my-pi/pi-coding-agent/registry/persisted-agents";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { CURRENT_SESSION_VERSION } from "@oh-my-pi/pi-coding-agent/session/session-entries";
@@ -85,7 +91,7 @@ async function renderIrcPeerRoster(
 	registry: AgentRegistry = AgentRegistry.global(),
 	sessionFileHint?: string | null,
 ): Promise<string> {
-	const hint = sessionFileHint ?? registry.get(selfId)?.sessionFile ?? registry.get(MAIN_AGENT_ID)?.sessionFile;
+	const hint = sessionFileHint ?? getLocalSessionFile(registry.get(selfId)) ?? getLocalSessionFile(registry.get(MAIN_AGENT_ID));
 	const root = await ensurePersistedRoster(registry, hint);
 	const roster = collectIrcPeerRoster(registry, selfId, root);
 	return prompt.render(await fs.promises.readFile(subagentSystemPromptTemplatePath, "utf-8"), {
@@ -110,7 +116,7 @@ describe("hub list", () => {
 			id: MAIN_AGENT_ID,
 			displayName: MAIN_AGENT_ID,
 			kind: "main",
-			session: null,
+			endpoint: { kind: "local", session: null, sessionFile: null },
 			status: "running",
 		});
 		registry.register({
@@ -118,7 +124,7 @@ describe("hub list", () => {
 			displayName: "task",
 			kind: "sub",
 			parentId: MAIN_AGENT_ID,
-			session: null,
+			endpoint: { kind: "local", session: null, sessionFile: null },
 			status: "running",
 			activity: "auditing tokens",
 		});
@@ -126,14 +132,14 @@ describe("hub list", () => {
 			id: "IdleWorker",
 			displayName: "task",
 			kind: "sub",
-			session: null,
+			endpoint: { kind: "local", session: null, sessionFile: null },
 			status: "idle",
 		});
 		registry.register({
 			id: "ParkedScout",
 			displayName: "secret parked label",
 			kind: "sub",
-			session: null,
+			endpoint: { kind: "local", session: null, sessionFile: null },
 			status: "parked",
 			activity: "reviewing classified.diff",
 		});
@@ -146,6 +152,7 @@ describe("hub list", () => {
 			running: 1,
 			idle: 1,
 			parked: 1,
+			"execution-unknown": 0,
 			shown: 2,
 			truncated: 0,
 		});
@@ -165,16 +172,16 @@ describe("hub list", () => {
 			id: MAIN_AGENT_ID,
 			displayName: MAIN_AGENT_ID,
 			kind: "main",
-			session: null,
+			endpoint: { kind: "local", session: null, sessionFile: null },
 			status: "running",
 		});
-		registry.register({ id: "Live", displayName: "task", kind: "sub", session: null, status: "idle" });
+		registry.register({ id: "Live", displayName: "task", kind: "sub", endpoint: { kind: "local", session: null, sessionFile: null }, status: "idle" });
 		registry.register({
 			id: "ParkedScout",
 			displayName: "task",
 			kind: "sub",
 			parentId: MAIN_AGENT_ID,
-			session: null,
+			endpoint: { kind: "local", session: null, sessionFile: null },
 			status: "parked",
 		});
 
@@ -192,6 +199,7 @@ describe("hub list", () => {
 			running: 0,
 			idle: 1,
 			parked: 1,
+			"execution-unknown": 0,
 			shown: 1,
 			truncated: 0,
 		});
@@ -204,7 +212,7 @@ describe("hub list", () => {
 			id: MAIN_AGENT_ID,
 			displayName: MAIN_AGENT_ID,
 			kind: "main",
-			session: null,
+			endpoint: { kind: "local", session: null, sessionFile: null },
 			status: "running",
 		});
 		const extra = 5;
@@ -213,7 +221,7 @@ describe("hub list", () => {
 				id: `Idle${index}`,
 				displayName: "task",
 				kind: "sub",
-				session: null,
+				endpoint: { kind: "local", session: null, sessionFile: null },
 				status: "idle",
 				lastActivity: index,
 			});
@@ -227,6 +235,7 @@ describe("hub list", () => {
 			running: 0,
 			idle: DEFAULT_HUB_LIST_LIMIT + extra,
 			parked: 0,
+			"execution-unknown": 0,
 			shown: DEFAULT_HUB_LIST_LIMIT,
 			truncated: extra,
 		});
@@ -241,7 +250,7 @@ describe("hub list", () => {
 			id: MAIN_AGENT_ID,
 			displayName: MAIN_AGENT_ID,
 			kind: "main",
-			session: null,
+			endpoint: { kind: "local", session: null, sessionFile: null },
 			status: "running",
 		});
 		const extra = 20;
@@ -250,7 +259,7 @@ describe("hub list", () => {
 				id: `Parked${index}`,
 				displayName: "task",
 				kind: "sub",
-				session: null,
+				endpoint: { kind: "local", session: null, sessionFile: null },
 				status: "parked",
 				lastActivity: index,
 			});
@@ -264,6 +273,7 @@ describe("hub list", () => {
 			running: 0,
 			idle: 0,
 			parked: MAX_HUB_LIST_LIMIT + extra,
+			"execution-unknown": 0,
 			shown: MAX_HUB_LIST_LIMIT,
 			truncated: extra,
 		});
@@ -275,18 +285,18 @@ describe("hub list", () => {
 			id: MAIN_AGENT_ID,
 			displayName: MAIN_AGENT_ID,
 			kind: "main",
-			session: null,
+			endpoint: { kind: "local", session: null, sessionFile: null },
 			status: "running",
 		});
-		registry.register({ id: "Worker", displayName: "task", kind: "sub", session: null, status: "idle" });
+		registry.register({ id: "Worker", displayName: "task", kind: "sub", endpoint: { kind: "local", session: null, sessionFile: null }, status: "idle" });
 		registry.register({
 			id: `${MAIN_AGENT_ID}/advisor`,
 			displayName: "advisor",
 			kind: "advisor",
-			session: null,
+			endpoint: { kind: "local", session: null, sessionFile: null },
 			status: "parked",
 		});
-		registry.register({ id: "Dead", displayName: "task", kind: "sub", session: null, status: "aborted" });
+		registry.register({ id: "Dead", displayName: "task", kind: "sub", endpoint: { kind: "local", session: null, sessionFile: null }, status: "aborted" });
 
 		const listed = await executeList(registry, MAIN_AGENT_ID);
 		const parked = await executeList(registry, MAIN_AGENT_ID, { status: "parked" });
@@ -298,6 +308,7 @@ describe("hub list", () => {
 			running: 0,
 			idle: 1,
 			parked: 0,
+			"execution-unknown": 0,
 			shown: 1,
 			truncated: 0,
 		});
@@ -309,8 +320,7 @@ describe("hub list", () => {
 			id: MAIN_AGENT_ID,
 			displayName: MAIN_AGENT_ID,
 			kind: "main",
-			session: null,
-			sessionFile: "\0invalid.jsonl",
+			endpoint: { kind: "local", session: null, sessionFile: "\0invalid.jsonl" },
 			status: "running",
 		});
 		registry.register({
@@ -318,7 +328,7 @@ describe("hub list", () => {
 			displayName: "task",
 			kind: "sub",
 			parentId: MAIN_AGENT_ID,
-			session: null,
+			endpoint: { kind: "local", session: null, sessionFile: null },
 			status: "idle",
 		});
 
@@ -340,8 +350,7 @@ describe("hub list", () => {
 			id: MAIN_AGENT_ID,
 			displayName: MAIN_AGENT_ID,
 			kind: "main",
-			session: null,
-			sessionFile,
+			endpoint: { kind: "local", session: null, sessionFile: sessionFile },
 			status: "running",
 		});
 		registry.register({
@@ -349,7 +358,7 @@ describe("hub list", () => {
 			displayName: "task",
 			kind: "sub",
 			parentId: MAIN_AGENT_ID,
-			session: null,
+			endpoint: { kind: "local", session: null, sessionFile: null },
 			status: "idle",
 		});
 
@@ -365,6 +374,7 @@ describe("hub list", () => {
 				running: 0,
 				idle: 1,
 				parked: 0,
+				"execution-unknown": 0,
 				shown: 1,
 				truncated: 0,
 			});
@@ -379,6 +389,7 @@ describe("hub list", () => {
 				running: 0,
 				idle: 1,
 				parked: 1,
+				"execution-unknown": 0,
 				shown: 1,
 				truncated: 0,
 			});
@@ -402,8 +413,7 @@ describe("hub list", () => {
 			id: MAIN_AGENT_ID,
 			displayName: MAIN_AGENT_ID,
 			kind: "main",
-			session: null,
-			sessionFile,
+			endpoint: { kind: "local", session: null, sessionFile: sessionFile },
 			status: "running",
 		});
 
@@ -414,6 +424,7 @@ describe("hub list", () => {
 			running: 0,
 			idle: 0,
 			parked: 0,
+			"execution-unknown": 0,
 			shown: 0,
 			truncated: 0,
 		});
@@ -429,6 +440,7 @@ describe("hub list", () => {
 			running: 0,
 			idle: 0,
 			parked: 1,
+			"execution-unknown": 0,
 			shown: 0,
 			truncated: 0,
 		});
@@ -449,8 +461,7 @@ describe("hub list", () => {
 			id: MAIN_AGENT_ID,
 			displayName: MAIN_AGENT_ID,
 			kind: "main",
-			session: null,
-			sessionFile,
+			endpoint: { kind: "local", session: null, sessionFile: sessionFile },
 			status: "running",
 		});
 
@@ -466,6 +477,7 @@ describe("hub list", () => {
 				running: 0,
 				idle: 0,
 				parked: 0,
+				"execution-unknown": 0,
 				shown: 0,
 				truncated: 0,
 			});
@@ -478,6 +490,7 @@ describe("hub list", () => {
 				running: 0,
 				idle: 0,
 				parked: 1,
+				"execution-unknown": 0,
 				shown: 0,
 				truncated: 0,
 			});
@@ -502,8 +515,7 @@ describe("hub list", () => {
 				id: MAIN_AGENT_ID,
 				displayName: MAIN_AGENT_ID,
 				kind: "main",
-				session: null,
-				sessionFile,
+				endpoint: { kind: "local", session: null, sessionFile: sessionFile },
 				status: "running",
 			});
 			registry.register({
@@ -511,7 +523,7 @@ describe("hub list", () => {
 				displayName: "task",
 				kind: "sub",
 				parentId: MAIN_AGENT_ID,
-				session: null,
+				endpoint: { kind: "local", session: null, sessionFile: null },
 				status: "idle",
 			});
 
@@ -527,6 +539,7 @@ describe("hub list", () => {
 					running: 0,
 					idle: 1,
 					parked: 0,
+					"execution-unknown": 0,
 					shown: 1,
 					truncated: 0,
 				});
@@ -543,6 +556,7 @@ describe("hub list", () => {
 					running: 0,
 					idle: 1,
 					parked: 1,
+					"execution-unknown": 0,
 					shown: 1,
 					truncated: 0,
 				});
@@ -567,8 +581,7 @@ describe("hub list", () => {
 			id: MAIN_AGENT_ID,
 			displayName: MAIN_AGENT_ID,
 			kind: "main",
-			session: null,
-			sessionFile,
+			endpoint: { kind: "local", session: null, sessionFile: sessionFile },
 			status: "running",
 		});
 		registry.register({
@@ -576,7 +589,7 @@ describe("hub list", () => {
 			displayName: "task",
 			kind: "sub",
 			parentId: MAIN_AGENT_ID,
-			session: null,
+			endpoint: { kind: "local", session: null, sessionFile: null },
 			status: "idle",
 		});
 
@@ -594,6 +607,7 @@ describe("hub list", () => {
 				running: 0,
 				idle: 1,
 				parked: 0,
+				"execution-unknown": 0,
 				shown: 1,
 				truncated: 0,
 			});
@@ -640,8 +654,7 @@ describe("hub list", () => {
 			id: MAIN_AGENT_ID,
 			displayName: MAIN_AGENT_ID,
 			kind: "main",
-			session: null,
-			sessionFile,
+			endpoint: { kind: "local", session: null, sessionFile: sessionFile },
 			status: "running",
 		});
 
@@ -664,8 +677,7 @@ describe("hub list", () => {
 			id: MAIN_AGENT_ID,
 			displayName: MAIN_AGENT_ID,
 			kind: "main",
-			session: null,
-			sessionFile,
+			endpoint: { kind: "local", session: null, sessionFile: sessionFile },
 			status: "running",
 		});
 		registry.register({
@@ -673,7 +685,7 @@ describe("hub list", () => {
 			displayName: "task",
 			kind: "sub",
 			parentId: MAIN_AGENT_ID,
-			session: null,
+			endpoint: { kind: "local", session: null, sessionFile: null },
 			status: "idle",
 		});
 
@@ -684,6 +696,7 @@ describe("hub list", () => {
 			running: 0,
 			idle: 1,
 			parked: 0,
+			"execution-unknown": 0,
 			shown: 1,
 			truncated: 0,
 		});
@@ -731,8 +744,7 @@ describe("hub list", () => {
 			id: MAIN_AGENT_ID,
 			displayName: MAIN_AGENT_ID,
 			kind: "main",
-			session: null,
-			sessionFile,
+			endpoint: { kind: "local", session: null, sessionFile: sessionFile },
 			status: "running",
 		});
 
@@ -743,11 +755,12 @@ describe("hub list", () => {
 			running: 0,
 			idle: 0,
 			parked: 1,
+			"execution-unknown": 0,
 			shown: 0,
 			truncated: 0,
 		});
 		expect(listText(listed)).not.toContain("Worker");
-		expect(registry.get("Worker")?.sessionFile).toBe(workerSessionFile);
+		expect(getLocalSessionFile(registry.get("Worker"))).toBe(workerSessionFile);
 
 		const parked = await executeList(registry, MAIN_AGENT_ID, { status: "parked" });
 		if (!parked.details) throw new Error("Expected coordination details");
@@ -777,8 +790,7 @@ describe("hub list", () => {
 			id: MAIN_AGENT_ID,
 			displayName: MAIN_AGENT_ID,
 			kind: "main",
-			session: null,
-			sessionFile,
+			endpoint: { kind: "local", session: null, sessionFile: sessionFile },
 			status: "running",
 		});
 		registry.register({
@@ -786,8 +798,7 @@ describe("hub list", () => {
 			displayName: "task",
 			kind: "sub",
 			parentId: MAIN_AGENT_ID,
-			session: null,
-			sessionFile: liveSessionFile,
+			endpoint: { kind: "local", session: null, sessionFile: liveSessionFile },
 			status: "idle",
 		});
 
@@ -798,6 +809,7 @@ describe("hub list", () => {
 			running: 0,
 			idle: 1,
 			parked: 1,
+			"execution-unknown": 0,
 			shown: 1,
 			truncated: 0,
 		});
@@ -823,8 +835,7 @@ describe("hub list", () => {
 			id: MAIN_AGENT_ID,
 			displayName: MAIN_AGENT_ID,
 			kind: "main",
-			session: null,
-			sessionFile: firstSession,
+			endpoint: { kind: "local", session: null, sessionFile: firstSession },
 			status: "running",
 		});
 		const first = await executeList(registry, MAIN_AGENT_ID, { status: "parked" });
@@ -841,8 +852,7 @@ describe("hub list", () => {
 			id: MAIN_AGENT_ID,
 			displayName: MAIN_AGENT_ID,
 			kind: "main",
-			session: null,
-			sessionFile: secondSession,
+			endpoint: { kind: "local", session: null, sessionFile: secondSession },
 			status: "running",
 		});
 		const second = await executeList(registry, MAIN_AGENT_ID, { status: "parked" });
@@ -877,8 +887,7 @@ describe("hub list", () => {
 			id: MAIN_AGENT_ID,
 			displayName: MAIN_AGENT_ID,
 			kind: "main",
-			session: null,
-			sessionFile,
+			endpoint: { kind: "local", session: null, sessionFile: sessionFile },
 			status: "running",
 		});
 		registry.register({
@@ -886,8 +895,7 @@ describe("hub list", () => {
 			displayName: "task",
 			kind: "sub",
 			parentId: "L9",
-			session: null,
-			sessionFile: deepSessionFile,
+			endpoint: { kind: "local", session: null, sessionFile: deepSessionFile },
 			status: "idle",
 		});
 
@@ -911,10 +919,10 @@ describe("hub list", () => {
 			id: MAIN_AGENT_ID,
 			displayName: MAIN_AGENT_ID,
 			kind: "main",
-			session: null,
+			endpoint: { kind: "local", session: null, sessionFile: null },
 			status: "running",
 		});
-		registry.register({ id: "IdleWorker", displayName: "task", kind: "sub", session: null, status: "idle" });
+		registry.register({ id: "IdleWorker", displayName: "task", kind: "sub", endpoint: { kind: "local", session: null, sessionFile: null }, status: "idle" });
 
 		const result = await executeList(registry, MAIN_AGENT_ID, { limit: 0.9 });
 		if (!result.details) throw new Error("Expected coordination details");
@@ -933,10 +941,10 @@ describe("hub list", () => {
 				id: MAIN_AGENT_ID,
 				displayName: MAIN_AGENT_ID,
 				kind: "main",
-				session: null,
+				endpoint: { kind: "local", session: null, sessionFile: null },
 				status: "running",
 			});
-			registry.register({ id: "Sleeper", displayName: "task", kind: "sub", session: null, status: "parked" });
+			registry.register({ id: "Sleeper", displayName: "task", kind: "sub", endpoint: { kind: "local", session: null, sessionFile: null }, status: "parked" });
 			const delivered: string[] = [];
 			const revived = {
 				isStreaming: false,
@@ -984,8 +992,7 @@ describe("hub list session authority", () => {
 			id: MAIN_AGENT_ID,
 			displayName: MAIN_AGENT_ID,
 			kind: "main",
-			session: null,
-			sessionFile: firstSession,
+			endpoint: { kind: "local", session: null, sessionFile: firstSession },
 			status: "running",
 		});
 		const tool = new HubTool(makeToolSession(registry, MAIN_AGENT_ID, secondSession));
@@ -993,7 +1000,7 @@ describe("hub list session authority", () => {
 		if (!listed.details || !("peers" in listed.details)) throw new Error("Expected list details");
 		expect(listed.details.peers?.map(peer => peer.id)).toEqual(["SecondWorker"]);
 		expect(listText(listed)).not.toContain("FirstWorker");
-		expect(registry.get(MAIN_AGENT_ID)?.sessionFile).toBe(firstSession);
+		expect(getLocalSessionFile(registry.get(MAIN_AGENT_ID))).toBe(firstSession);
 	});
 
 	it("replaces a detached old-root parked sub so send and history target the current file", async () => {
@@ -1058,16 +1065,14 @@ describe("hub list session authority", () => {
 				id: MAIN_AGENT_ID,
 				displayName: MAIN_AGENT_ID,
 				kind: "main",
-				session: null,
-				sessionFile: firstSession,
+				endpoint: { kind: "local", session: null, sessionFile: firstSession },
 				status: "running",
 			});
 			registry.register({
 				id: "Worker",
 				displayName: "task",
 				kind: "sub",
-				session: null,
-				sessionFile: oldWorker,
+				endpoint: { kind: "local", session: null, sessionFile: oldWorker },
 				status: "parked",
 				activity: "old-secret-task-body",
 			});
@@ -1075,7 +1080,7 @@ describe("hub list session authority", () => {
 			const tool = new HubTool(makeToolSession(registry, MAIN_AGENT_ID, secondSession));
 			const listed = await tool.execute("list-replace", { op: "list", status: "parked" });
 			if (!listed.details || !("peers" in listed.details)) throw new Error("Expected list details");
-			expect(registry.get("Worker")?.sessionFile).toBe(newWorker);
+			expect(getLocalSessionFile(registry.get("Worker"))).toBe(newWorker);
 			expect(listed.details.peers?.map(peer => peer.id)).toEqual(["Worker"]);
 
 			const history = await new HistoryProtocolHandler().resolve(parseInternalUrl("history://Worker"));
@@ -1153,63 +1158,57 @@ describe("hub list session authority", () => {
 			id: MAIN_AGENT_ID,
 			displayName: MAIN_AGENT_ID,
 			kind: "main",
-			session: null,
-			sessionFile: currentSession,
+			endpoint: { kind: "local", session: null, sessionFile: currentSession },
 			status: "running",
 		});
 		registry.register({
 			id: "LiveTwin",
 			displayName: "task",
 			kind: "sub",
-			session: liveSession,
-			sessionFile: oldLive,
+			endpoint: { kind: "local", session: liveSession, sessionFile: oldLive },
 			status: "running",
 		});
 		registry.register({
 			id: "IdleTwin",
 			displayName: "task",
 			kind: "sub",
-			session: liveSession,
-			sessionFile: oldIdle,
+			endpoint: { kind: "local", session: liveSession, sessionFile: oldIdle },
 			status: "idle",
 		});
 		registry.register({
 			id: "DeadTwin",
 			displayName: "task",
 			kind: "sub",
-			session: null,
-			sessionFile: oldDead,
+			endpoint: { kind: "local", session: null, sessionFile: oldDead },
 			status: "aborted",
 		});
 		registry.register({
 			id: "AdvisorTwin",
 			displayName: "advisor",
 			kind: "advisor",
-			session: null,
-			sessionFile: oldAdvisor,
+			endpoint: { kind: "local", session: null, sessionFile: oldAdvisor },
 			status: "parked",
 		});
 		registry.register({
 			id: "VibeKid",
 			displayName: "task",
 			kind: "sub",
-			session: null,
-			sessionFile: oldVibe,
+			endpoint: { kind: "local", session: null, sessionFile: oldVibe },
 			status: "parked",
 		});
 
 		await executeList(registry, MAIN_AGENT_ID, { status: "parked" }, currentSession);
 		expect(registry.get("LiveTwin")?.status).toBe("running");
-		expect(registry.get("LiveTwin")?.session).toBe(liveSession);
-		expect(registry.get("LiveTwin")?.sessionFile).toBe(oldLive);
+		expect(getLocalSession(registry.get("LiveTwin"))).toBe(liveSession);
+		expect(getLocalSessionFile(registry.get("LiveTwin"))).toBe(oldLive);
 		expect(registry.get("IdleTwin")?.status).toBe("idle");
-		expect(registry.get("IdleTwin")?.sessionFile).toBe(oldIdle);
+		expect(getLocalSessionFile(registry.get("IdleTwin"))).toBe(oldIdle);
 		expect(registry.get("DeadTwin")?.status).toBe("aborted");
-		expect(registry.get("DeadTwin")?.sessionFile).toBe(oldDead);
+		expect(getLocalSessionFile(registry.get("DeadTwin"))).toBe(oldDead);
 		expect(registry.get("AdvisorTwin")?.kind).toBe("advisor");
-		expect(registry.get("AdvisorTwin")?.sessionFile).toBe(oldAdvisor);
-		expect(registry.get("VibeKid")?.sessionFile).toBe(oldVibe);
-		expect(registry.get("Outer")?.sessionFile).toBe(path.join(dir, "current", "Outer.jsonl"));
+		expect(getLocalSessionFile(registry.get("AdvisorTwin"))).toBe(oldAdvisor);
+		expect(getLocalSessionFile(registry.get("VibeKid"))).toBe(oldVibe);
+		expect(getLocalSessionFile(registry.get("Outer"))).toBe(path.join(dir, "current", "Outer.jsonl"));
 		expect(registry.get("Outer")?.activity).toContain("outer-visible-task");
 		expect(registry.get("Outer")?.activity).not.toContain("nested-steal-task");
 	});
@@ -1233,24 +1232,21 @@ describe("hub list session authority", () => {
 			id: MAIN_AGENT_ID,
 			displayName: MAIN_AGENT_ID,
 			kind: "main",
-			session: null,
-			sessionFile: currentSession,
+			endpoint: { kind: "local", session: null, sessionFile: currentSession },
 			status: "running",
 		});
 		const incomplete = registry.register({
 			id: "IncompleteTwin",
 			displayName: "task",
 			kind: "sub",
-			session: null,
-			sessionFile: oldIncomplete,
+			endpoint: { kind: "local", session: null, sessionFile: oldIncomplete },
 			status: "parked",
 		});
 		const parkedRace = registry.register({
 			id: "RaceTwin",
 			displayName: "task",
 			kind: "sub",
-			session: null,
-			sessionFile: oldRace,
+			endpoint: { kind: "local", session: null, sessionFile: oldRace },
 			status: "parked",
 		});
 		const originalGet = registry.get.bind(registry);
@@ -1265,8 +1261,7 @@ describe("hub list session authority", () => {
 						id: "RaceTwin",
 						displayName: "task",
 						kind: "sub",
-						session: liveSession,
-						sessionFile: newRace,
+						endpoint: { kind: "local", session: liveSession, sessionFile: newRace },
 						status: "running",
 					});
 				});
@@ -1276,9 +1271,9 @@ describe("hub list session authority", () => {
 
 		await executeList(registry, MAIN_AGENT_ID, { status: "parked" }, currentSession);
 		expect(originalGet("IncompleteTwin")).toBe(incomplete);
-		expect(originalGet("IncompleteTwin")?.sessionFile).toBe(oldIncomplete);
+		expect(getLocalSessionFile(originalGet("IncompleteTwin"))).toBe(oldIncomplete);
 		expect(originalGet("RaceTwin")?.status).toBe("running");
-		expect(originalGet("RaceTwin")?.session).toBe(liveSession);
+		expect(getLocalSession(originalGet("RaceTwin"))).toBe(liveSession);
 	});
 
 	it("keeps ensurePersistedRoster metadata-only and hydrates on a later explicit register", async () => {
@@ -1322,12 +1317,11 @@ describe("hub list session authority", () => {
 			id: MAIN_AGENT_ID,
 			displayName: MAIN_AGENT_ID,
 			kind: "main",
-			session: null,
-			sessionFile,
+			endpoint: { kind: "local", session: null, sessionFile: sessionFile },
 			status: "running",
 		});
 		await ensurePersistedRoster(registry, sessionFile);
-		expect(registry.get("Worker")?.sessionFile).toBe(workerFile);
+		expect(getLocalSessionFile(registry.get("Worker"))).toBe(workerFile);
 		expect(registry.get("Worker")?.history?.metrics).toBeUndefined();
 
 		await registerPersistedSubagents(registry, sessionFile);
@@ -1350,14 +1344,14 @@ describe("child system prompt roster", () => {
 			id: MAIN_AGENT_ID,
 			displayName: MAIN_AGENT_ID,
 			kind: "main",
-			session: null,
+			endpoint: { kind: "local", session: null, sessionFile: null },
 			status: "running",
 		});
 		registry.register({
 			id: "LiveWorker",
 			displayName: "implementer",
 			kind: "sub",
-			session: null,
+			endpoint: { kind: "local", session: null, sessionFile: null },
 			status: "running",
 			activity: "editing auth.ts",
 		});
@@ -1365,14 +1359,14 @@ describe("child system prompt roster", () => {
 			id: "IdleReviewer",
 			displayName: "reviewer",
 			kind: "sub",
-			session: null,
+			endpoint: { kind: "local", session: null, sessionFile: null },
 			status: "idle",
 		});
 		registry.register({
 			id: "ParkedScout",
 			displayName: "secret parked label",
 			kind: "sub",
-			session: null,
+			endpoint: { kind: "local", session: null, sessionFile: null },
 			status: "parked",
 			activity: "reviewing classified.diff",
 		});
@@ -1380,7 +1374,7 @@ describe("child system prompt roster", () => {
 			id: `${MAIN_AGENT_ID}/advisor`,
 			displayName: "advisor",
 			kind: "advisor",
-			session: null,
+			endpoint: { kind: "local", session: null, sessionFile: null },
 			status: "parked",
 			activity: "advisor-only gist",
 		});
@@ -1413,8 +1407,7 @@ describe("child system prompt roster", () => {
 			id: MAIN_AGENT_ID,
 			displayName: MAIN_AGENT_ID,
 			kind: "main",
-			session: null,
-			sessionFile,
+			endpoint: { kind: "local", session: null, sessionFile: sessionFile },
 			status: "running",
 		});
 		registry.register({
@@ -1422,8 +1415,7 @@ describe("child system prompt roster", () => {
 			displayName: "task",
 			kind: "sub",
 			parentId: MAIN_AGENT_ID,
-			session: null,
-			sessionFile: liveSessionFile,
+			endpoint: { kind: "local", session: null, sessionFile: liveSessionFile },
 			status: "idle",
 		});
 
@@ -1442,7 +1434,7 @@ describe("child system prompt roster", () => {
 				id: `Idle${index}`,
 				displayName: "task",
 				kind: "sub",
-				session: null,
+				endpoint: { kind: "local", session: null, sessionFile: null },
 				status: "idle",
 				lastActivity: index,
 			});
@@ -1453,7 +1445,7 @@ describe("child system prompt roster", () => {
 			id: "Runner",
 			displayName: "task",
 			kind: "sub",
-			session: null,
+			endpoint: { kind: "local", session: null, sessionFile: null },
 			status: "running",
 			lastActivity: 0,
 		});
@@ -1564,14 +1556,13 @@ describe("hub direct addressing refreshes the caller root without a prior list",
 			// Worker ref points at B's transcript (and B's artifacts dir wins the
 			// agent:// scan before A's session is even registered).
 			await ensurePersistedRoster(registry, rootB);
-			expect(registry.get("Worker")?.sessionFile).toBe(childB);
+			expect(getLocalSessionFile(registry.get("Worker"))).toBe(childB);
 			expect(countReaddirs(readdirs, scanDir(rootB))).toBe(1);
 			registry.register({
 				id: MAIN_AGENT_ID,
 				displayName: MAIN_AGENT_ID,
 				kind: "main",
-				session: null,
-				sessionFile: rootA,
+				endpoint: { kind: "local", session: null, sessionFile: rootA },
 				status: "running",
 			});
 
@@ -1583,7 +1574,7 @@ describe("hub direct addressing refreshes the caller root without a prior list",
 			expect(history.sourcePath).toBe(childA);
 			expect(history.content).toContain("secret-A-line");
 			expect(history.content).not.toContain("secret-B-line");
-			expect(registry.get("Worker")?.sessionFile).toBe(childA);
+			expect(getLocalSessionFile(registry.get("Worker"))).toBe(childA);
 			expect(countReaddirs(readdirs, scanDir(rootA))).toBe(1);
 
 			// agent://Worker resolves A's output artifact through the same refresh.
@@ -1612,7 +1603,7 @@ describe("hub direct addressing refreshes the caller root without a prior list",
 			expect(sent.isError).toBeFalsy();
 			expect(sent.details?.receipts).toEqual([{ to: "Worker", outcome: "revived" }]);
 			expect(delivered).toEqual(["wake A"]);
-			expect(registry.get("Worker")?.sessionFile).toBe(childA);
+			expect(getLocalSessionFile(registry.get("Worker"))).toBe(childA);
 			expect(countReaddirs(readdirs, scanDir(rootA))).toBe(1);
 
 			// A repeated direct send stays on the settled latch — no re-scan.
@@ -1623,7 +1614,7 @@ describe("hub direct addressing refreshes the caller root without a prior list",
 			expect(again.isError).toBeFalsy();
 			expect(again.details?.receipts?.[0]?.to).toBe("Worker");
 			expect(delivered).toEqual(["wake A", "wake A again"]);
-			expect(registry.get("Worker")?.sessionFile).toBe(childA);
+			expect(getLocalSessionFile(registry.get("Worker"))).toBe(childA);
 			expect(countReaddirs(readdirs, scanDir(rootA))).toBe(1);
 
 			// A's revived Worker parks again (session detached, ref retained) —
@@ -1633,8 +1624,7 @@ describe("hub direct addressing refreshes the caller root without a prior list",
 				id: "Worker",
 				displayName: "task",
 				kind: "sub",
-				session: null,
-				sessionFile: childA,
+				endpoint: { kind: "local", session: null, sessionFile: childA },
 				status: "parked",
 			});
 
@@ -1662,7 +1652,7 @@ describe("hub direct addressing refreshes the caller root without a prior list",
 			expect(sentB.isError).toBeFalsy();
 			expect(sentB.details?.receipts).toEqual([{ to: "Worker", outcome: "revived" }]);
 			expect(deliveredB).toEqual(["wake B"]);
-			expect(registry.get("Worker")?.sessionFile).toBe(childB);
+			expect(getLocalSessionFile(registry.get("Worker"))).toBe(childB);
 			expect(countReaddirs(readdirs, scanDir(rootB))).toBe(2);
 			expect(countReaddirs(readdirs, scanDir(rootA))).toBe(1);
 		} finally {
@@ -1692,16 +1682,14 @@ describe("hub direct addressing refreshes the caller root without a prior list",
 			id: MAIN_AGENT_ID,
 			displayName: MAIN_AGENT_ID,
 			kind: "main",
-			session: null,
-			sessionFile: rootA,
+			endpoint: { kind: "local", session: null, sessionFile: rootA },
 			status: "running",
 		});
 		registry.register({
 			id: "Worker",
 			displayName: "task",
 			kind: "sub",
-			session: liveSession,
-			sessionFile: childA,
+			endpoint: { kind: "local", session: liveSession, sessionFile: childA },
 			status: "running",
 		});
 
@@ -1715,8 +1703,8 @@ describe("hub direct addressing refreshes the caller root without a prior list",
 		expect(sent.details?.receipts).toEqual([{ to: "Worker", outcome: "woken" }]);
 		expect(delivered).toEqual(["live ping"]);
 		expect(registry.get("Worker")?.status).toBe("running");
-		expect(registry.get("Worker")?.session).toBe(liveSession);
-		expect(registry.get("Worker")?.sessionFile).toBe(childA);
+		expect(getLocalSession(registry.get("Worker"))).toBe(liveSession);
+		expect(getLocalSessionFile(registry.get("Worker"))).toBe(childA);
 
 		const history = await new HistoryProtocolHandler().resolve(parseInternalUrl("history://Worker"), {
 			sessionFile: rootA,
@@ -1724,7 +1712,7 @@ describe("hub direct addressing refreshes the caller root without a prior list",
 		expect(history.notes?.join("\n")).toContain("live session");
 		expect(history.content).toContain("live-worker-line");
 		expect(registry.get("Worker")?.status).toBe("running");
-		expect(registry.get("Worker")?.session).toBe(liveSession);
+		expect(getLocalSession(registry.get("Worker"))).toBe(liveSession);
 	});
 
 	it("stays graceful when the caller root or target id is unavailable", async () => {
@@ -1739,16 +1727,14 @@ describe("hub direct addressing refreshes the caller root without a prior list",
 			id: MAIN_AGENT_ID,
 			displayName: MAIN_AGENT_ID,
 			kind: "main",
-			session: null,
-			sessionFile: rootB,
+			endpoint: { kind: "local", session: null, sessionFile: rootB },
 			status: "running",
 		});
 		registry.register({
 			id: "Worker",
 			displayName: "task",
 			kind: "sub",
-			session: null,
-			sessionFile: childB,
+			endpoint: { kind: "local", session: null, sessionFile: childB },
 			status: "parked",
 		});
 		// The caller session file points at a root that does not exist on disk.

@@ -13,7 +13,7 @@ import { SelectorController } from "@oh-my-pi/pi-coding-agent/modes/controllers/
 import { SessionObserverRegistry } from "@oh-my-pi/pi-coding-agent/modes/session-observer-registry";
 import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
-import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import { AgentRegistry, getLocalSessionFile } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { visitEntriesFromFileStream } from "@oh-my-pi/pi-coding-agent/session/session-loader";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
@@ -45,8 +45,7 @@ function makeHub(focusAgent: (id: string) => Promise<void>) {
 		displayName: AGENT_ID,
 		kind: "sub",
 		parentId: "Main",
-		session: { subscribe: () => () => {} } as unknown as AgentSession,
-		sessionFile: null,
+		endpoint: { kind: "local", session: { subscribe: () => () => {} } as unknown as AgentSession, sessionFile: null },
 		status: "running",
 	});
 	let doneCalls = 0;
@@ -154,8 +153,7 @@ describe("Agent hub Enter activation", () => {
 			displayName: AGENT_ID,
 			kind: "sub",
 			parentId: "Main",
-			session: null,
-			sessionFile: null,
+			endpoint: { kind: "local", session: null, sessionFile: null },
 			status: "aborted",
 		});
 		const focusAgent = vi.fn(async () => {});
@@ -219,7 +217,7 @@ describe("Agent hub Enter activation", () => {
 
 		const workerEntry = renderedRosterEntry(hub, "Worker", 120);
 		expect(workerEntry).toContain("○ Worker");
-		expect(agents.get("Worker")?.sessionFile).toBe(workerSessionFile);
+		expect(getLocalSessionFile(agents.get("Worker"))).toBe(workerSessionFile);
 		hub.dispose();
 	});
 
@@ -543,8 +541,7 @@ describe("Agent hub Enter activation", () => {
 			displayName: AGENT_ID,
 			kind: "sub",
 			parentId: "Main",
-			session: { subscribe: () => () => {} } as unknown as AgentSession,
-			sessionFile: null,
+			endpoint: { kind: "local", session: { subscribe: () => () => {} } as unknown as AgentSession, sessionFile: null },
 			status: "running",
 		});
 
@@ -657,8 +654,7 @@ describe("Agent hub double-← gating", () => {
 			displayName: AGENT_ID,
 			kind: "sub",
 			parentId: "Main",
-			session: { subscribe: () => () => {} } as unknown as AgentSession,
-			sessionFile: null,
+			endpoint: { kind: "local", session: { subscribe: () => () => {} } as unknown as AgentSession, sessionFile: null },
 			status: "running",
 		});
 	}
@@ -669,8 +665,7 @@ describe("Agent hub double-← gating", () => {
 			id: "Main",
 			displayName: "Main",
 			kind: "main",
-			session: null,
-			sessionFile: null,
+			endpoint: { kind: "local", session: null, sessionFile: null },
 			status: "running",
 		});
 		const { controller, shown } = setup(agents);
@@ -704,7 +699,7 @@ describe("Agent hub double-← gating", () => {
 
 		expect(shown()).toBeUndefined();
 		const shownHub = await shownReady;
-		expect(agents.get("Worker")?.sessionFile).toBe(workerSessionFile);
+		expect(getLocalSessionFile(agents.get("Worker"))).toBe(workerSessionFile);
 		shownHub!.dispose();
 	});
 
@@ -736,8 +731,7 @@ describe("Agent hub double-← gating", () => {
 			displayName: "Parked",
 			kind: "sub",
 			parentId: "Main",
-			session: { subscribe: () => () => {} } as unknown as AgentSession,
-			sessionFile: null,
+			endpoint: { kind: "local", session: { subscribe: () => () => {} } as unknown as AgentSession, sessionFile: null },
 			status: "parked",
 		});
 		const { controller, editor, shown, focusTargets } = setup(agents);
@@ -795,8 +789,7 @@ describe("Agent hub data refresh coalescing", () => {
 					displayName: id,
 					kind: "sub",
 					parentId: "Main",
-					session: { subscribe: () => () => {} } as unknown as AgentSession,
-					sessionFile: null,
+					endpoint: { kind: "local", session: { subscribe: () => () => {} } as unknown as AgentSession, sessionFile: null },
 					status: "running",
 				});
 			}
@@ -851,7 +844,7 @@ describe("Agent hub data refresh coalescing", () => {
 			displayName: "SDK agent",
 			kind: "sub",
 			parentId: "Main",
-			session: { getSessionStats, subscribe: () => () => {} } as unknown as AgentSession,
+			endpoint: { kind: "local", session: { getSessionStats, subscribe: () => () => {} } as unknown as AgentSession, sessionFile: null },
 			status: "running",
 		});
 		const hub = new AgentHubOverlayComponent({
@@ -906,13 +899,13 @@ describe("Agent hub data refresh coalescing", () => {
 			contextUsage: undefined,
 		}));
 		const session = { getSessionStats } as unknown as AgentSession;
-		agents.register({ id: "Parent", displayName: "Parent", kind: "sub", session, status: "idle" });
+		agents.register({ id: "Parent", displayName: "Parent", kind: "sub", endpoint: { kind: "local", session: session, sessionFile: null }, status: "idle" });
 		agents.register({
 			id: "Child",
 			displayName: "Child",
 			kind: "sub",
 			parentId: "Parent",
-			session,
+			endpoint: { kind: "local", session: session, sessionFile: null },
 			status: "idle",
 		});
 		const hub = new AgentHubOverlayComponent({

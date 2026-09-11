@@ -14,7 +14,8 @@ export const EVAL_STATUS_BRIDGE_NAME = "__status__";
 export const EVAL_CANCEL_BRIDGE_NAME = "__cancel__";
 
 export type EvalHandleKind = "agent" | "completion";
-export type EvalHandleState = "running" | "completed" | "failed" | "cancelled";
+// D2: eval handles preserve the job's transport-unknown verdict.
+export type EvalHandleState = AsyncJob["status"];
 
 /** Stable process-local reference sent by eval runtimes. */
 export interface EvalHandleRef {
@@ -94,6 +95,10 @@ function agentSnapshot(ref: EvalHandleRef, job: AsyncJob): EvalHandleSnapshot {
 	}
 	if (job.status === "cancelled") {
 		return { ...ref, status: "cancelled", error: job.errorText || job.resultText || "Agent cancelled" };
+	}
+	// D2: losing execution visibility is neither successful output nor a failed run.
+	if (job.status === "execution-unknown") {
+		return { ...ref, status: "execution-unknown", error: job.errorText || "Agent execution unknown" };
 	}
 
 	const snapshot: EvalHandleSnapshot = { ...ref, status: "completed", text: job.resultText ?? "" };

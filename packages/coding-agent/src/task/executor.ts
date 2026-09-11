@@ -44,7 +44,7 @@ import subagentAsyncPendingTemplate from "../prompts/system/subagent-async-pendi
 import subagentSystemPromptTemplate from "../prompts/system/subagent-system-prompt.md" with { type: "text" };
 import submitReminderTemplate from "../prompts/system/subagent-yield-reminder.md" with { type: "text" };
 import { AgentLifecycleManager, type AgentReviver } from "../registry/agent-lifecycle";
-import { AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
+import { AgentRegistry, getLocalSession, getLocalSessionFile, MAIN_AGENT_ID } from "../registry/agent-registry";
 import { ensurePersistedRoster, isCurrentSessionRosterRef } from "../registry/persisted-agents";
 import { type CreateAgentSessionOptions, createAgentSession, discoverAuthStorage } from "../sdk";
 import type { AgentSession, AgentSessionEvent, Prewalk } from "../session/agent-session";
@@ -67,6 +67,8 @@ import { type EventBus, emitSubagentFrame } from "../utils/event-bus";
 import { trackLateCleanup } from "../utils/late-cleanup";
 import { buildNamedToolChoice } from "../utils/tool-choice";
 import type { WorkspaceTree } from "../workspace-tree";
+import { type DispatchContext, startEndpoint } from "./dispatch";
+import type { AgentEndpoint, RunOutcome } from "./endpoint";
 import { attributeSubagentError } from "./error-attribution";
 import { generateTaskLabel } from "./label";
 import { resolveAgentPrewalkDefault } from "./prewalk";
@@ -387,6 +389,8 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 /** Options for subagent execution */
 export interface ExecutorOptions {
+	/** D2: an endpoint already prepared through dispatch; absent keeps the local runner unchanged. */
+	endpointExecution?: { endpoint: AgentEndpoint; context: DispatchContext };
 	cwd: string;
 	/** Additional workspace directories to seed on the subagent session (multi-root). */
 	additionalDirectories?: string[];
@@ -613,7 +617,7 @@ function resolveFallbackCompletion(rawOutput: string, outputSchema: unknown): { 
 
 interface FinalizeSubprocessOutputArgs {
 	rawOutput: string;
-	exitCode: number;
+	exitCode: number | null;
 	stderr: string;
 	doneAborted: boolean;
 	signalAborted: boolean;
@@ -626,7 +630,7 @@ interface FinalizeSubprocessOutputArgs {
 
 interface FinalizeSubprocessOutputResult {
 	rawOutput: string;
-	exitCode: number;
+	exitCode: number | null;
 	stderr: string;
 	abortedViaYield: boolean;
 	hasYield: boolean;
@@ -672,6 +676,10 @@ export function finalizeSubprocessOutput(args: FinalizeSubprocessOutputArgs): Fi
 	let structuredOutput: StructuredSubagentOutput | undefined;
 	let abortedViaYield = false;
 	const hasYield = Array.isArray(yieldItems) && yieldItems.length > 0;
+	// D2: observation loss is not a yield success or an inferred execution failure.
+	if (exitCode === null) {
+		return { rawOutput, exitCode, stderr, abortedViaYield: false, hasYield };
+	}
 	const hadFailureBeforeYield = exitCode !== 0 && stderr.trim().length > 0;
 
 	if (hasYield) {
@@ -1050,6 +1058,9 @@ interface SubagentRunMonitor {
 	yieldTurnStopRequested(): boolean;
 	/** Resolves when the yield turn-stop session abort has settled (immediately when none fired). */
 	waitForYieldTurnStop(): Promise<void>;
+	/** D2: settle owned executions and remote reply barriers before accepting a yield. */
+	waitForOwnerJobsAndReplies(): Promise<void>;
+	captureEndpointOutcome(outcome: RunOutcome): DriveOutcome;
 	/** The abort kind for this run, when an abort was requested. */
 	abortKind(): AbortReason | undefined;
 	terminalError(): string | undefined;
@@ -1263,7 +1274,11 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 	};
 
 	/** Owner async work that can still re-wake the run (quiescence barrier predicate). */
-	const sessionHasPendingAsyncWork = (): boolean => activeSession?.hasPendingAsyncWork?.() ?? false;
+	const sessionHasPendingAsyncWork = (): boolean =>
+		(activeSession?.hasPendingAsyncWork?.() ?? false) ||
+		// D2: even a settled remote job may still owe replies; keep the yield barrier reachable.
+		(AsyncJobManager.instance()?.getAllJobs({ ownerId: id }).some(job => job.endpoint?.handle.kind === "remote") ??
+			false);
 
 	// Handle abort signal
 	if (signal) {
@@ -1792,6 +1807,8 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 		return session.subscribe(event => {
 			emitSubagentEvent(event);
 			publishServingModel();
+			// D2: a scheduling-pause end cannot supply authoritative final output.
+			if (event.type === "agent_end" && event.isTerminal === false) return;
 			if (event.type === "auto_retry_start") {
 				progress.retryState = {
 					attempt: event.attempt,
@@ -1859,6 +1876,31 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 		abortSignal,
 		accumulatedUsage,
 		hasUsage: () => hasUsage,
+		waitForOwnerJobsAndReplies: async () => {
+			// D2: the manager owns remote reply-drained ordering; local jobs bypass that barrier.
+			const result = await AsyncJobManager.instance()?.waitForOwnerJobsAndReplies(id, abortSignal);
+			if (result?.status === "aborted") throw new ToolAbortError();
+		},
+		captureEndpointOutcome: outcome => {
+			// D2: endpoint outcomes are authoritative, never synthesized from local session state.
+			if (outcome.text !== undefined) finalOutputChunks.push(outcome.text);
+			if (outcome.usage) {
+				Object.assign(accumulatedUsage, outcome.usage);
+				hasUsage = true;
+				progress.tokens = getUsageTokens(outcome.usage);
+				progress.cost = outcome.usage.cost.total;
+			}
+			switch (outcome.status) {
+				case "completed":
+					return { exitCode: 0, aborted: false };
+				case "failed":
+					return { exitCode: 1, error: outcome.error, aborted: false };
+				case "cancelled":
+					return { exitCode: 1, error: outcome.error, aborted: true, abortReasonText: outcome.error };
+				case "execution-unknown":
+					return { exitCode: null, error: outcome.error, aborted: false };
+			}
+		},
 		yieldCalled: () => yieldCalled,
 		runtimeLimitExceeded: () => runtimeLimitExceeded,
 		terminalError: () => terminalError,
@@ -1933,7 +1975,7 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 }
 
 interface DriveOutcome {
-	exitCode: number;
+	exitCode: number | null;
 	error?: string;
 	aborted: boolean;
 	abortReasonText?: string;
@@ -2091,7 +2133,12 @@ async function driveSessionToYield(
 			// Let the parked yield's turn-stop session abort settle before
 			// prompting again (mirrors waitForBudgetStop).
 			await awaitAbortable(monitor.waitForYieldTurnStop());
-			if (!session.hasPendingAsyncWork()) break;
+			if (!session.hasPendingAsyncWork()) {
+				// D2: no local delivery pending does not mean remote replies have drained.
+				await awaitAbortable(monitor.waitForOwnerJobsAndReplies());
+				if (!session.hasPendingAsyncWork() && monitor.yieldCalled()) break;
+				continue;
+			}
 			if (!asyncPendingNoticeSent) {
 				asyncPendingNoticeSent = true;
 				const running = session.getAsyncJobSnapshot()?.running ?? [];
@@ -2119,6 +2166,7 @@ async function driveSessionToYield(
 				}
 			}
 			await awaitAbortable(session.settleAsyncWork());
+			await awaitAbortable(monitor.waitForOwnerJobsAndReplies());
 			// Results delivered during the settle invalidated the recorded
 			// yield: the next iteration's ladder demands a fresh one.
 		}
@@ -2194,7 +2242,9 @@ async function driveSessionToYield(
 
 interface FinalizeRunArgs {
 	monitor: SubagentRunMonitor;
-	done: { exitCode: number; error?: string; aborted?: boolean; abortReason?: string; durationMs: number };
+	done: { exitCode: number | null; error?: string; aborted?: boolean; abortReason?: string; durationMs: number };
+	/** D2: endpoint outcomes bypass the local yield-normalization policy. */
+	endpointOutcome?: RunOutcome;
 	index: number;
 	id: string;
 	agent: AgentDefinition;
@@ -2243,18 +2293,27 @@ async function finalizeRunResult(args: FinalizeRunArgs): Promise<SingleResult> {
 	pushLoopPhase(`subagent:${id}`);
 	let finalized: FinalizeSubprocessOutputResult;
 	try {
-		finalized = finalizeSubprocessOutput({
-			rawOutput,
-			exitCode,
-			stderr,
-			doneAborted: Boolean(done.aborted),
-			signalAborted: Boolean(signal?.aborted),
-			yieldItems,
-			outputSchema: args.outputSchema,
-			outputSchemaMode: args.outputSchemaMode,
-			outputSchemaSource: args.outputSchemaSource,
-			lastAssistantText: monitor.lastAssistantSalvageText(),
-		});
+		finalized = args.endpointOutcome
+			? {
+					rawOutput: args.endpointOutcome.text ?? "",
+					exitCode,
+					stderr,
+					abortedViaYield: false,
+					hasYield: false,
+					structuredOutput: args.endpointOutcome.structured,
+				}
+			: finalizeSubprocessOutput({
+					rawOutput,
+					exitCode,
+					stderr,
+					doneAborted: Boolean(done.aborted),
+					signalAborted: Boolean(signal?.aborted),
+					yieldItems,
+					outputSchema: args.outputSchema,
+					outputSchemaMode: args.outputSchemaMode,
+					outputSchemaSource: args.outputSchemaSource,
+					lastAssistantText: monitor.lastAssistantSalvageText(),
+				});
 	} finally {
 		popLoopPhase();
 	}
@@ -2358,12 +2417,14 @@ async function finalizeRunResult(args: FinalizeRunArgs): Promise<SingleResult> {
 	// while we were tearing the session down. The yield data is still surfaced
 	// to the caller via `progress.extractedToolData`, but the exit status must
 	// reflect the timeout so on-call doesn't mistake a stuck run for success.
-	const runtimeLimitExceeded = monitor.runtimeLimitExceeded();
+	// D2: observer timeouts cannot rewrite an authoritative endpoint outcome.
+	const runtimeLimitExceeded = args.endpointOutcome === undefined && monitor.runtimeLimitExceeded();
 	if (runtimeLimitExceeded && exitCode === 0) {
 		exitCode = 1;
 	}
 	const wasAborted =
-		runtimeLimitExceeded || Boolean(done.aborted) || abortedViaYield || (!hasYield && Boolean(signal?.aborted));
+		exitCode !== null &&
+		(runtimeLimitExceeded || Boolean(done.aborted) || abortedViaYield || (!hasYield && Boolean(signal?.aborted)));
 	const finalAbortReason = wasAborted
 		? runtimeLimitExceeded
 			? monitor.resolveAbortReasonText()
@@ -2375,7 +2436,8 @@ async function finalizeRunResult(args: FinalizeRunArgs): Promise<SingleResult> {
 						? monitor.resolveSignalAbortReason()
 						: monitor.resolveAbortReasonText()
 		: undefined;
-	progress.status = wasAborted ? "aborted" : exitCode === 0 ? "completed" : "failed";
+	// D2: unknown observation stays distinct even if the local observer was cancelled.
+	progress.status = exitCode === null ? "execution-unknown" : wasAborted ? "aborted" : exitCode === 0 ? "completed" : "failed";
 	monitor.scheduleProgress(true);
 
 	// Emit lifecycle end event after finalization so yield status is reflected
@@ -2386,7 +2448,7 @@ async function finalizeRunResult(args: FinalizeRunArgs): Promise<SingleResult> {
 		detached: args.detached,
 		agentSource: agent.source,
 		description: progress.description,
-		status: progress.status as "completed" | "failed" | "aborted",
+		status: progress.status,
 		sessionFile: args.sessionFile,
 		index,
 	};
@@ -2486,7 +2548,11 @@ async function relayWakeTurnOutput(args: {
 	yielded: boolean;
 	result: SingleResult;
 	turnText: string;
+	signal?: AbortSignal;
 }): Promise<void> {
+	// D2: a stopped peer can still receive replies from its owned remote jobs.
+	const replies = await AsyncJobManager.instance()?.waitForOwnerJobsAndReplies(args.id, args.signal);
+	if (replies?.status === "aborted") return;
 	const bus = IrcBus.global();
 	const pending = wakeSources(args.records, args.id).filter(
 		source => !bus.sentSince(args.id, source.from, args.turnStartTime),
@@ -2558,7 +2624,8 @@ export function attachIrcWakeTurnMonitor(session: AgentSession, options: IrcWake
 		const turnStartTime = Date.now();
 		const relay = Promise.withResolvers<void>();
 		session.trackIrcReply(relay.promise);
-		const sessionFile = AgentRegistry.global().get(id)?.sessionFile ?? options.sessionFile ?? undefined;
+		// D2: remote references never become local transcript paths.
+		const sessionFile = getLocalSessionFile(AgentRegistry.global().get(id)) ?? options.sessionFile ?? undefined;
 		const turnMonitor = createSubagentRunMonitor({
 			index,
 			id,
@@ -2641,7 +2708,15 @@ export function attachIrcWakeTurnMonitor(session: AgentSession, options: IrcWake
 					startTime: turnStartTime,
 				});
 				if (!aborted && !error) {
-					await relayWakeTurnOutput({ id, records, turnStartTime, yielded, result, turnText });
+					await relayWakeTurnOutput({
+						id,
+						records,
+						turnStartTime,
+						yielded,
+						result,
+						turnText,
+						signal: turnMonitor.abortSignal,
+					});
 				}
 			} catch (finalizeError) {
 				logger.warn("IRC subagent turn finalization failed", {
@@ -2677,7 +2752,8 @@ export async function finalizeSubagentLifecycle(args: {
 }): Promise<void> {
 	const registry = AgentRegistry.global();
 	const ref = registry.get(args.id);
-	const ownsRef = Boolean(ref && ref.session === args.session);
+	// D2: only a matching local endpoint owns this session's teardown.
+	const ownsRef = getLocalSession(ref) === args.session;
 	const cleanupDeadlineAt = args.cleanupDeadlineAt ?? Date.now() + 5000;
 	const disposeSession = async (): Promise<void> => {
 		// On a graceful finish (e.g. a `yield`) the advisor's review of the final
@@ -2826,10 +2902,13 @@ export async function runSubagentFollowUpTurn(options: FollowUpTurnOptions): Pro
 	const { id, agent, message, signal } = options;
 	const index = options.index ?? 0;
 	const startTime = Date.now();
-	const session = await AgentLifecycleManager.global().ensureLive(id);
+	// D2: this follow-up runner drives local sessions; remote runs use endpoint dispatch.
+	const live = await AgentLifecycleManager.global().ensureLive(id);
+	if (live.kind !== "local") throw new Error("Remote follow-up execution requires endpoint dispatch.");
+	const session = live.session;
 	session.setWorkPoolYieldItems(options.workPoolYieldItems ?? []);
 	const ref = AgentRegistry.global().get(id);
-	const sessionFile = ref?.sessionFile ?? undefined;
+	const sessionFile = getLocalSessionFile(ref) ?? undefined;
 
 	const monitor = createSubagentRunMonitor({
 		index,
@@ -2956,7 +3035,8 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 
 	// Set up artifact paths and write input file upfront if artifacts dir provided
 	let subtaskSessionFile: string | undefined;
-	if (options.artifactsDir) {
+	// D2: remote endpoints do not acquire a fabricated local transcript path.
+	if (options.artifactsDir && !options.endpointExecution) {
 		subtaskSessionFile = path.join(options.artifactsDir, `${id}.jsonl`);
 	}
 
@@ -3065,6 +3145,86 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		maxRuntimeMs,
 	});
 	const progress = monitor.progress;
+	if (options.endpointExecution) {
+		// D2: reuse dispatch authorization and this monitor without registering a duplicate outer task job.
+		const { endpoint, context } = options.endpointExecution;
+		const registry = AgentRegistry.global();
+		const ref = registry.get(id);
+		const ownsRemoteRef = ref?.endpoint.kind === "remote" && ref.endpoint.endpoint === endpoint;
+		try {
+			const ack = await startEndpoint(endpoint, task, monitor.abortSignal, context);
+			if (ownsRemoteRef) registry.setStatus(id, "running", ref);
+			emitSubagentFrame(options.eventBus, options.subagentEventBus, TASK_SUBAGENT_LIFECYCLE_CHANNEL, {
+				id,
+				agent: agent.name,
+				status: "started",
+				index,
+				parentToolCallId: options.parentToolCallId,
+				detached: options.detached,
+				agentSource: agent.source,
+				description: options.description,
+			});
+			// D2: cancelling an assignment is separate from observing it; never terminate the peer.
+			const cancelRun = (): void => {
+				void Promise.resolve()
+					.then(() => endpoint.cancelRun(ack.runId))
+					.catch(error => {
+						logger.warn("Endpoint assignment cancellation failed", {
+							id,
+							runId: ack.runId,
+							error: error instanceof Error ? error.message : String(error),
+						});
+					});
+			};
+			monitor.abortSignal.addEventListener("abort", cancelRun, { once: true });
+			if (monitor.abortSignal.aborted) cancelRun();
+			let outcome: RunOutcome;
+			try {
+				outcome = await endpoint.run(ack.runId, monitor.abortSignal);
+			} catch (error) {
+				if (endpoint.handle.kind === "local") throw error;
+				// D2: observer failure does not establish that remote execution failed or was cancelled.
+				outcome = {
+					runId: ack.runId,
+					status: "execution-unknown",
+					error: error instanceof Error ? error.message : String(error),
+				};
+			} finally {
+				monitor.abortSignal.removeEventListener("abort", cancelRun);
+			}
+			const done = monitor.captureEndpointOutcome(outcome);
+			if (ownsRemoteRef) {
+				registry.setStatus(
+					id,
+					outcome.status === "execution-unknown" ? "execution-unknown" : outcome.status === "cancelled" ? "aborted" : "idle",
+					ref,
+				);
+			}
+			// D2: cancellation of a reply wait must not overwrite the endpoint's reported run outcome.
+			await AsyncJobManager.instance()?.waitForOwnerJobsAndReplies(id, monitor.abortSignal);
+			monitor.finish();
+			return await finalizeRunResult({
+				monitor,
+				done: { ...done, abortReason: done.abortReasonText, durationMs: Date.now() - startTime },
+				endpointOutcome: outcome,
+				index,
+				id,
+				agent,
+				task,
+				assignment,
+				modelOverride,
+				modelRole,
+				eventBus: options.eventBus,
+				subagentEventBus: options.subagentEventBus,
+				parentToolCallId: options.parentToolCallId,
+				detached: options.detached,
+				artifactsDir: options.artifactsDir,
+				startTime,
+			});
+		} finally {
+			monitor.finish();
+		}
+	}
 	let unsubscribe: (() => void) | null = null;
 	let reviveSession: AgentReviver | null = null;
 	const installIrcWakeTurnMonitor = (target: AgentSession): void => {
@@ -3088,7 +3248,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 	};
 
 	const runSubagent = async (): Promise<{
-		exitCode: number;
+		exitCode: number | null;
 		error?: string;
 		aborted?: boolean;
 		abortReason?: string;
@@ -3096,7 +3256,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 	}> => {
 		const sessionAbortController = new AbortController();
 		const abortSignal = monitor.abortSignal;
-		let exitCode = 0;
+		let exitCode: number | null = 0;
 		let error: string | undefined;
 		let aborted = false;
 		let abortReasonText: string | undefined;
@@ -3421,8 +3581,10 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					AgentRegistry.global(),
 					sessionManager.getSessionFile() ??
 						sessionFile ??
-						AgentRegistry.global().get(id)?.sessionFile ??
-						AgentRegistry.global().get(MAIN_AGENT_ID)?.sessionFile,
+						// D2: persisted rosters only consume local transcript paths.
+						getLocalSessionFile(AgentRegistry.global().get(id)) ??
+						getLocalSessionFile(AgentRegistry.global().get(MAIN_AGENT_ID)) ??
+						undefined,
 				);
 			}
 
@@ -3460,8 +3622,10 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 							AgentRegistry.global(),
 							reopened.getSessionFile() ??
 								sessionFile ??
-								AgentRegistry.global().get(id)?.sessionFile ??
-								AgentRegistry.global().get(MAIN_AGENT_ID)?.sessionFile,
+								// D2: revival cannot persist a remote endpoint reference as a path.
+								getLocalSessionFile(AgentRegistry.global().get(id)) ??
+								getLocalSessionFile(AgentRegistry.global().get(MAIN_AGENT_ID)) ??
+								undefined,
 						);
 					}
 					const { session: revived } = await createAgentSession(

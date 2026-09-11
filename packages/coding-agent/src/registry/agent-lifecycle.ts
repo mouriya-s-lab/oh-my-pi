@@ -23,17 +23,26 @@
 import * as fs from "node:fs/promises";
 import { logger, untilAborted } from "@oh-my-pi/pi-utils";
 import type { AgentSession } from "../session/agent-session";
+import type { AgentEndpoint } from "../task/endpoint";
 import { trackLateCleanup } from "../utils/late-cleanup";
 import {
 	type AgentRef,
 	type AgentRefExpectation,
 	AgentRegistry,
+	type AgentStatus,
 	getAgentTombstonePath,
+	getLocalSession,
+	getLocalSessionFile,
 	MAIN_AGENT_ID,
 	type RegistryEvent,
 } from "./agent-registry";
 
 export type AgentReviver = (expected: AgentRef) => Promise<AgentSession>;
+
+// D2 dependency: lifecycle callers must distinguish a local session from a remote acknowledgement.
+export type LiveAgent =
+	| { kind: "local"; session: AgentSession }
+	| { kind: "remote"; reference: string; endpoint: AgentEndpoint };
 
 const AGENT_RELEASE_GRACE_MS = 5000;
 
@@ -83,7 +92,7 @@ interface ParkInFlight {
 
 interface RevivingAgent {
 	ref: AgentRef;
-	promise: Promise<AgentSession>;
+	promise: Promise<LiveAgent>;
 }
 
 export class AgentLifecycleManager {
@@ -155,7 +164,7 @@ export class AgentLifecycleManager {
 	adopt(id: string, opts: AdoptOptions, expected?: AgentRefExpectation): void {
 		if (id === MAIN_AGENT_ID) return;
 		const ref = this.#registry.get(id);
-		if (!ref || (expected !== undefined && ref !== expected && ref.session !== expected)) {
+		if (!ref || (expected !== undefined && ref !== expected && getLocalSession(ref) !== expected)) {
 			logger.warn("AgentLifecycleManager.adopt: unknown or replaced agent id", { id });
 			return;
 		}
@@ -170,7 +179,7 @@ export class AgentLifecycleManager {
 	has(id: string, expected?: AgentRefExpectation): boolean {
 		const adopted = this.#adopted.get(id);
 		return Boolean(
-			adopted && (expected === undefined || adopted.ref === expected || adopted.ref.session === expected),
+			adopted && (expected === undefined || adopted.ref === expected || getLocalSession(adopted.ref) === expected),
 		);
 	}
 
@@ -186,10 +195,10 @@ export class AgentLifecycleManager {
 	 */
 	async reclaimDeadCorpse(id: string, expected: AgentRef): Promise<boolean> {
 		const ref = this.#registry.get(id);
-		if (ref !== expected || ref.status !== "parked" || ref.session) return false;
+		if (ref !== expected || ref.endpoint.kind !== "local" || ref.status !== "parked" || getLocalSession(ref)) return false;
 		if (this.#adopted.has(id) || this.#parks.has(id) || this.#revivals.has(id)) return false;
 
-		const persistedFactory = ref.sessionFile ? this.#persistedReviverFactory : undefined;
+		const persistedFactory = getLocalSessionFile(ref) ? this.#persistedReviverFactory : undefined;
 		if (persistedFactory) {
 			try {
 				if (await persistedFactory(ref)) return false;
@@ -202,7 +211,7 @@ export class AgentLifecycleManager {
 			}
 			// The factory awaited I/O; another lifecycle operation may now own or
 			// have replaced this ref. Revalidate every reclaim invariant.
-			if (this.#registry.get(id) !== ref || ref.status !== "parked" || ref.session) return false;
+			if (this.#registry.get(id) !== ref || ref.status !== "parked" || getLocalSession(ref)) return false;
 			if (this.#adopted.has(id) || this.#parks.has(id) || this.#revivals.has(id)) return false;
 		}
 		return this.#registry.unregister(id, ref);
@@ -227,7 +236,8 @@ export class AgentLifecycleManager {
 	isParking(id: string, expected?: AgentRefExpectation): boolean {
 		const park = this.#parks.get(id);
 		return Boolean(
-			park && !park.cancelled && (expected === undefined || park.ref === expected || park.ref.session === expected),
+			park && !park.cancelled &&
+				(expected === undefined || park.ref === expected || getLocalSession(park.ref) === expected),
 		);
 	}
 
@@ -244,11 +254,42 @@ export class AgentLifecycleManager {
 		const existing = this.#parks.get(id);
 		if (existing) return existing.promise;
 
-		const adopted = this.#adopted.get(id);
-		if (!adopted) return;
 		const ref = this.#registry.get(id);
-		if (!ref || adopted.ref !== ref) return;
-		const session = ref.session;
+		if (!ref) return;
+		const adopted = this.#adopted.get(id);
+		if (ref.endpoint.kind === "remote") {
+			// D2 dependency: remote park is an endpoint operation, not local disposal.
+			const endpoint = ref.endpoint.endpoint;
+			if (!endpoint) throw new Error(`Agent "${id}" has no connected endpoint.`);
+			const runId = endpoint.asHandleSnapshot().runId;
+			if (!runId) throw new Error(`Agent "${id}" has no run to park.`);
+			const deferred = Promise.withResolvers<void>();
+			const park: ParkInFlight = {
+				ref, promise: deferred.promise, cancel: () => false, cancelled: false, detached: true,
+			};
+			this.#parks.set(id, park);
+			if (adopted?.ref === ref) {
+				clearTimeout(adopted.timer);
+				adopted.timer = undefined;
+			}
+			void (async () => {
+				try {
+					const ack = await endpoint.park(runId);
+					if (!ack.acknowledged) throw new Error(`Agent "${id}" could not park: ${ack.reason}`);
+					if (!this.#registry.setStatus(id, "parked", ref)) {
+						throw new Error(`Agent "${id}" changed while parking.`);
+					}
+					deferred.resolve();
+				} catch (error) {
+					deferred.reject(error);
+				} finally {
+					if (this.#parks.get(id) === park) this.#parks.delete(id);
+				}
+			})();
+			return deferred.promise;
+		}
+		if (!adopted || adopted.ref !== ref) return;
+		const session = getLocalSession(ref);
 		if (!session) return;
 
 		if (adopted.timer) {
@@ -281,11 +322,11 @@ export class AgentLifecycleManager {
 
 				// Re-check liveness: release/unregister/replace may have raced us.
 				const live = this.#registry.get(id);
-				if (live !== ref || !live.session || live.session !== session) return;
+				if (live !== ref || getLocalSession(live) !== session) return;
 				if (this.#adopted.get(id)?.ref !== ref) return;
 
 				// Commit: detach + parked *before* dispose so callers never see a
-				// dying session via ref.session / idle status.
+				// dying session via the local-session accessor / idle status.
 				park.detached = true;
 				this.#registry.detachSession(id, ref);
 				this.#registry.setStatus(id, "parked", ref);
@@ -307,27 +348,27 @@ export class AgentLifecycleManager {
 	}
 
 	/**
-	 * Return the live session, reviving from the sessionFile if parked.
+	 * Return a tagged live agent, reviving the local session or remote reference.
 	 * Throws a plain Error if the id is unknown or parked without a reviver.
 	 * Concurrent calls share one in-flight revive.
 	 *
 	 * Never returns a session that is mid-dispose: an in-flight park is either
 	 * cancelled (session still live) or awaited to completion before revive.
 	 */
-	async ensureLive(id: string): Promise<AgentSession> {
+	async ensureLive(id: string): Promise<LiveAgent> {
 		const park = this.#parks.get(id);
 		if (park) {
 			const parked = this.#registry.get(id);
 			// Cancel if the live session is still attached — keep it instead of
 			// thrashing dispose + revive.
-			if (parked?.session && !park.detached && park.cancel()) {
+			if (parked && getLocalSession(parked) && !park.detached && park.cancel()) {
 				await park.promise;
-				const kept = this.#registry.get(id)?.session;
+				const kept = getLocalSession(this.#registry.get(id));
 				if (kept) {
 					// Park cleared the idle timer; re-arm so TTL park still works.
 					const adopted = this.#adopted.get(id);
 					if (adopted && adopted.ref === parked && parked.status === "idle") this.#armTimer(id, adopted);
-					return kept;
+					return { kind: "local", session: kept };
 				}
 			} else {
 				// Already committed to detach (or no live session): wait for park,
@@ -342,10 +383,13 @@ export class AgentLifecycleManager {
 				`Unknown agent "${id}" — it was never registered or has been released. If a transcript exists, read history://${id}.`,
 			);
 		}
-		if (ref.session) return ref.session;
+		const session = getLocalSession(ref);
+		if (session) return { kind: "local", session };
 		const inflight = this.#revivals.get(id);
 		if (inflight?.ref === ref) return inflight.promise;
-		const revival = this.#resolveAndRevive(id, ref);
+		const revival = ref.endpoint.kind === "remote"
+			? this.#ensureRemoteLive(id, ref, ref.endpoint.reference, ref.endpoint.endpoint)
+			: this.#resolveAndRevive(id, ref).then(session => ({ kind: "local" as const, session }));
 		const pending: RevivingAgent = { ref, promise: revival };
 		this.#revivals.set(id, pending);
 		try {
@@ -353,6 +397,40 @@ export class AgentLifecycleManager {
 		} finally {
 			if (this.#revivals.get(id) === pending) this.#revivals.delete(id);
 		}
+	}
+
+	async #ensureRemoteLive(
+		id: string,
+		ref: AgentRef,
+		reference: string,
+		endpoint: AgentEndpoint | null,
+	): Promise<LiveAgent> {
+		// D2 dependency: unknown execution remains recoverable through the same opaque reference.
+		if (ref.status === "aborted") throw new Error(`Agent "${id}" is aborted and cannot be revived.`);
+		if (!endpoint) throw new Error(`Agent "${id}" has no connected endpoint.`);
+		const ack = await endpoint.ensureLive(reference);
+		if (!ack.acknowledged) throw new Error(`Agent "${id}" could not become live: ${ack.reason}`);
+		// Reachability acknowledgement is not a new execution verdict.
+		const status = endpoint.asRosterSnapshot().status;
+		let agentStatus: AgentStatus;
+		switch (status) {
+			case "running":
+			case "execution-unknown":
+				agentStatus = status;
+				break;
+			case "cancelled":
+				agentStatus = "aborted";
+				break;
+			case "idle":
+			case "completed":
+			case "failed":
+				agentStatus = "idle";
+				break;
+		}
+		if (this.#disposed || this.#registry.get(id) !== ref || !this.#registry.setStatus(id, agentStatus, ref)) {
+			throw new Error(`Agent "${id}" changed while becoming live.`);
+		}
+		return { kind: "remote", reference, endpoint };
 	}
 
 	/**
@@ -366,7 +444,7 @@ export class AgentLifecycleManager {
 		let adoption = this.#adopted.get(id);
 		let revive = adoption?.ref === ref ? adoption.revive : undefined;
 		let coldAdopted = false;
-		if (!revive && ref.status === "parked" && ref.sessionFile && this.#persistedReviverFactory) {
+		if (!revive && ref.status === "parked" && getLocalSessionFile(ref) && this.#persistedReviverFactory) {
 			revive = await this.#persistedReviverFactory(ref);
 			// Teardown can complete during the factory await. A late cold revive must
 			// not cold-adopt (and later attach a live session + TTL) into a disposed
@@ -418,9 +496,9 @@ export class AgentLifecycleManager {
 		const adopted = this.#adopted.get(id);
 		const current = this.#registry.get(id);
 		const currentMatches =
-			current && (expected === undefined || current === expected || current.session === expected);
+			current && (expected === undefined || current === expected || getLocalSession(current) === expected);
 		const adoptedMatches =
-			adopted && (expected === undefined || adopted.ref === expected || adopted.ref.session === expected);
+			adopted && (expected === undefined || adopted.ref === expected || getLocalSession(adopted.ref) === expected);
 		const ref = currentMatches ? current : adoptedMatches ? adopted.ref : undefined;
 		if (!ref) return false;
 		if (adopted?.ref === ref) {
@@ -435,7 +513,16 @@ export class AgentLifecycleManager {
 			await park.promise;
 		}
 
-		const live = this.#registry.get(id) === ref ? ref.session : null;
+		// D2 dependency: remote release never writes a local transcript/tombstone (disk refs wait for #14).
+		if (ref.endpoint.kind === "remote") {
+			const endpoint = ref.endpoint.endpoint;
+			if (!endpoint && options?.tombstone) throw new Error(`Agent "${id}" has no connected endpoint to terminate.`);
+			await endpoint?.terminate();
+			if (options?.tombstone) this.#registry.setStatus(id, "aborted", ref);
+			else this.#registry.unregister(id, ref);
+			return true;
+		}
+		const live = this.#registry.get(id) === ref ? getLocalSession(ref) : null;
 		if (options?.tombstone) {
 			// Apply the terminal transition synchronously, before any await. The
 			// dying session's own dispose path calls unregisterUnlessParked
@@ -454,7 +541,8 @@ export class AgentLifecycleManager {
 			}
 		}
 		try {
-			if (options?.tombstone && ref.sessionFile) await persistAgentTombstone(ref.sessionFile);
+			const sessionFile = getLocalSessionFile(ref);
+			if (options?.tombstone && sessionFile) await persistAgentTombstone(sessionFile);
 		} finally {
 			// Detaching removes the registry's only route to the live session. Always
 			// dispose the captured session, even when tombstone persistence fails.
@@ -509,10 +597,10 @@ export class AgentLifecycleManager {
 			);
 		}
 		let liveRef = this.#registry.get(id);
-		if (liveRef === ref && ref.status === "parked" && !ref.session) {
+		if (liveRef === ref && ref.status === "parked" && !getLocalSession(ref)) {
 			// A simple reviver returned a session without claiming the parked ref;
 			// attach it here while the exact ref is still revivable.
-			if (!this.#registry.attachSession(id, session, ref.sessionFile, ref)) {
+			if (!this.#registry.attachSession(id, session, getLocalSessionFile(ref), ref)) {
 				await session.dispose();
 				throw new Error(`Agent "${id}" changed before its persisted session could attach.`);
 			}
@@ -520,10 +608,10 @@ export class AgentLifecycleManager {
 		} else if (
 			liveRef !== ref ||
 			liveRef.status !== "running" ||
-			liveRef.session !== session ||
+			getLocalSession(liveRef) !== session ||
 			liveRef.kind !== ref.kind ||
 			liveRef.parentId !== ref.parentId ||
-			liveRef.sessionFile !== ref.sessionFile
+			getLocalSessionFile(liveRef) !== getLocalSessionFile(ref)
 		) {
 			// createAgentSession may have already claimed this exact parked ref and
 			// attached the returned session. Any other state — especially an
@@ -560,7 +648,7 @@ export class AgentLifecycleManager {
 			return;
 		}
 		if (event.type !== "status_changed") return;
-		if (event.ref.status === "running") {
+		if (event.ref.status !== "idle") {
 			if (adopted.timer) {
 				clearTimeout(adopted.timer);
 				adopted.timer = undefined;

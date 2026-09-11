@@ -43,7 +43,7 @@ function createToolSession(options: {
 }
 
 function registerRunningSub(registry: AgentRegistry, id: string, parentId = "Main"): void {
-	registry.register({ id, displayName: id, kind: "sub", parentId, session: null });
+	registry.register({ id, displayName: id, kind: "sub", parentId, endpoint: { kind: "local", session: null, sessionFile: null }});
 }
 
 function resultText(result: { content: Array<{ type: string; text?: string }> }): string {
@@ -146,8 +146,8 @@ describe("hub jobs snapshot", () => {
 		registerRunningSub(registry, "Worker");
 		registerRunningSub(registry, "Idler");
 		registry.setStatus("Idler", "idle");
-		registry.register({ id: "advisor", displayName: "advisor", kind: "advisor", session: null });
-		registry.register({ id: "Main", displayName: "Main", kind: "main", session: null });
+		registry.register({ id: "advisor", displayName: "advisor", kind: "advisor", endpoint: { kind: "local", session: null, sessionFile: null }});
+		registry.register({ id: "Main", displayName: "Main", kind: "main", endpoint: { kind: "local", session: null, sessionFile: null }});
 		const tool = new HubTool(createToolSession({ manager: createManager(), registry, agentId: "Main" }));
 
 		const result = await tool.execute("call", { op: "jobs" });
@@ -266,7 +266,7 @@ describe("hub cancel of a non-job-backed agent registration (#6315)", () => {
 			displayName: "Zombie",
 			kind: "sub",
 			parentId: "Main",
-			session: fake.session as never,
+			endpoint: { kind: "local", session: fake.session as never, sessionFile: null },
 			status: "idle",
 		});
 		lifecycle.adopt("Zombie", { idleTtlMs: 0 });
@@ -291,7 +291,7 @@ describe("hub cancel of a non-job-backed agent registration (#6315)", () => {
 			displayName: "Runner",
 			kind: "sub",
 			parentId: "Main",
-			session: fake.session as never,
+			endpoint: { kind: "local", session: fake.session as never, sessionFile: null },
 			status: "running",
 		});
 		lifecycle.adopt("Runner", { idleTtlMs: 0 });
@@ -314,7 +314,7 @@ describe("hub cancel of a non-job-backed agent registration (#6315)", () => {
 			displayName: "OtherKid",
 			kind: "sub",
 			parentId: "SomeoneElse",
-			session: fake.session as never,
+			endpoint: { kind: "local", session: fake.session as never, sessionFile: null },
 			status: "idle",
 		});
 		const tool = new HubTool(createToolSession({ manager: createManager(), registry, agentId: "Main", lifecycle }));
@@ -350,7 +350,7 @@ describe("hub cancel of a non-job-backed agent registration (#6315)", () => {
 			displayName: "Zombie",
 			kind: "sub",
 			parentId: "Main",
-			session: fake.session as never,
+			endpoint: { kind: "local", session: fake.session as never, sessionFile: null },
 			status: "idle",
 		});
 		lifecycle.adopt("Zombie", { idleTtlMs: 0 });

@@ -947,6 +947,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		// the call returns, so post-return job updates never drop them.
 		let settledCount = 0;
 		let failedCount = 0;
+		let unknownCount = 0;
 		let primaryJobId = asyncSpawns[0].agentId;
 		const syncResults: SingleResult[] = [];
 		// oxlint-disable-next-line prefer-const -- read by buildAsyncDetails before assignment
@@ -962,7 +963,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			outputPaths: syncOutputPaths,
 			progress: spawns.map(spawn => ({ ...spawn.progress })),
 			async: {
-				state: settledCount < asyncSpawns.length ? "running" : failedCount > 0 ? "failed" : "completed",
+				// D2: a settled batch with unknown execution is neither success nor failure.
+				state: settledCount < asyncSpawns.length ? "running" : unknownCount > 0 ? "execution-unknown" : failedCount > 0 ? "failed" : "completed",
 				jobId: primaryJobId,
 				type: "task",
 			},
@@ -981,9 +983,10 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					ircEnabled,
 					buildDetails: buildAsyncDetails,
 					onUpdate,
-					onSettled: failed => {
+					onSettled: status => {
 						settledCount += 1;
-						if (failed) failedCount += 1;
+						if (status === "failed") failedCount += 1;
+						if (status === "execution-unknown") unknownCount += 1;
 					},
 				});
 				if (started.length === 0) primaryJobId = jobId;
@@ -1101,11 +1104,12 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			const spawn = syncSpawns[position];
 			const result = merged.results.find(r => r.id === spawn.agentId);
 			if (result) {
-				spawn.progress.status = result.aborted
-					? "aborted"
-					: result.exitCode === 0 && !result.error
-						? "completed"
-						: "failed";
+				// D2: null exit codes are the endpoint's explicit unknown observation.
+				spawn.progress.status = result.exitCode === null
+					? "execution-unknown"
+					: result.aborted
+						? "aborted"
+						: result.exitCode === 0 && !result.error ? "completed" : "failed";
 				spawn.progress.durationMs = result.durationMs;
 			} else {
 				spawn.progress.status = payloads[position] ? "failed" : "aborted";
@@ -1140,7 +1144,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		ircEnabled: boolean;
 		buildDetails: () => TaskToolDetails;
 		onUpdate?: AgentToolUpdateCallback<TaskToolDetails>;
-		onSettled?: (failed: boolean) => void;
+		onSettled?: (status: "completed" | "failed" | "execution-unknown") => void;
 	}): string {
 		const { manager, toolCallId, spawnParams, agentId, progress, ircEnabled, buildDetails, onUpdate, onSettled } =
 			options;
@@ -1190,7 +1194,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				if (!semaphoreHeld || runSignal.aborted) {
 					releasePermit();
 					progress.status = "aborted";
-					onSettled?.(true);
+					onSettled?.("failed");
 					throw new Error("Aborted before execution");
 				}
 				try {
@@ -1255,8 +1259,10 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					const singleResult = result.details?.results[0];
 					// A missing result means the sync path failed at the tool level
 					// (results: []) — treat it as a failure, not success.
-					const resultFailed = !singleResult || (singleResult.aborted ?? false) || singleResult.exitCode !== 0;
-					progress.status = singleResult?.aborted ? "aborted" : resultFailed ? "failed" : "completed";
+					// D2: unknown must bypass TaskJobError, which deliberately means known failure.
+					const executionUnknown = singleResult?.exitCode === null;
+					const resultFailed = !executionUnknown && (!singleResult || (singleResult.aborted ?? false) || singleResult.exitCode !== 0);
+					progress.status = executionUnknown ? "execution-unknown" : singleResult?.aborted ? "aborted" : resultFailed ? "failed" : "completed";
 					progress.durationMs = singleResult?.durationMs ?? Math.max(0, Date.now() - startedAt);
 					progress.tokens = singleResult?.tokens ?? 0;
 					progress.requests = singleResult?.requests ?? 0;
@@ -1275,11 +1281,14 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						delete progress.resolvedModel;
 						delete progress.resolvedModelIsFallback;
 					}
-					onSettled?.(resultFailed);
-					const statusText = resultFailed
-						? `Background task ${agentId} failed.`
-						: `Background task ${agentId} complete.`;
+					onSettled?.(executionUnknown ? "execution-unknown" : resultFailed ? "failed" : "completed");
+					const statusText = executionUnknown
+						? `Background task ${agentId} execution-unknown.`
+						: resultFailed ? `Background task ${agentId} failed.` : `Background task ${agentId} complete.`;
 					await reportProgress(statusText, buildDetails() as unknown as Record<string, unknown>);
+					if (executionUnknown) {
+						return { status: "execution-unknown", text: finalText, structured: singleResult?.structuredOutput };
+					}
 					const deliveryText = `${finalText}${await buildFollowUpHint(singleResult?.aborted === true)}`;
 					const structured = singleResult?.structuredOutput;
 					if (resultFailed) {
@@ -1293,7 +1302,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					}
 					progress.status = "failed";
 					progress.durationMs = Math.max(0, Date.now() - startedAt);
-					onSettled?.(true);
+					onSettled?.("failed");
 					const statusText = `Background task ${agentId} failed.`;
 					await reportProgress(statusText, buildDetails() as unknown as Record<string, unknown>);
 					const message = error instanceof Error ? error.message : String(error);

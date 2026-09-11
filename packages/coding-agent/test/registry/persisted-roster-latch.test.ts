@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
 import * as path from "node:path";
-import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import { AgentRegistry, getLocalSessionFile } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { ensurePersistedRoster } from "@oh-my-pi/pi-coding-agent/registry/persisted-agents";
 import { CURRENT_SESSION_VERSION } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { TempDir } from "@oh-my-pi/pi-utils";
@@ -248,7 +248,7 @@ describe("persisted roster latch semantics", () => {
 		releaseChildB();
 		await pB;
 		// The later scan's registration is the current one: B's transcript, not A's.
-		expect(registry.get("Worker")?.sessionFile).toBe(childB);
+		expect(getLocalSessionFile(registry.get("Worker"))).toBe(childB);
 		expect(registry.get("Worker")?.status).toBe("parked");
 		// B's latch settled with that result: a repeated call does not re-scan.
 		await ensurePersistedRoster(registry, rootB);
@@ -278,7 +278,7 @@ describe("persisted roster latch semantics", () => {
 		expect(rb).toBe(rootB);
 		// A's failed scan did not poison the queue: B's scan still ran and
 		// registered its child.
-		expect(registry.get("Worker")?.sessionFile).toBe(childB);
+		expect(getLocalSessionFile(registry.get("Worker"))).toBe(childB);
 		// A's failed scan dropped its latch: a retry re-scans A.
 		await ensurePersistedRoster(registry, rootA);
 		expect(countReaddirs(readdirs, scanDir(rootA))).toBe(2);
@@ -328,18 +328,18 @@ describe("persisted roster latch semantics", () => {
 		spyOnReaddirs(readdirs);
 		const registry = new AgentRegistry();
 		await ensurePersistedRoster(registry, rootA);
-		expect(registry.get("Worker")?.sessionFile).toBe(childA);
+		expect(getLocalSessionFile(registry.get("Worker"))).toBe(childA);
 		expect(countReaddirs(readdirs, scanDir(rootA))).toBe(1);
 		// Root B's scan replaces the shared id globally: the parked ref now
 		// targets B's transcript.
 		await ensurePersistedRoster(registry, rootB);
-		expect(registry.get("Worker")?.sessionFile).toBe(childB);
+		expect(getLocalSessionFile(registry.get("Worker"))).toBe(childB);
 		// Returning to root A must not early-return off A's settled latch: the
 		// ref its scan restored no longer matches registry identity/session, so
 		// A is re-scanned and its own transcript wins again — the session,
 		// history, and messaging refs all target A's file.
 		await ensurePersistedRoster(registry, rootA);
-		expect(registry.get("Worker")?.sessionFile).toBe(childA);
+		expect(getLocalSessionFile(registry.get("Worker"))).toBe(childA);
 		expect(registry.get("Worker")?.status).toBe("parked");
 		expect(countReaddirs(readdirs, scanDir(rootA))).toBe(2);
 		// A's restored latch is valid again: a repeated call does not re-scan.
@@ -347,7 +347,7 @@ describe("persisted roster latch semantics", () => {
 		expect(countReaddirs(readdirs, scanDir(rootA))).toBe(2);
 		// B's latch was superseded by A's re-scan; revisiting B refreshes it.
 		await ensurePersistedRoster(registry, rootB);
-		expect(registry.get("Worker")?.sessionFile).toBe(childB);
+		expect(getLocalSessionFile(registry.get("Worker"))).toBe(childB);
 		expect(countReaddirs(readdirs, scanDir(rootB))).toBe(2);
 	}, 10_000);
 
@@ -368,24 +368,24 @@ describe("persisted roster latch semantics", () => {
 		spyOnReaddirs(readdirs);
 		const registry = new AgentRegistry();
 		await ensurePersistedRoster(registry, rootA);
-		expect(registry.get("Worker1")?.sessionFile).toBe(childA1);
-		expect(registry.get("Worker2")?.sessionFile).toBe(childA2);
+		expect(getLocalSessionFile(registry.get("Worker1"))).toBe(childA1);
+		expect(getLocalSessionFile(registry.get("Worker2"))).toBe(childA2);
 		// B owns only Worker1: it replaces just that one; Worker2 stays A's.
 		await ensurePersistedRoster(registry, rootB);
-		expect(registry.get("Worker1")?.sessionFile).toBe(childB1);
-		expect(registry.get("Worker2")?.sessionFile).toBe(childA2);
+		expect(getLocalSessionFile(registry.get("Worker1"))).toBe(childB1);
+		expect(getLocalSessionFile(registry.get("Worker2"))).toBe(childA2);
 		// A's latch detects Worker1 moved; re-scanning restores Worker1 without
 		// touching Worker2's still-valid ref.
 		await ensurePersistedRoster(registry, rootA);
-		expect(registry.get("Worker1")?.sessionFile).toBe(childA1);
-		expect(registry.get("Worker2")?.sessionFile).toBe(childA2);
+		expect(getLocalSessionFile(registry.get("Worker1"))).toBe(childA1);
+		expect(getLocalSessionFile(registry.get("Worker2"))).toBe(childA2);
 		expect(countReaddirs(readdirs, scanDir(rootA))).toBe(2);
 		expect(countReaddirs(readdirs, scanDir(rootB))).toBe(1);
 		// B's latch is stale again (Worker1 moved back to A); revisiting B
 		// refreshes it, still leaving Worker2 on A.
 		await ensurePersistedRoster(registry, rootB);
-		expect(registry.get("Worker1")?.sessionFile).toBe(childB1);
-		expect(registry.get("Worker2")?.sessionFile).toBe(childA2);
+		expect(getLocalSessionFile(registry.get("Worker1"))).toBe(childB1);
+		expect(getLocalSessionFile(registry.get("Worker2"))).toBe(childA2);
 		expect(countReaddirs(readdirs, scanDir(rootB))).toBe(2);
 	}, 10_000);
 
@@ -400,13 +400,13 @@ describe("persisted roster latch semantics", () => {
 		spyOnReaddirs(readdirs);
 		const registry = new AgentRegistry();
 		await ensurePersistedRoster(registry, rootFile);
-		expect(registry.get("Worker")?.sessionFile).toBe(childFile);
+		expect(getLocalSessionFile(registry.get("Worker"))).toBe(childFile);
 		expect(countReaddirs(readdirs, scanDir(rootFile))).toBe(1);
 		// A release removes the ref the latch restored; the next ensure sees the
 		// missing ref and re-scans to restore it.
 		expect(registry.unregister("Worker")).toBe(true);
 		await ensurePersistedRoster(registry, rootFile);
-		expect(registry.get("Worker")?.sessionFile).toBe(childFile);
+		expect(getLocalSessionFile(registry.get("Worker"))).toBe(childFile);
 		expect(countReaddirs(readdirs, scanDir(rootFile))).toBe(2);
 	}, 10_000);
 
@@ -423,7 +423,7 @@ describe("persisted roster latch semantics", () => {
 		const registry = new AgentRegistry();
 		await ensurePersistedRoster(registry, rootFile);
 		expect(registry.get("Worker")?.status).toBe("aborted");
-		expect(registry.get("Worker")?.sessionFile).toBe(childFile);
+		expect(getLocalSessionFile(registry.get("Worker"))).toBe(childFile);
 		// The restored aborted ref still matches the latch token: no re-scan.
 		await ensurePersistedRoster(registry, rootFile);
 		expect(countReaddirs(readdirs, scanDir(rootFile))).toBe(1);
@@ -440,13 +440,13 @@ describe("persisted roster latch semantics", () => {
 		spyOnReaddirs(readdirs);
 		const registry = new AgentRegistry();
 		await ensurePersistedRoster(registry, rootFile);
-		expect(registry.get("Worker")?.sessionFile).toBe(childFile);
+		expect(getLocalSessionFile(registry.get("Worker"))).toBe(childFile);
 		expect(countReaddirs(readdirs, scanDir(rootFile))).toBe(1);
 		await fs.promises.rm(childFile);
 		// The ref's id+file identity is intact even though the transcript is
 		// gone; the settled latch stays valid and no re-scan runs.
 		await ensurePersistedRoster(registry, rootFile);
-		expect(registry.get("Worker")?.sessionFile).toBe(childFile);
+		expect(getLocalSessionFile(registry.get("Worker"))).toBe(childFile);
 		expect(countReaddirs(readdirs, scanDir(rootFile))).toBe(1);
 	}, 10_000);
 
@@ -473,18 +473,18 @@ describe("persisted roster latch semantics", () => {
 		spyOnReaddirs(readdirs);
 		const registry = new AgentRegistry();
 		await ensurePersistedRoster(registry, rootA);
-		expect(registry.get("Worker")?.sessionFile).toBe(childA);
+		expect(getLocalSessionFile(registry.get("Worker"))).toBe(childA);
 		await ensurePersistedRoster(registry, rootB);
-		expect(registry.get("Worker")?.sessionFile).toBe(childB);
+		expect(getLocalSessionFile(registry.get("Worker"))).toBe(childB);
 		// A's refresh scan faults on its child: the scan fails and drops the
 		// latch, so B's ref stays current and the failure stays retryable.
 		failChildA = true;
 		await ensurePersistedRoster(registry, rootA);
-		expect(registry.get("Worker")?.sessionFile).toBe(childB);
+		expect(getLocalSessionFile(registry.get("Worker"))).toBe(childB);
 		expect(countReaddirs(readdirs, scanDir(rootA))).toBe(2);
 		failChildA = false;
 		await ensurePersistedRoster(registry, rootA);
-		expect(registry.get("Worker")?.sessionFile).toBe(childA);
+		expect(getLocalSessionFile(registry.get("Worker"))).toBe(childA);
 		expect(countReaddirs(readdirs, scanDir(rootA))).toBe(3);
 	}, 10_000);
 });

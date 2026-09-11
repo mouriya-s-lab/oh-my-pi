@@ -3,7 +3,8 @@ import * as fs from "node:fs/promises";
 import type { AgentProgress } from "../task/types";
 
 export type AgentActivityKind = "response" | "tool" | "irc" | "lifecycle";
-export type AgentActivityStatus = "pending" | "success" | "error" | "aborted";
+// D2: an unobservable run retains a distinct activity verdict.
+export type AgentActivityStatus = "pending" | "success" | "error" | "aborted" | "execution-unknown";
 
 export interface AgentActivityRow {
 	id: string;
@@ -174,6 +175,8 @@ function pruneToolRows(state: TranscriptState, evicted: readonly AgentActivityRo
 }
 
 export function activityRowsFromProgress(progress: AgentProgress, lastUpdate = Date.now()): AgentActivityRow[] {
+	// D2: transport loss must not render a live spinner or successful response.
+	const executionUnknown = progress.status === "execution-unknown";
 	const rows: AgentActivityRow[] = [];
 	const recentTools = progress.recentTools ?? [];
 	for (let index = recentTools.length - 1; index >= 0; index--) {
@@ -198,7 +201,7 @@ export function activityRowsFromProgress(progress: AgentProgress, lastUpdate = D
 			kind: "tool",
 			title: progress.currentTool,
 			summary: progress.lastIntent ?? progress.currentToolArgs ?? progress.currentTool,
-			status: "pending",
+			status: executionUnknown ? "execution-unknown" : "pending",
 			toolName: progress.currentTool,
 			source: "live",
 		});
@@ -210,8 +213,9 @@ export function activityRowsFromProgress(progress: AgentProgress, lastUpdate = D
 		kind: "lifecycle",
 		title: progress.status ?? "running",
 		summary: progress.task ?? progress.description ?? "Agent activity",
-		status:
-			progress.status === "completed"
+		status: executionUnknown
+			? "execution-unknown"
+			: progress.status === "completed"
 				? "success"
 				: progress.status === "failed"
 					? "error"
@@ -229,7 +233,13 @@ export function activityRowsFromProgress(progress: AgentProgress, lastUpdate = D
 			kind: "response",
 			title: "Response",
 			summary: response,
-			status: progress.status === "failed" ? "error" : progress.status === "aborted" ? "aborted" : "pending",
+			status: executionUnknown
+				? "execution-unknown"
+				: progress.status === "failed"
+					? "error"
+					: progress.status === "aborted"
+						? "aborted"
+						: "pending",
 			source: "live",
 		});
 	}

@@ -9,7 +9,7 @@ import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { LocalProtocolHandler } from "@oh-my-pi/pi-coding-agent/internal-urls/local-protocol";
 import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
-import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import { AgentRegistry, getLocalSession } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import * as secrets from "@oh-my-pi/pi-coding-agent/secrets";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
@@ -204,7 +204,7 @@ describe("createAgentSession session storage isolation", () => {
 			displayName: "replacement B",
 			kind: "sub",
 			parentId: "Main",
-			session: null,
+			endpoint: { kind: "local", session: null, sessionFile: null },
 			status: "idle",
 		});
 
@@ -231,7 +231,7 @@ describe("createAgentSession session storage isolation", () => {
 			}),
 		).rejects.toThrow("already owned by another session generation");
 		expect(registry.get("shared-worker")).toBe(replacement);
-		expect(replacement).toMatchObject({ status: "idle", session: null });
+		expect(replacement).toMatchObject({ status: "idle", endpoint: { kind: "local", session: null } });
 	});
 
 	it("reclaims an unrevivable parked generation before a fresh same-id spawn", async () => {
@@ -248,8 +248,7 @@ describe("createAgentSession session storage isolation", () => {
 			displayName: "dead generation",
 			kind: "sub",
 			parentId: "Main",
-			session: null,
-			sessionFile: path.join(tempDir, "old-worker.jsonl"),
+			endpoint: { kind: "local", session: null, sessionFile: path.join(tempDir, "old-worker.jsonl") },
 			status: "parked",
 		});
 
@@ -278,7 +277,7 @@ describe("createAgentSession session storage isolation", () => {
 			const replacement = registry.get("reused-worker");
 			expect(replacement).toBeDefined();
 			expect(replacement).not.toBe(corpse);
-			expect(replacement?.session).toBe(session);
+			expect(getLocalSession(replacement)).toBe(session);
 		} finally {
 			await session?.dispose();
 			await lifecycle.dispose();
@@ -302,8 +301,7 @@ describe("createAgentSession session storage isolation", () => {
 			displayName: "revived worker",
 			kind: "sub",
 			parentId: "Main",
-			session: null,
-			sessionFile,
+			endpoint: { kind: "local", session: null, sessionFile: sessionFile },
 			status: "parked",
 		});
 
@@ -329,7 +327,7 @@ describe("createAgentSession session storage isolation", () => {
 		});
 		try {
 			expect(registry.get("revived-worker")).toBe(parked);
-			expect(parked).toMatchObject({ status: "running", session, sessionFile });
+			expect(parked).toMatchObject({ status: "running", endpoint: { kind: "local", session, sessionFile } });
 		} finally {
 			await session.dispose();
 		}

@@ -1,0 +1,124 @@
+/**
+ * Reply-drained barrier: a run is finished only when it is terminal *and* owes
+ * no more replies (RFC #1 §6.5, R5).
+ *
+ * The two facts arrive independently — a run's terminal outcome usually
+ * precedes its last outbound reply by a delivery round trip — so neither may be
+ * inferred from the other. A caller that folds "terminal" into "stopped
+ * without replying" strands an awaited `hub` send; a caller that folds "already
+ * replied" into "terminal" reports a verdict the run never produced. This
+ * barrier keeps both facts per run id and releases a waiter only when the pair
+ * is complete.
+ *
+ * Local runs auto-drain (their replies are in-process); a remote run drains
+ * when its peer's barrier frame lands (#9/#11). Nothing here performs I/O.
+ */
+
+/**
+ * Whether a drain wait completed on its own facts or because its caller's
+ * signal aborted the wait.
+ */
+export type ReplyDrainedStatus = "drained" | "aborted";
+
+/**
+ * Result of {@link ReplyDrainedBarrier.await}. `aborted` describes the waiting
+ * call, never the run: the run may still be in flight, and an aborted wait has
+ * learnt nothing new about it.
+ */
+export interface ReplyDrainedResult {
+	status: ReplyDrainedStatus;
+}
+
+/** Facts and live waiters for one run id. */
+interface DrainState {
+	terminal: boolean;
+	drained: boolean;
+	waiters: Set<DrainWaiter>;
+}
+
+/** One `await()` call: its own result, plus the abort wiring that must be undone on settle. */
+interface DrainWaiter {
+	deferred: PromiseWithResolvers<ReplyDrainedResult>;
+	signal?: AbortSignal;
+	onAbort?: () => void;
+}
+
+/**
+ * Tracks "terminal" and "reply-drained" per run and hands both facts to
+ * waiters. Facts and waiters are keyed by run id, so several runs of one
+ * endpoint (a resumed session's successive runs, a roster's overlapping runs)
+ * never leak into each other.
+ */
+export class ReplyDrainedBarrier {
+	readonly #runs = new Map<string, DrainState>();
+
+	/**
+	 * Record that `runId` reached a terminal verdict. Independent of draining:
+	 * a terminal run with replies still in flight keeps its waiters blocked
+	 * until {@link markDrained}.
+	 */
+	markTerminal(runId: string): void {
+		const state = this.#state(runId);
+		if (state.terminal) return;
+		state.terminal = true;
+		this.#release(state);
+	}
+
+	/** Record that `runId` owes no further replies (delivered or definitively failed). */
+	markDrained(runId: string): void {
+		const state = this.#state(runId);
+		if (state.drained) return;
+		state.drained = true;
+		this.#release(state);
+	}
+
+	/**
+	 * Wait until `runId` is both terminal and drained. Each call registers an
+	 * independent waiter with its own deferred, so aborting one wait resolves
+	 * only that waiter and never poisons the others or the recorded facts.
+	 * Passing no signal means waiting for the pair; a run that never reaches
+	 * one of the two states keeps the caller waiting by design.
+	 */
+	await(runId: string, signal?: AbortSignal): Promise<ReplyDrainedResult> {
+		const state = this.#state(runId);
+		if (state.terminal && state.drained) return Promise.resolve({ status: "drained" });
+		if (signal?.aborted) return Promise.resolve({ status: "aborted" });
+		const waiter: DrainWaiter = { deferred: Promise.withResolvers<ReplyDrainedResult>() };
+		if (signal) {
+			const onAbort = (): void => {
+				if (!state.waiters.delete(waiter)) return;
+				signal.removeEventListener("abort", onAbort);
+				waiter.deferred.resolve({ status: "aborted" });
+			};
+			waiter.signal = signal;
+			waiter.onAbort = onAbort;
+			signal.addEventListener("abort", onAbort, { once: true });
+		}
+		state.waiters.add(waiter);
+		return waiter.deferred.promise;
+	}
+
+	#state(runId: string): DrainState {
+		let state = this.#runs.get(runId);
+		if (!state) {
+			state = { terminal: false, drained: false, waiters: new Set() };
+			this.#runs.set(runId, state);
+		}
+		return state;
+	}
+
+	/**
+	 * Release every waiter of a fully-drained run. The facts stay behind so a
+	 * late {@link await} still resolves immediately; waiters that were already
+	 * aborted are no longer in the set and are left untouched.
+	 */
+	#release(state: DrainState): void {
+		if (!state.terminal || !state.drained || state.waiters.size === 0) return;
+		const waiters = [...state.waiters];
+		state.waiters.clear();
+		for (const waiter of waiters) {
+			if (waiter.signal && waiter.onAbort) waiter.signal.removeEventListener("abort", waiter.onAbort);
+			waiter.deferred.resolve({ status: "drained" });
+		}
+	}
+}

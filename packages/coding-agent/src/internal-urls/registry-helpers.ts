@@ -7,7 +7,7 @@ import type { Dirent } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { isEnoent } from "@oh-my-pi/pi-utils";
-import { AgentRegistry } from "../registry/agent-registry";
+import { AgentRegistry, getLocalSession, getLocalSessionFile } from "../registry/agent-registry";
 
 const extraArtifactsDirs = new Set<string>();
 
@@ -49,8 +49,10 @@ export function artifactsDirsFromRegistry(options?: { preferredDir?: string }): 
 	};
 	if (options?.preferredDir) addDir(options.preferredDir);
 	for (const ref of AgentRegistry.global().list()) {
-		addDir(ref.session?.sessionManager?.getArtifactsDir());
-		if (ref.sessionFile) addDir(ref.sessionFile.slice(0, -6));
+		// D2 dependency: remote refs are never interpreted as local artifact paths.
+		addDir(getLocalSession(ref)?.sessionManager?.getArtifactsDir());
+		const sessionFile = getLocalSessionFile(ref);
+		if (sessionFile) addDir(sessionFile.slice(0, -6));
 	}
 	for (const dir of extraArtifactsDirs) addDir(dir);
 	return dirs;
@@ -119,8 +121,10 @@ export async function hasResolvableTranscript(agentId: string): Promise<boolean>
 		let ref = registry.get(agentId);
 		if (ref?.kind === "advisor") ref = undefined;
 		ref ??= registry.list().find(candidate => candidate.kind !== "advisor" && candidate.id.toLowerCase() === lower);
-		if (ref?.session) return true;
-		if (ref?.sessionFile && (await isReadableFile(ref.sessionFile))) return true;
+		if (ref?.endpoint.kind === "remote") return false; // D2: remote resource reads wait for #13.
+		if (getLocalSession(ref)) return true;
+		const sessionFile = getLocalSessionFile(ref);
+		if (sessionFile && (await isReadableFile(sessionFile))) return true;
 		const files = await sessionFilesFromDisk();
 		for (const id of files.keys()) {
 			if (id.toLowerCase() === lower) return true;

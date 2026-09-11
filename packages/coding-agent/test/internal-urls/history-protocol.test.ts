@@ -19,7 +19,7 @@ import {
 	registerArtifactsDir,
 	resetRegisteredArtifactDirsForTests,
 } from "@oh-my-pi/pi-coding-agent/internal-urls/registry-helpers";
-import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import { AgentRegistry, getLocalSessionFile } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { CURRENT_SESSION_VERSION } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
@@ -108,7 +108,7 @@ describe("history:// protocol", () => {
 			id: "HubAgent",
 			displayName: "task",
 			kind: "sub",
-			session: fakeLiveSession([]),
+			endpoint: { kind: "local", session: fakeLiveSession([]), sessionFile: null },
 			status: "idle",
 		});
 
@@ -124,7 +124,7 @@ describe("history:// protocol", () => {
 			id: "HubAgent",
 			displayName: "task",
 			kind: "sub",
-			session: fakeLiveSession([{ role: "user", content: "hello from live", timestamp: 1 }]),
+			endpoint: { kind: "local", session: fakeLiveSession([{ role: "user", content: "hello from live", timestamp: 1 }]), sessionFile: null },
 			status: "idle",
 		});
 
@@ -141,7 +141,7 @@ describe("history:// protocol", () => {
 			id: "HubAgent",
 			displayName: "task",
 			kind: "sub",
-			session: fakeLiveSession([{ role: "user", content: "hello from live", timestamp: 1 }]),
+			endpoint: { kind: "local", session: fakeLiveSession([{ role: "user", content: "hello from live", timestamp: 1 }]), sessionFile: null },
 			status: "idle",
 		});
 		const tool = new ReadTool(makeToolSession(os.tmpdir()));
@@ -160,7 +160,7 @@ describe("history:// protocol", () => {
 			id: "HubAgent",
 			displayName: "task",
 			kind: "sub",
-			session: fakeLiveSession([{ role: "user", content: "hello from live", timestamp: 1 }]),
+			endpoint: { kind: "local", session: fakeLiveSession([{ role: "user", content: "hello from live", timestamp: 1 }]), sessionFile: null },
 			status: "idle",
 		});
 
@@ -176,8 +176,7 @@ describe("history:// protocol", () => {
 				id: "Sleeper",
 				displayName: "task",
 				kind: "sub",
-				session: null,
-				sessionFile,
+				endpoint: { kind: "local", session: null, sessionFile: sessionFile },
 				status: "parked",
 			});
 
@@ -196,7 +195,7 @@ describe("history:// protocol", () => {
 			id: "HubAgent",
 			displayName: "task",
 			kind: "sub",
-			session: fakeLiveSession([]),
+			endpoint: { kind: "local", session: fakeLiveSession([]), sessionFile: null },
 			status: "idle",
 		});
 
@@ -217,8 +216,7 @@ describe("history:// protocol", () => {
 			id: "Husk",
 			displayName: "task",
 			kind: "sub",
-			session: null,
-			sessionFile: null,
+			endpoint: { kind: "local", session: null, sessionFile: null },
 			status: "aborted",
 		});
 
@@ -237,21 +235,21 @@ describe("history:// protocol", () => {
 			id: "HubAgent",
 			displayName: "task",
 			kind: "sub",
-			session: fakeLiveSession([]),
+			endpoint: { kind: "local", session: fakeLiveSession([]), sessionFile: null },
 			status: "idle",
 		});
 		AgentRegistry.global().register({
 			id: "Main/advisor",
 			displayName: "advisor",
 			kind: "advisor",
-			session: fakeLiveSession([{ role: "user", content: "should stay hidden", timestamp: 1 }]),
+			endpoint: { kind: "local", session: fakeLiveSession([{ role: "user", content: "should stay hidden", timestamp: 1 }]), sessionFile: null },
 			status: "parked",
 		});
 		AgentRegistry.global().register({
 			id: "AdvisorProbe",
 			displayName: "advisor",
 			kind: "advisor",
-			session: fakeLiveSession([{ role: "user", content: "should stay hidden", timestamp: 1 }]),
+			endpoint: { kind: "local", session: fakeLiveSession([{ role: "user", content: "should stay hidden", timestamp: 1 }]), sessionFile: null },
 			status: "parked",
 		});
 
@@ -277,15 +275,14 @@ describe("history:// protocol", () => {
 			id: "HubAgent",
 			displayName: "task",
 			kind: "sub",
-			session: fakeLiveSession([]),
+			endpoint: { kind: "local", session: fakeLiveSession([]), sessionFile: null },
 			status: "idle",
 		});
 		AgentRegistry.global().register({
 			id: "AdvisorProbe",
 			displayName: "advisor",
 			kind: "advisor",
-			session: null,
-			sessionFile: "/tmp/x/__advisor.jsonl",
+			endpoint: { kind: "local", session: null, sessionFile: "/tmp/x/__advisor.jsonl" },
 			status: "parked",
 		});
 
@@ -306,11 +303,10 @@ describe("history:// protocol", () => {
 				id: "Main",
 				displayName: "main",
 				kind: "main",
-				session: {
+				endpoint: { kind: "local", session: {
 					messages: [],
 					sessionManager: { getArtifactsDir: () => artifactsDir },
-				} as unknown as AgentSession,
-				sessionFile,
+				} as unknown as AgentSession, sessionFile: sessionFile },
 				status: "idle",
 			});
 
@@ -332,11 +328,10 @@ describe("history:// protocol", () => {
 				id: "Main",
 				displayName: "main",
 				kind: "main",
-				session: {
+				endpoint: { kind: "local", session: {
 					messages: [],
 					sessionManager: { getArtifactsDir: () => artifactsDir },
-				} as unknown as AgentSession,
-				sessionFile,
+				} as unknown as AgentSession, sessionFile: sessionFile },
 				status: "idle",
 			});
 
@@ -356,11 +351,10 @@ describe("history:// protocol", () => {
 				id: "Main",
 				displayName: "main",
 				kind: "main",
-				session: {
+				endpoint: { kind: "local", session: {
 					messages: [],
 					sessionManager: { getArtifactsDir: () => artifactsDir },
-				} as unknown as AgentSession,
-				sessionFile,
+				} as unknown as AgentSession, sessionFile: sessionFile },
 				status: "idle",
 			});
 
@@ -386,11 +380,10 @@ describe("history:// protocol", () => {
 				id: "Main",
 				displayName: "main",
 				kind: "main",
-				session: {
+				endpoint: { kind: "local", session: {
 					messages: [],
 					sessionManager: { getArtifactsDir: () => artifactsDir },
-				} as unknown as AgentSession,
-				sessionFile,
+				} as unknown as AgentSession, sessionFile: sessionFile },
 				status: "idle",
 			});
 
@@ -439,8 +432,7 @@ describe("history:// protocol", () => {
 				id: "Main",
 				displayName: "main",
 				kind: "main",
-				session: null,
-				sessionFile: rootA,
+				endpoint: { kind: "local", session: null, sessionFile: rootA },
 				status: "running",
 			});
 			// B's scan ran first: the process-global Worker ref targets B's file.
@@ -448,8 +440,7 @@ describe("history:// protocol", () => {
 				id: "Worker",
 				displayName: "task",
 				kind: "sub",
-				session: null,
-				sessionFile: childB,
+				endpoint: { kind: "local", session: null, sessionFile: childB },
 				status: "parked",
 			});
 
@@ -462,7 +453,7 @@ describe("history:// protocol", () => {
 			if (output?.type !== "text") throw new Error("Expected text output");
 			expect(output.text).toContain("hello from root A");
 			expect(output.text).not.toContain("hello from root B");
-			expect(AgentRegistry.global().get("Worker")?.sessionFile).toBe(childA);
+			expect(getLocalSessionFile(AgentRegistry.global().get("Worker"))).toBe(childA);
 		});
 	});
 });

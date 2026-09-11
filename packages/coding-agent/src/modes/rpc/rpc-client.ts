@@ -1015,13 +1015,14 @@ export class RpcClient {
 
 	/**
 	 * Wait for agent to become idle (no streaming).
-	 * Resolves when agent_end event is received.
+	 * Resolves on a terminal agent_end; omitted isTerminal retains legacy semantics.
 	 */
 	waitForIdle(timeout = 60000): Promise<void> {
 		const { promise, resolve, reject } = Promise.withResolvers<void>();
 		let settled = false;
-		const unsubscribe = this.onEvent(event => {
-			if (event.type === "agent_end") {
+		// D2: scheduling-pause agent_end frames do not settle RPC waiters.
+		const unsubscribe = this.onSessionEvent(event => {
+			if (event.type === "agent_end" && event.isTerminal !== false) {
 				settled = true;
 				unsubscribe();
 				clearTimeout(timeoutId);
@@ -1045,7 +1046,9 @@ export class RpcClient {
 		const { promise, resolve, reject } = Promise.withResolvers<AgentEvent[]>();
 		const events: AgentEvent[] = [];
 		let settled = false;
-		const unsubscribe = this.onEvent(event => {
+		const unsubscribe = this.onSessionEvent(event => {
+			// D2: collect core events only, excluding nonterminal completion frames.
+			if (!isAgentEvent(event) || (event.type === "agent_end" && event.isTerminal === false)) return;
 			events.push(event);
 			if (event.type === "agent_end") {
 				settled = true;

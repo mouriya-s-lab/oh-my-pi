@@ -23,7 +23,7 @@ import type {
 } from "@oh-my-pi/pi-wire";
 import type { InteractiveModeContext } from "../modes/types";
 import { AgentLifecycleManager } from "../registry/agent-lifecycle";
-import { type AgentRef, AgentRegistry } from "../registry/agent-registry";
+import { type AgentRef, AgentRegistry, getLocalSession, getLocalSessionFile } from "../registry/agent-registry";
 import type { AgentSessionEvent } from "../session/agent-session";
 import { stripImagesFromMessage, USER_INTERRUPT_LABEL } from "../session/messages";
 import type { SessionEntry as StoredSessionEntry } from "../session/session-entries";
@@ -575,7 +575,7 @@ export class CollabHost {
 					kind: ref.kind,
 					parentId: ref.parentId,
 					status: ref.status,
-					hasSessionFile: !!ref.sessionFile,
+					hasSessionFile: !!getLocalSessionFile(ref),
 					createdAt: ref.createdAt,
 					lastActivity: ref.lastActivity,
 				}))
@@ -615,7 +615,11 @@ export class CollabHost {
 				// Mirrors the hub's #submitChatMessage: revive if parked, steer if mid-turn.
 				AgentLifecycleManager.global()
 					.ensureLive(agentId)
-					.then(session => session.prompt(trimmed, { streamingBehavior: "steer" }))
+					.then(live => {
+						// D2 dependency: remote chat routing is not implemented by the local collab command path (#11).
+						if (live.kind !== "local") throw new Error("Remote agent chat is not implemented (#11).");
+						return live.session.prompt(trimmed, { streamingBehavior: "steer" });
+					})
 					.catch(fail);
 				break;
 			}
@@ -623,8 +627,9 @@ export class CollabHost {
 				const kill = async () => {
 					const ref = AgentRegistry.global().get(agentId);
 					if (!ref) return;
-					if (ref.status === "running" && ref.session) {
-						await ref.session.abort({ reason: USER_INTERRUPT_LABEL });
+					const session = getLocalSession(ref);
+					if (ref.status === "running" && session) {
+						await session.abort({ reason: USER_INTERRUPT_LABEL });
 					}
 					await AgentLifecycleManager.global().release(agentId, ref, { tombstone: true });
 				};
@@ -641,7 +646,8 @@ export class CollabHost {
 	async #handleFetchTranscript(reqId: number, agentId: string, fromByte: number, fromPeer: number): Promise<void> {
 		const reply = (text: string, newSize: number, error?: string) =>
 			this.#socket?.send({ t: "transcript", reqId, text, newSize, error }, fromPeer);
-		const file = AgentRegistry.global().get(agentId)?.sessionFile;
+		// D2 dependency: remote transcript fetching needs endpoint resource routing (#13).
+		const file = getLocalSessionFile(AgentRegistry.global().get(agentId));
 		if (!file) {
 			reply("", fromByte, "no transcript available");
 			return;

@@ -188,6 +188,10 @@ if (!globalThis.__omp_js_prelude_loaded__) {
 	const resolveHandleSnapshot = (handle, snapshot) => {
 		const status = snapshot?.status ?? "failed";
 		if (status === "running") throw timeoutError(`${handle.kind} handle ${handle.id} is still running`);
+		// D2: an unobservable agent run cannot produce a successful handle value.
+		if (status === "execution-unknown") {
+			throw new Error(snapshot?.error || `${handle.kind} handle ${handle.id} execution-unknown`);
+		}
 		if (status === "failed" || status === "cancelled") {
 			throw new Error(snapshot?.error || `${handle.kind} handle ${handle.id} failed`);
 		}

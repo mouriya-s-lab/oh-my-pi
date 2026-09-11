@@ -267,7 +267,7 @@ describe("InteractiveMode todo HUD persistence", () => {
 			displayName: agentId,
 			kind: "sub",
 			parentId: MAIN_AGENT_ID,
-			session: focusedSession,
+			endpoint: { kind: "local", session: focusedSession, sessionFile: null },
 			status: "running",
 		});
 		try {

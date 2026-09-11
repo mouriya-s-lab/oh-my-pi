@@ -16,7 +16,7 @@ import type { Settings } from "../../config/settings";
 import type { RenderResultOptions } from "../../extensibility/custom-tools/types";
 import { IrcAwaitTargetStopped, IrcBus, type IrcDeliveryReceipt, type IrcMessage } from "../../irc/bus";
 import type { Theme } from "../../modes/theme/theme";
-import { type AgentRegistry, MAIN_AGENT_ID } from "../../registry/agent-registry";
+import { type AgentRegistry, getLocalSession, getLocalSessionFile, MAIN_AGENT_ID } from "../../registry/agent-registry";
 import { ensurePersistedRoster, isCurrentSessionRosterRef } from "../../registry/persisted-agents";
 import { canSpawnAtDepth } from "../../task/types";
 import { Ellipsis, renderStatusLine, renderTreeList, truncateToWidth } from "../../tui";
@@ -44,7 +44,7 @@ export { DEFAULT_HUB_LIST_LIMIT, MAX_HUB_LIST_LIMIT } from "./types";
 export const DEFAULT_IRC_TIMEOUT_MS = 120_000;
 
 /** Hub roster ordering (running before idle before parked) shared with the child prompt's live-row cap. */
-export const LIST_STATUS_ORDER: Record<string, number> = { running: 0, idle: 1, parked: 2 };
+export const LIST_STATUS_ORDER: Record<string, number> = { running: 0, "execution-unknown": 1, idle: 2, parked: 3 };
 
 export interface HubListParams {
 	status?: HubListStatus;
@@ -80,20 +80,21 @@ function selectListRefs(
 	return status ? live.filter(ref => ref.status === status) : live;
 }
 
-function countAddressable(refs: { status: string }[]): Pick<HubRosterCounts, "running" | "idle" | "parked"> {
-	const counts = { running: 0, idle: 0, parked: 0 };
+function countAddressable(refs: { status: string }[]): Pick<HubRosterCounts, "running" | "idle" | "parked" | "execution-unknown"> {
+	const counts = { running: 0, idle: 0, parked: 0, "execution-unknown": 0 };
 	for (const ref of refs) {
 		if (ref.status === "running") counts.running++;
 		else if (ref.status === "idle") counts.idle++;
 		else if (ref.status === "parked") counts.parked++;
+		else if (ref.status === "execution-unknown") counts["execution-unknown"]++;
 	}
 	return counts;
 }
 
 function formatRosterSummary(counts: HubRosterCounts, emptyNoun: string): string {
-	const tally = `running ${counts.running}, idle ${counts.idle}, parked ${counts.parked}; shown ${counts.shown}, truncated ${counts.truncated}`;
+	const tally = `running ${counts.running}, idle ${counts.idle}, parked ${counts.parked}, execution-unknown ${counts["execution-unknown"]}; shown ${counts.shown}, truncated ${counts.truncated}`;
 	if (counts.shown === 0) {
-		return counts.running + counts.idle + counts.parked === 0
+		return counts.running + counts.idle + counts.parked + counts["execution-unknown"] === 0
 			? `No other agents (${tally}).`
 			: `No ${emptyNoun} (${tally}).`;
 	}
@@ -135,7 +136,8 @@ export function resolveMessageTimeoutMs(settings: Settings, explicit?: number): 
 
 /** Session-buffered inbox drain used before parking a bus waiter. */
 export function drainPendingInbox(registry: AgentRegistry, senderId: string, from?: string): IrcMessage | undefined {
-	const session = registry.get(senderId)?.session;
+	// D2: remote peers have no local inbox to drain.
+	const session = getLocalSession(registry.get(senderId));
 	return typeof session?.drainPendingIrcInboxMessages === "function"
 		? session.drainPendingIrcInboxMessages(senderId, { from, limit: 1 })[0]
 		: undefined;
@@ -162,7 +164,7 @@ export async function executeList(
 ): Promise<AgentToolResult<CoordinationDetails>> {
 	const rootSessionFile = await ensurePersistedRoster(
 		registry,
-		sessionFileHint ?? registry.get(senderId)?.sessionFile,
+		sessionFileHint ?? getLocalSessionFile(registry.get(senderId)),
 	);
 	const refs = registry
 		.list()
@@ -187,9 +189,10 @@ export async function executeList(
 		id: ref.id,
 		displayName: ref.displayName,
 		kind: ref.kind,
+		endpointKind: ref.endpoint.kind,
 		status: ref.status,
 		parentId: ref.parentId,
-		unread: bus.unreadCount(ref.id),
+		unread: ref.endpoint.kind === "local" ? bus.unreadCount(ref.id) : 0,
 		lastActivity: ref.lastActivity,
 		activity: ref.activity,
 	}));
@@ -201,7 +204,7 @@ export async function executeList(
 			peer.parentId ? `parent ${peer.parentId}` : undefined,
 			`active ${formatDuration(Date.now() - peer.lastActivity)} ago`,
 		].filter(Boolean);
-		lines.push(`- ${peer.id} [${peer.displayName} · ${peer.kind} · ${peer.status}] — ${extras.join(", ")}`);
+		lines.push(`- ${peer.id} [${peer.displayName} · ${peer.kind} · ${peer.endpointKind} · ${peer.status}] — ${extras.join(", ")}`);
 	}
 	if (counts.parked > 0) {
 		lines.push("");
@@ -262,6 +265,15 @@ export async function executeSend(
 		await ensurePersistedRoster(registry, sessionFileHint);
 	}
 
+	// D2: remote IRC routing belongs to #11; do not revive or enqueue on the local bus.
+	if (registry.get(senderId)?.endpoint.kind === "remote" || (!isBroadcast && registry.get(to)?.endpoint.kind === "remote")) {
+		return hubErrorResult("Remote peer messaging is not implemented (pending #11).", {
+			op: "send",
+			from: senderId,
+			to,
+			receipts: [{ to, outcome: "failed", error: "Remote IRC delivery is not implemented (pending #11)." }],
+		});
+	}
 	const bus = IrcBus.global();
 	let waited: IrcMessage | null | undefined;
 	const timeoutMs = params.await ? resolveMessageTimeoutMs(settings, params.timeoutMs) : undefined;
@@ -305,7 +317,13 @@ export async function executeSend(
 		const suppressRelay = isBroadcast && targets.includes(MAIN_AGENT_ID);
 		const receipts = await Promise.all(
 			targets.map(target =>
-				bus.send(
+				registry.get(target)?.endpoint.kind === "remote"
+					? Promise.resolve<IrcDeliveryReceipt>({
+							to: target,
+							outcome: "failed",
+							error: "Remote IRC delivery is not implemented (pending #11).",
+						})
+					: bus.send(
 					{ from: senderId, to: target, body: message, replyTo: params.replyTo },
 					// Awaited sends mark the sender as blocked on an answer so a
 					// busy recipient that cannot reach a step boundary (async
@@ -401,6 +419,10 @@ export async function executeMessageWait(
 ): Promise<AgentToolResult<CoordinationDetails>> {
 	const { registry, senderId, settings } = deps;
 	const from = params.from?.trim() || undefined;
+	// D2: waiting on a remote peer must not route through the local IRC bus.
+	if (registry.get(senderId)?.endpoint.kind === "remote" || (from && registry.get(from)?.endpoint.kind === "remote")) {
+		return hubErrorResult("Remote peer messaging is not implemented (pending #11).", { op: "wait", from: senderId });
+	}
 	const timeoutMs = resolveMessageTimeoutMs(settings, params.timeoutMs);
 	try {
 		const waited = await IrcBus.global().wait(senderId, { from }, timeoutMs, signal, {
@@ -429,8 +451,12 @@ export function executeInbox(
 	senderId: string,
 	peek?: boolean,
 ): AgentToolResult<CoordinationDetails> {
+	// D2: no local mailbox is authoritative for a remote peer.
+	if (registry.get(senderId)?.endpoint.kind === "remote") {
+		return hubErrorResult("Remote peer messaging is not implemented (pending #11).", { op: "inbox", from: senderId });
+	}
 	const busMessages = IrcBus.global().inbox(senderId, { peek });
-	const session = registry.get(senderId)?.session;
+	const session = getLocalSession(registry.get(senderId));
 	const pendingMessages =
 		typeof session?.drainPendingIrcInboxMessages === "function" ? session.drainPendingIrcInboxMessages(senderId) : [];
 	const messages = [...busMessages, ...pendingMessages].sort((a, b) => a.ts - b.ts);
@@ -484,6 +510,8 @@ function peerStatusBadge(status: string, theme: Theme): string {
 			return theme.fg("success", `${theme.status.enabled} idle`);
 		case "parked":
 			return theme.fg("muted", `${theme.status.shadowed} parked`);
+		case "execution-unknown":
+			return theme.fg("warning", "execution-unknown");
 		default:
 			return theme.fg("error", `${theme.status.aborted} ${status}`);
 	}
@@ -758,11 +786,12 @@ function renderListResult(details: Partial<CoordinationDetails>, expanded: boole
 	const rosterCounts = details.counts;
 	if (peers.length === 0) {
 		const meta =
-			rosterCounts && rosterCounts.running + rosterCounts.idle + rosterCounts.parked > 0
+			rosterCounts && rosterCounts.running + rosterCounts.idle + rosterCounts.parked + rosterCounts["execution-unknown"] > 0
 				? [
 						`${rosterCounts.running} running`,
 						`${rosterCounts.idle} idle`,
 						`${rosterCounts.parked} parked`,
+						`${rosterCounts["execution-unknown"]} execution-unknown`,
 						...(rosterCounts.truncated > 0 ? [`${rosterCounts.truncated} truncated`] : []),
 					]
 				: ["no other agents"];
@@ -775,6 +804,7 @@ function renderListResult(details: Partial<CoordinationDetails>, expanded: boole
 				`${rosterCounts.running} running`,
 				`${rosterCounts.idle} idle`,
 				`${rosterCounts.parked} parked`,
+				`${rosterCounts["execution-unknown"]} execution-unknown`,
 				...(rosterCounts.truncated > 0 ? [`${rosterCounts.truncated} truncated`] : []),
 			]
 		: [...counts].map(([status, count]) => `${count} ${status}`);
@@ -788,7 +818,7 @@ function renderListResult(details: Partial<CoordinationDetails>, expanded: boole
 			maxCollapsed: PREVIEW_LIMITS.COLLAPSED_ITEMS,
 			itemType: "peer",
 			renderItem: peer => {
-				const kindText = peer.parentId ? `${peer.kind}${theme.sep.dot}of ${peer.parentId}` : peer.kind;
+				const kindText = `${peer.kind}${theme.sep.dot}${peer.endpointKind}${peer.parentId ? `${theme.sep.dot}of ${peer.parentId}` : ""}`;
 				const unread = peer.unread > 0 ? ` ${formatBadge(`${peer.unread} unread`, "warning", theme)}` : "";
 				const age = messageAge(peer.lastActivity);
 				const activity = peer.activity ? ` ${theme.fg("dim", replaceTabs(peer.activity))}` : "";

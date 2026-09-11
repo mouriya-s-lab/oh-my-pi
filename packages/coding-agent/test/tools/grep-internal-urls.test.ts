@@ -85,8 +85,7 @@ describe("GrepTool internal URL resolution", () => {
 			id: "test-main",
 			displayName: "test",
 			kind: "main",
-			session: null,
-			sessionFile: `${artifactsDir}.jsonl`,
+			endpoint: { kind: "local", session: null, sessionFile: `${artifactsDir}.jsonl` }
 		});
 	});
 

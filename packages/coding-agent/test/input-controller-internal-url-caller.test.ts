@@ -24,8 +24,7 @@ function registerSession(id: string, kind: "main" | "sub", backend: "local" | "o
 		displayName: id,
 		kind,
 		...(kind === "sub" ? { parentId: "controller-main" } : {}),
-		session,
-		sessionFile: null,
+		endpoint: { kind: "local", session: session, sessionFile: null }
 	});
 	return session;
 }

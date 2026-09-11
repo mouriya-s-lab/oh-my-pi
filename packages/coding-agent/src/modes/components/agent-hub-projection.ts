@@ -1,5 +1,6 @@
 import type { AgentMetricsSummary, AgentRef, AgentStatus } from "../../registry/agent-registry";
 import { MAIN_AGENT_ID } from "../../registry/agent-registry";
+import type { AgentSession } from "../../session/agent-session";
 import type { ObservableSession } from "../session-observer-registry";
 
 export type AgentMetrics = AgentMetricsSummary;
@@ -17,7 +18,10 @@ interface AgentTreeProjection {
 	lastSiblingById: Map<string, boolean>;
 }
 
-export const STATUS_ORDER: Record<AgentStatus, number> = { running: 0, idle: 1, parked: 2, aborted: 3 };
+// D2 dependency: unknown execution has its own roster position, not an aborted/live alias.
+export const STATUS_ORDER: Record<AgentStatus, number> = {
+	running: 0, idle: 1, "execution-unknown": 2, parked: 3, aborted: 4,
+};
 
 function finiteMetric(value: number | undefined): number {
 	return typeof value === "number" && Number.isFinite(value) ? value : 0;
@@ -65,7 +69,7 @@ export function progressMetrics(observed: ObservableSession | undefined): AgentM
  * usage embedded in completed `task` tool results, so using it for a parent
  * row would double-count child rows in the aggregate.
  */
-function readSessionMetrics(session: NonNullable<AgentRef["session"]>): AgentMetrics | undefined {
+function readSessionMetrics(session: AgentSession): AgentMetrics | undefined {
 	try {
 		const stats = session.getSessionStats();
 		const messages = session.agent?.state?.messages;
@@ -117,7 +121,7 @@ export function aggregateMetrics(args: {
 	fallbackStatsSession: (
 		ref: AgentRef,
 		observed: ObservableSession | undefined,
-	) => NonNullable<AgentRef["session"]> | undefined;
+	) => AgentSession | undefined;
 	sessionMetrics: WeakMap<object, { metrics: AgentMetrics | undefined }>;
 	refreshFallback: boolean;
 }): { metrics: AggregateMetrics; hasFallbackLiveSessions: boolean } {
@@ -132,7 +136,7 @@ export function aggregateMetrics(args: {
 		activeDurationAgents: 0,
 	};
 	let hasFallbackLiveSessions = false;
-	const countedFallbackSessions = new Set<NonNullable<AgentRef["session"]>>();
+	const countedFallbackSessions = new Set<AgentSession>();
 	for (const ref of args.rows) {
 		const observed = args.observedById.get(ref.id);
 		const fallbackSession = args.fallbackStatsSession(ref, observed);

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import * as path from "node:path";
-import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import { AgentRegistry, getLocalSession, getLocalSessionFile } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { registerPersistedSubagents } from "@oh-my-pi/pi-coding-agent/registry/persisted-agents";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { CURRENT_SESSION_VERSION } from "@oh-my-pi/pi-coding-agent/session/session-entries";
@@ -59,7 +59,7 @@ describe("registerPersistedSubagents mid-spawn stubs", () => {
 
 		const registry = await registerFrom(dir);
 		expect(registry.get("Worker")?.status).toBe("parked");
-		expect(registry.get("Worker")?.sessionFile).toBe(path.join(dir, "main", "Worker.jsonl"));
+		expect(getLocalSessionFile(registry.get("Worker"))).toBe(path.join(dir, "main", "Worker.jsonl"));
 	});
 
 	it("still parks a legacy child that has messages but no session_init", async () => {
@@ -119,8 +119,7 @@ describe("registerPersistedSubagents mid-spawn stubs", () => {
 						displayName: id,
 						kind: "sub",
 						parentId: "main",
-						session: liveSession,
-						sessionFile: childFile,
+						endpoint: { kind: "local", session: liveSession, sessionFile: childFile },
 						status: "running",
 					});
 				});
@@ -131,6 +130,6 @@ describe("registerPersistedSubagents mid-spawn stubs", () => {
 		await registerPersistedSubagents(registry, path.join(dir, "main.jsonl"));
 
 		expect(originalGet("Worker")?.status).toBe("running");
-		expect(originalGet("Worker")?.session).toBe(liveSession);
+		expect(getLocalSession(originalGet("Worker"))).toBe(liveSession);
 	});
 });

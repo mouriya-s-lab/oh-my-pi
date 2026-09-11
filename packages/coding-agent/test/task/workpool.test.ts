@@ -69,7 +69,7 @@ function makeSession(
 		displayName: "Main",
 		kind: "main",
 		status: "idle",
-		session: { emitIrcRelayObservation: (card: CustomMessage) => cards.push(card) } as unknown as AgentSession,
+		endpoint: { kind: "local", session: { emitIrcRelayObservation: (card: CustomMessage) => cards.push(card) } as unknown as AgentSession, sessionFile: null }
 	});
 	return session;
 }
@@ -108,7 +108,7 @@ function markIdle(id: string): void {
 		displayName: id,
 		kind: "sub",
 		status: "idle",
-		session: null,
+		endpoint: { kind: "local", session: null, sessionFile: null }
 	});
 }
 

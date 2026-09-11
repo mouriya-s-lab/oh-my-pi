@@ -1643,7 +1643,9 @@ export class EventController {
 		const component = this.ctx.pendingTools.get(event.toolCallId);
 		if (component) {
 			const asyncState = (event.partialResult.details as { async?: { state?: string } } | undefined)?.async?.state;
-			const isFinalAsyncState = asyncState === "completed" || asyncState === "failed";
+			// D2: transport loss settles the background row without styling it as a failed run.
+			const isFinalAsyncState =
+				asyncState === "completed" || asyncState === "failed" || asyncState === "execution-unknown";
 			// A final async snapshot is terminal only for a parked background
 			// block (the call already returned and was kept alive for its jobs).
 			// While the call is still executing — a mixed blocking+async task

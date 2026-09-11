@@ -42,13 +42,15 @@ export function formatTaskResultSummary(
 	result: SingleResult,
 	options: { totalDurationMs: number; mergeSummary?: string },
 ): string {
-	const status = result.aborted
-		? "cancelled"
-		: result.exitCode === 0 && result.error
-			? "merge failed"
-			: result.exitCode === 0
-				? "completed"
-				: `failed (exit ${result.exitCode})`;
+	const status = result.exitCode === null
+		? "execution-unknown"
+		: result.aborted
+			? "cancelled"
+			: result.exitCode === 0 && result.error
+				? "merge failed"
+				: result.exitCode === 0
+					? "completed"
+					: `failed (exit ${result.exitCode})`;
 	const output = formatResultOutputFallback(result);
 	const outputCharCount = result.outputMeta?.charCount ?? output.length;
 	const truncated = outputCharCount > FULL_OUTPUT_THRESHOLD && result.outputPath !== undefined;

@@ -734,6 +734,11 @@ if "__omp_prelude_loaded__" not in globals():
         status = snapshot.get("status") if isinstance(snapshot, dict) else "failed"
         if status == "running":
             raise TimeoutError(f"{handle.kind} handle {handle.id} is still running")
+        # D2: an unobservable agent run cannot produce a successful handle value.
+        if status == "execution-unknown":
+            raise RuntimeError(
+                snapshot.get("error") or f"{handle.kind} handle {handle.id} execution-unknown"
+            )
         if status in ("failed", "cancelled"):
             message = (
                 snapshot.get("error")

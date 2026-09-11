@@ -10,7 +10,7 @@
  */
 
 import { AgentLifecycleManager } from "../../registry/agent-lifecycle";
-import { AgentRegistry, MAIN_AGENT_ID, type RegistryEvent } from "../../registry/agent-registry";
+import { AgentRegistry, isTerminalAgentStatus, MAIN_AGENT_ID, type RegistryEvent } from "../../registry/agent-registry";
 import type { AgentSession } from "../../session/agent-session";
 import { setTerminalTitleState } from "../../utils/title-generator";
 import type { InteractiveModeContext } from "../types";
@@ -41,7 +41,10 @@ export class SessionFocusController {
 	async focusAgent(id: string): Promise<void> {
 		if (this.ctx.collabGuest) throw new Error("Viewing agents is unavailable in a collab session.");
 		if (id === MAIN_AGENT_ID) return this.unfocus();
-		const session = await this.lifecycle().ensureLive(id);
+		// D2 dependency: only a local live agent can be attached to this session UI.
+		const live = await this.lifecycle().ensureLive(id);
+		if (live.kind !== "local") throw new Error("Remote agent viewing is not implemented (#13).");
+		const session = live.session;
 		if (id === this.#focusedAgentId && session === this.#attachedSession) return;
 		this.#focusedAgentId = id;
 		this.#attachedSession = session;
@@ -79,7 +82,7 @@ export class SessionFocusController {
 	#onRegistryEvent(event: RegistryEvent): void {
 		if (event.ref.id !== this.#focusedAgentId) return;
 		const gone = event.type === "removed";
-		const dead = event.type === "status_changed" && (event.ref.status === "parked" || event.ref.status === "aborted");
+		const dead = event.type === "status_changed" && isTerminalAgentStatus(event.ref.status);
 		if (!gone && !dead) return;
 		void this.unfocus().then(() => {
 			this.ctx.showStatus(`Agent ${event.ref.id} is ${gone ? "gone" : event.ref.status}; returned to main session`);

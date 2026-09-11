@@ -609,7 +609,7 @@ export class CollabGuestLink {
 		session.agent.setDisableReasoning(shouldDisableReasoning(level));
 	}
 
-	/** Diff a host agent snapshot into the local registry (refs keep `session: null`). */
+	/** Diff a host agent snapshot into remote refs without claiming local session ownership. */
 	#applyAgentSnapshots(agents: AgentSnapshot[]): void {
 		const seen = new Set<string>();
 		for (const snap of agents) seen.add(snap.id);
@@ -628,7 +628,8 @@ export class CollabGuestLink {
 					displayName: snap.displayName,
 					kind: snap.kind,
 					parentId: snap.parentId,
-					session: null,
+					// D2 dependency: collab remains the existing transport; no AgentEndpoint adapter is invented.
+					endpoint: { kind: "remote", reference: snap.id, endpoint: null },
 					status: snap.status,
 				});
 			}

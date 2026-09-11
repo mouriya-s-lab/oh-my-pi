@@ -1,7 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import type { IrcMessage } from "@oh-my-pi/pi-coding-agent/irc/bus";
 import { getThemeByName } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
-import { type CoordinationDetails, hubToolRenderer } from "@oh-my-pi/pi-coding-agent/tools/hub";
+import { type CoordinationDetails, hubToolRenderer, type HubRosterCounts } from "@oh-my-pi/pi-coding-agent/tools/hub";
 import { sanitizeText } from "@oh-my-pi/pi-utils";
 
 async function theme() {
@@ -199,6 +199,7 @@ describe("hubToolRenderer list", () => {
 								id: "RateLimiter",
 								displayName: "task",
 								kind: "sub",
+								endpointKind: "local",
 								status: "parked",
 								parentId: "Main",
 								unread: 2,
@@ -208,6 +209,7 @@ describe("hubToolRenderer list", () => {
 								id: "AuthLoader",
 								displayName: "task",
 								kind: "sub",
+								endpointKind: "local",
 								status: "running",
 								parentId: "Main",
 								unread: 0,
@@ -246,6 +248,7 @@ describe("hubToolRenderer list", () => {
 								id: "AuthScout",
 								displayName: "Auth-flow security reviewer",
 								kind: "sub",
+								endpointKind: "local",
 								status: "running",
 								parentId: "Main",
 								unread: 0,
@@ -269,32 +272,32 @@ describe("hubToolRenderer list", () => {
 	it("renders supplied totals on an empty filtered page whenever any roster count is nonzero", async () => {
 		const uiTheme = await theme();
 		const cases: Array<{
-			counts: { running: number; idle: number; parked: number; shown: number; truncated: number };
+			counts: HubRosterCounts;
 			contains: string[];
 			absent?: string[];
 		}> = [
 			{
-				counts: { running: 2, idle: 0, parked: 0, shown: 0, truncated: 0 },
+				counts: { running: 2, idle: 0, parked: 0, "execution-unknown": 0, shown: 0, truncated: 0 },
 				contains: ["2 running", "0 idle", "0 parked"],
 				absent: ["no other agents"],
 			},
 			{
-				counts: { running: 0, idle: 4, parked: 0, shown: 0, truncated: 0 },
+				counts: { running: 0, idle: 4, parked: 0, "execution-unknown": 0, shown: 0, truncated: 0 },
 				contains: ["0 running", "4 idle", "0 parked"],
 				absent: ["no other agents"],
 			},
 			{
-				counts: { running: 0, idle: 0, parked: 3, shown: 0, truncated: 0 },
+				counts: { running: 0, idle: 0, parked: 3, "execution-unknown": 0, shown: 0, truncated: 0 },
 				contains: ["0 running", "0 idle", "3 parked"],
 				absent: ["no other agents"],
 			},
 			{
-				counts: { running: 1, idle: 2, parked: 0, shown: 0, truncated: 3 },
+				counts: { running: 1, idle: 2, parked: 0, "execution-unknown": 0, shown: 0, truncated: 3 },
 				contains: ["1 running", "2 idle", "0 parked", "3 truncated"],
 				absent: ["no other agents"],
 			},
 			{
-				counts: { running: 0, idle: 0, parked: 0, shown: 0, truncated: 0 },
+				counts: { running: 0, idle: 0, parked: 0, "execution-unknown": 0, shown: 0, truncated: 0 },
 				contains: ["no other agents"],
 			},
 		];

@@ -3,7 +3,7 @@ import * as path from "node:path";
 import { getAgentDir, isEnoent } from "@oh-my-pi/pi-utils";
 import { getMemoryRoot } from "../memories";
 import { getMnemopiSessionState, type MnemopiScopedMemoryHit, type MnemopiSessionState } from "../mnemopi/state";
-import { AgentRegistry } from "../registry/agent-registry";
+import { AgentRegistry, getLocalSession } from "../registry/agent-registry";
 import type { AgentSession } from "../session/agent-session";
 import { isMarkdownPath } from "../utils/lang-from-path";
 import { buildDirectoryResource } from "./filesystem-resource";
@@ -33,7 +33,8 @@ export function memoryRootsFromRegistry(): string[] {
 	const agentDir = getAgentDir();
 	const roots: string[] = [];
 	for (const ref of AgentRegistry.global().list()) {
-		const sm = ref.session?.sessionManager;
+		// D2 dependency: memory banks and filesystem roots belong only to local sessions.
+		const sm = getLocalSession(ref)?.sessionManager;
 		if (!sm) continue;
 		const root = getMemoryRoot(agentDir, sm.getCwd());
 		if (root && !roots.includes(root)) roots.push(root);
@@ -228,7 +229,7 @@ function mnemopiSessionStatesFromRegistry(): MnemopiSessionState[] {
 	const seen = new Set<unknown>();
 	const states: MnemopiSessionState[] = [];
 	for (const ref of AgentRegistry.global().list()) {
-		const session = ref.session;
+		const session = getLocalSession(ref);
 		if (!session) continue;
 		const state = getMnemopiSessionState(session);
 		if (!state) continue;
@@ -274,19 +275,19 @@ interface MemoryCallerBinding {
 function findCallerSession(context: ResolveContext): AgentSession | undefined {
 	const refs = (context.agentRegistry ?? AgentRegistry.global()).list();
 	if (context.sessionFile !== undefined) {
-		const byFile = refs.find(ref => ref.session?.sessionFile === context.sessionFile)?.session;
+		const byFile = getLocalSession(refs.find(ref => getLocalSession(ref)?.sessionFile === context.sessionFile));
 		if (byFile) return byFile;
 	}
 	if (context.sessionId !== undefined) {
-		const byId = refs.find(ref => ref.session?.sessionManager.getSessionId() === context.sessionId)?.session;
+		const byId = getLocalSession(refs.find(ref => getLocalSession(ref)?.sessionManager.getSessionId() === context.sessionId));
 		if (byId) return byId;
 	}
 	// An exact identity that matches no live session is a stale caller, never a
 	// cue to fall back to whoever else shares its cwd.
 	if (context.sessionFile !== undefined || context.sessionId !== undefined) return undefined;
 	if (context.cwd === undefined) return undefined;
-	const sameCwd = refs.filter(ref => ref.session?.sessionManager.getCwd() === context.cwd);
-	return sameCwd.length === 1 ? (sameCwd[0]?.session ?? undefined) : undefined;
+	const sameCwd = refs.filter(ref => getLocalSession(ref)?.sessionManager.getCwd() === context.cwd);
+	return sameCwd.length === 1 ? (getLocalSession(sameCwd[0]) ?? undefined) : undefined;
 }
 
 function resolveMemoryCaller(context?: ResolveContext): MemoryCallerBinding {
@@ -410,7 +411,7 @@ export class MemoryProtocolHandler implements ProtocolHandler {
 				(mnemopiStates.length === 0 &&
 					AgentRegistry.global()
 						.list()
-						.some(ref => ref.session?.getHindsightSessionState?.()));
+						.some(ref => getLocalSession(ref)?.getHindsightSessionState?.()));
 			if (hindsightActive) {
 				throw new Error(HINDSIGHT_UNADDRESSABLE);
 			}

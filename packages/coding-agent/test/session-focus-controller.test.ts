@@ -123,7 +123,7 @@ function makeHarness(options: { renderInitialMessages?: () => void | Promise<voi
 }
 
 function registerSub(registry: AgentRegistry, id: string, session: AgentSession, parentId?: string) {
-	return registry.register({ id, displayName: id, kind: "sub", parentId, session, status: "running" });
+	return registry.register({ id, displayName: id, kind: "sub", parentId, endpoint: { kind: "local", session: session, sessionFile: null }, status: "running" });
 }
 
 /** Settle the async unfocus chain (registry event → void unfocus() → #attach). */

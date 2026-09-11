@@ -1,5 +1,7 @@
 import type { ImageContent } from "@oh-my-pi/pi-ai";
 import { logger } from "@oh-my-pi/pi-utils";
+import { AgentRegistry, type AgentStatus } from "../registry/agent-registry";
+import type { AgentEndpoint, AgentEndpointKind, RunOutcome, RunOutcomeStatus } from "../task/endpoint";
 import type { StructuredSubagentOutput } from "../task/types";
 
 const DELIVERY_RETRY_BASE_MS = 500;
@@ -54,10 +56,10 @@ interface PollEscalationState {
 export type AsyncJobType = "bash" | "task" | "eval";
 
 /** Settled job-body payload: delivery text plus its parsed structured output. */
-export interface AsyncJobRunResult {
+export type AsyncJobRunResult = {
 	text: string;
 	structured?: StructuredSubagentOutput;
-}
+} & ({ status?: "completed" } | { status: "execution-unknown" });
 
 /**
  * Job-body failure that still carries the run's structured output, so a
@@ -79,14 +81,23 @@ export interface AsyncJobDetails extends Record<string, unknown> {
 	images?: ImageContent[];
 }
 
+/** D2: endpoint uncertainty is a settled observation, not a cancellation. */
+export type AsyncJobStatus = "running" | RunOutcomeStatus;
+
 export interface AsyncJob {
 	id: string;
 	type: AsyncJobType;
-	status: "running" | "completed" | "failed" | "cancelled";
+	status: AsyncJobStatus;
 	startTime: number;
 	label: string;
 	abortController: AbortController;
 	promise: Promise<void>;
+	/** D2: endpoint jobs retain their run identity for cancellation and reply drain. */
+	endpoint?: AgentEndpoint;
+	endpointKind?: AgentEndpointKind;
+	runId?: string;
+	replyDrainStatus?: "pending" | "drained";
+	exitCode?: number | null;
 	resultText?: string;
 	errorText?: string;
 	/**
@@ -176,7 +187,10 @@ interface AsyncJobDelivery {
 	 * retrying) — without it, a recovered delivery would silently drop
 	 * `structured` even though `text` survives on the delivery itself.
 	 */
-	jobSnapshot?: Pick<AsyncJob, "type" | "status" | "startTime" | "label" | "structured" | "agentId" | "latestDetails">;
+	jobSnapshot?: Pick<
+		AsyncJob,
+		"type" | "status" | "startTime" | "label" | "structured" | "agentId" | "latestDetails" | "endpointKind" | "exitCode"
+	>;
 }
 
 export interface AsyncJobDeliveryState {
@@ -244,6 +258,7 @@ export class AsyncJobManager {
 	readonly #retentionMs: number;
 	readonly #retainedArtifactsCleanupGraceMs: number;
 	readonly #retainedArtifactsCleanupMaxWaitMs: number;
+	readonly #replyDrainAbort = new AbortController();
 	#deliveryLoop: Promise<void> | undefined;
 	#deliveryQueueChanged = Promise.withResolvers<void>();
 	#disposed = false;
@@ -354,12 +369,14 @@ export class AsyncJobManager {
 				const text = typeof outcome === "string" ? outcome : outcome.text;
 				const structured = typeof outcome === "string" ? undefined : outcome.structured;
 				if (structured) job.structured = structured;
-				if (job.status === "cancelled") {
+				if (job.status === "cancelled" && (typeof outcome === "string" || outcome.status !== "execution-unknown")) {
 					job.resultText = text;
 					this.#scheduleEviction(id);
 					return;
 				}
-				job.status = "completed";
+				// D2: explicit unknown outcomes bypass the ordinary exception-to-failure path.
+				job.status = typeof outcome === "string" ? "completed" : outcome.status ?? "completed";
+				if (job.status === "execution-unknown") job.exitCode = null;
 				job.resultText = text;
 				this.#enqueueDelivery(id, text);
 				this.#scheduleEviction(id);
@@ -382,6 +399,115 @@ export class AsyncJobManager {
 		return id;
 	}
 
+	/** D2: observe an already-started endpoint without constructing a local session. */
+	registerEndpoint(endpoint: AgentEndpoint, runId: string, options?: AsyncJobRegisterOptions): AsyncJob {
+		if (this.#disposed) throw new Error("Async job manager is disposed");
+		if (this.atCapacity) {
+			throw new Error(
+				`Background job limit reached (${this.#maxRunningJobs}). Wait for running jobs to finish or cancel one.`,
+			);
+		}
+		const id = this.#resolveJobId(options?.id);
+		this.#suppressedDeliveries.delete(id);
+		this.#consumedJobResults.delete(id);
+		const registry = AgentRegistry.global();
+		const ref = options?.agentId ? registry.get(options.agentId) : undefined;
+		if (ref) {
+			const registered = ref.endpoint;
+			const matches = registered.kind === "remote"
+				? endpoint.handle.kind === "remote" &&
+					registered.reference === endpoint.handle.reference &&
+					(registered.endpoint === null || registered.endpoint === endpoint)
+				: endpoint.handle.kind === "local" && registered.session === endpoint.handle.session;
+			if (!matches) throw new Error(`Endpoint does not match registered agent ${ref.id}`);
+		}
+		const job: AsyncJob = {
+			id,
+			type: "task",
+			status: "running",
+			startTime: Date.now(),
+			label: options?.agentId ?? runId,
+			abortController: new AbortController(),
+			promise: Promise.resolve(),
+			ownerId: options?.ownerId,
+			agentId: options?.agentId,
+			endpoint,
+			endpointKind: endpoint.handle.kind,
+			runId,
+			replyDrainStatus: endpoint.handle.kind === "remote" ? "pending" : undefined,
+			exitCode: null,
+		};
+		this.#jobs.set(id, job);
+		if (ref) registry.setStatus(ref.id, "running", ref);
+		job.promise = (async () => {
+			let outcome: RunOutcome;
+			try {
+				outcome = await endpoint.run(runId, job.abortController.signal);
+			} catch (error) {
+				// D2: losing a remote observer cannot prove the remote execution failed.
+				outcome = {
+					runId,
+					status: endpoint.handle.kind === "remote" ? "execution-unknown" : "failed",
+					error: error instanceof Error ? error.message : String(error),
+				};
+			}
+			job.status = outcome.status;
+			job.resultText = outcome.text;
+			job.errorText = outcome.error;
+			job.structured = outcome.structured;
+			let agentStatus: AgentStatus;
+			switch (outcome.status) {
+				case "completed":
+					job.exitCode = 0;
+					agentStatus = "idle";
+					break;
+				case "failed":
+					job.exitCode = 1;
+					// D2: a failed run leaves its peer resumable, matching lifecycle semantics.
+					agentStatus = "idle";
+					break;
+				case "cancelled":
+					job.exitCode = null;
+					agentStatus = "aborted";
+					break;
+				case "execution-unknown":
+					job.exitCode = null;
+					agentStatus = "execution-unknown";
+					break;
+			}
+			// D2: delivery observers must see the outcome in both production surfaces.
+			if (ref) registry.setStatus(ref.id, agentStatus, ref);
+			this.#enqueueDelivery(id, outcome.text ?? outcome.error ?? outcome.status);
+			if (job.replyDrainStatus === "pending") {
+				// D2: retention cannot erase an outstanding remote reply obligation.
+				void endpoint.waitReplyDrained(runId, { signal: this.#replyDrainAbort.signal }).then(
+					result => {
+						if (result.status !== "drained" || this.#jobs.get(id) !== job) return;
+						job.replyDrainStatus = "drained";
+						this.#scheduleEviction(id);
+					},
+					error => {
+						logger.warn("Endpoint reply drain failed", { jobId: id, error: String(error) });
+					},
+				);
+			} else {
+				this.#scheduleEviction(id);
+			}
+		})();
+		return job;
+	}
+
+	#cancelEndpointJob(job: AsyncJob, reason?: unknown): void {
+		const endpoint = job.endpoint;
+		const runId = job.runId;
+		if (!endpoint || runId === undefined) return;
+		// D2: only the endpoint outcome can confirm cancellation; never overwrite unknown.
+		void endpoint.cancelRun(runId).catch(error => {
+			logger.warn("Endpoint cancellation failed", { jobId: job.id, error: String(error) });
+		});
+		job.abortController.abort(reason);
+	}
+
 	/**
 	 * Cancel a single job by id. When `filter.ownerId` is set and does not
 	 * match the job's owner, the call is treated as not-found (returns false)
@@ -392,6 +518,10 @@ export class AsyncJobManager {
 		if (!job) return false;
 		if (filter?.ownerId && job.ownerId !== filter.ownerId) return false;
 		if (job.status !== "running") return false;
+		if (job.endpoint) {
+			this.#cancelEndpointJob(job);
+			return true;
+		}
 		job.status = "cancelled";
 		job.abortController.abort();
 		this.#scheduleEviction(id);
@@ -533,12 +663,12 @@ export class AsyncJobManager {
 			if (!jobId) continue;
 			if (!this.#suppressedDeliveries.delete(jobId)) continue;
 			const job = this.#jobs.get(jobId);
-			if (!job || (job.status !== "completed" && job.status !== "failed")) continue;
+			if (!job || job.status === "running" || (job.status === "cancelled" && !job.endpoint)) continue;
 			const queued =
 				this.#deliveries.some(delivery => delivery.jobId === jobId) ||
 				this.#inFlightDeliveries.some(delivery => delivery.jobId === jobId);
 			if (queued) continue;
-			this.#enqueueDelivery(jobId, job.status === "completed" ? (job.resultText ?? "") : (job.errorText ?? ""));
+			this.#enqueueDelivery(jobId, job.resultText ?? job.errorText ?? job.status);
 		}
 	}
 
@@ -558,6 +688,10 @@ export class AsyncJobManager {
 
 	#cancelJobs(filter?: AsyncJobFilter, reason?: unknown): void {
 		for (const job of this.getRunningJobs(filter)) {
+			if (job.endpoint) {
+				this.#cancelEndpointJob(job, reason);
+				continue;
+			}
 			job.status = "cancelled";
 			job.abortController.abort(reason);
 			this.#scheduleEviction(job.id);
@@ -577,7 +711,7 @@ export class AsyncJobManager {
 	evictCompletedJobs(filter?: AsyncJobFilter): number {
 		let evicted = 0;
 		for (const job of this.#filterJobs(this.#jobs.values(), filter)) {
-			if (job.status !== "completed" && job.status !== "failed") continue;
+			if (job.status === "running" || job.status === "cancelled") continue;
 			this.acknowledgeDeliveries([job.id]);
 			if (this.#evictJob(job.id)) evicted += 1;
 		}
@@ -634,6 +768,44 @@ export class AsyncJobManager {
 				deadline,
 			);
 			if (!settled) return false;
+		}
+	}
+
+	/** D2: owner quiescence also requires remote terminal-plus-reply-drained acknowledgement. */
+	async waitForOwnerJobsAndReplies(
+		ownerId: string,
+		signal?: AbortSignal,
+	): Promise<{ status: "drained" | "aborted" }> {
+		const waitSignal = signal
+			? AbortSignal.any([signal, this.#replyDrainAbort.signal])
+			: this.#replyDrainAbort.signal;
+		if (waitSignal.aborted) return { status: "aborted" };
+		const aborted = Promise.withResolvers<"aborted">();
+		const onAbort = () => aborted.resolve("aborted");
+		waitSignal.addEventListener("abort", onAbort, { once: true });
+		const awaited = new Set<AsyncJob>();
+		try {
+			for (;;) {
+				if (waitSignal.aborted) return { status: "aborted" };
+				const jobs = this.getAllJobs({ ownerId }).filter(job => !awaited.has(job));
+				if (jobs.length === 0) return { status: "drained" };
+				for (const job of jobs) awaited.add(job);
+				const settled = await Promise.race([
+					Promise.all(jobs.map(job => job.promise)).then(() => "settled" as const),
+					aborted.promise,
+				]);
+				if (settled === "aborted") return { status: "aborted" };
+				for (const job of jobs) {
+					if (job.endpoint?.handle.kind !== "remote" || job.runId === undefined) continue;
+					const result = await Promise.race([
+						job.endpoint.waitReplyDrained(job.runId, { signal: waitSignal }),
+						aborted.promise.then(() => ({ status: "aborted" as const })),
+					]);
+					if (result.status === "aborted") return result;
+				}
+			}
+		} finally {
+			waitSignal.removeEventListener("abort", onAbort);
 		}
 	}
 
@@ -724,6 +896,7 @@ export class AsyncJobManager {
 
 	async dispose(options?: { timeoutMs?: number }): Promise<boolean> {
 		this.#disposed = true;
+		this.#replyDrainAbort.abort(ASYNC_JOB_MANAGER_SHUTDOWN_REASON);
 		this.#clearEvictionTimers();
 		this.#cancelJobs(undefined, ASYNC_JOB_MANAGER_SHUTDOWN_REASON);
 		const timeoutMs = Math.max(options?.timeoutMs ?? 3_000, 0);
@@ -876,6 +1049,8 @@ export class AsyncJobManager {
 	}
 
 	#evictJob(jobId: string): boolean {
+		// D2: even explicit reaping must retain the sole handle to pending remote replies.
+		if (this.#jobs.get(jobId)?.replyDrainStatus === "pending" && !this.#disposed) return false;
 		clearTimeout(this.#evictionTimers.get(jobId));
 		this.#evictionTimers.delete(jobId);
 		this.#suppressedDeliveries.delete(jobId);
@@ -985,6 +1160,8 @@ export class AsyncJobManager {
 						structured: job.structured,
 						agentId: job.agentId,
 						latestDetails: job.latestDetails,
+						endpointKind: job.endpointKind,
+						exitCode: job.exitCode,
 					}
 				: undefined,
 		});
@@ -1115,6 +1292,8 @@ export class AsyncJobManager {
 			structured: snapshot.structured,
 			agentId: snapshot.agentId,
 			latestDetails: snapshot.latestDetails,
+			endpointKind: snapshot.endpointKind,
+			exitCode: snapshot.exitCode,
 		};
 	}
 

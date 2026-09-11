@@ -144,8 +144,7 @@ function makeViewer(file: string, remote?: AgentHubRemote, ui?: TUI) {
 		displayName: "advisor",
 		kind: "advisor",
 		parentId: "Main",
-		session: null,
-		sessionFile: remote ? undefined : file,
+		endpoint: { kind: "local", session: null, sessionFile: remote ? null : file },
 		status: "parked",
 	});
 	return new AgentTranscriptViewer({

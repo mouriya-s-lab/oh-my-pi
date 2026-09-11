@@ -89,7 +89,10 @@ const hubSchema = type({
 	"ids?": type("string[]").describe("wait: job ids to watch (omit = all running jobs); cancel: job ids to kill"),
 	"timeoutMs?": type("number").describe("wait (messages/jobs): timeout in milliseconds (0 waits indefinitely)"),
 	"peek?": type("boolean").describe("inbox: list messages without consuming them"),
-	"status?": type("'running' | 'idle' | 'parked'").describe("list: filter by status; omit for running+idle"),
+	// D2: uncertainty remains independently queryable, never relabeled running or parked.
+	"status?": type("'running' | 'idle' | 'parked' | 'execution-unknown'").describe(
+		"list: filter by status; omit for running+idle+execution-unknown",
+	),
 	"limit?": type("number > 0").describe(
 		`list: max peer rows; default ${DEFAULT_HUB_LIST_LIMIT}, max ${MAX_HUB_LIST_LIMIT}`,
 	),
@@ -373,6 +376,10 @@ export class HubTool implements AgentTool<typeof hubSchema, HubDetails> {
 		const manager = this.session.asyncJobManager;
 		const ownerId = this.#ownerId();
 		const from = params.from?.trim() || undefined;
+		// D2: remote messaging awaits #11 even when this wait also watches local jobs.
+		if (messaging && from && messaging.registry.get(from)?.endpoint.kind === "remote") {
+			return hubErrorResult("Remote peer messaging is not implemented (pending #11).", { op: "wait", from });
+		}
 
 		// A message already buffered on the session satisfies the wait first.
 		if (messaging) {

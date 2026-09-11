@@ -22,13 +22,13 @@ describe("advisor registry visibility", () => {
 
 	it("excludes advisor refs from listVisibleTo", () => {
 		const registry = AgentRegistry.global();
-		registry.register({ id: "Main", displayName: "Main", kind: "main", session: null, status: "running" });
-		registry.register({ id: "Worker", displayName: "Worker", kind: "sub", session: null, status: "idle" });
+		registry.register({ id: "Main", displayName: "Main", kind: "main", endpoint: { kind: "local", session: null, sessionFile: null }, status: "running" });
+		registry.register({ id: "Worker", displayName: "Worker", kind: "sub", endpoint: { kind: "local", session: null, sessionFile: null }, status: "idle" });
 		registry.register({
 			id: "Main/advisor",
 			displayName: "advisor",
 			kind: "advisor",
-			session: null,
+			endpoint: { kind: "local", session: null, sessionFile: null },
 			status: "idle",
 		});
 
@@ -43,8 +43,7 @@ describe("advisor registry visibility", () => {
 			id: "Main/advisor",
 			displayName: "advisor",
 			kind: "advisor",
-			session: null,
-			sessionFile: "/tmp/x/__advisor.jsonl",
+			endpoint: { kind: "local", session: null, sessionFile: "/tmp/x/__advisor.jsonl" },
 			status: "parked",
 		});
 		const bus = new IrcBus(registry);

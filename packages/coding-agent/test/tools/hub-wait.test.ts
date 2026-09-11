@@ -50,8 +50,8 @@ describe("hub unified wait", () => {
 
 	test("an incoming message settles the wait while watched jobs keep running", async () => {
 		const registry = AgentRegistry.global();
-		registry.register({ id: SELF_ID, displayName: "main", kind: "main", session: null });
-		registry.register({ id: "Peer", displayName: "task", kind: "sub", parentId: SELF_ID, session: null });
+		registry.register({ id: SELF_ID, displayName: "main", kind: "main", endpoint: { kind: "local", session: null, sessionFile: null }});
+		registry.register({ id: "Peer", displayName: "task", kind: "sub", parentId: SELF_ID, endpoint: { kind: "local", session: null, sessionFile: null }});
 
 		const manager = new AsyncJobManager({ onJobComplete: () => {} });
 		const job = registerHangingJob(manager, "sleep forever");
@@ -76,8 +76,8 @@ describe("hub unified wait", () => {
 
 	test("a settling job returns the snapshot exactly like the old poll", async () => {
 		const registry = AgentRegistry.global();
-		registry.register({ id: SELF_ID, displayName: "main", kind: "main", session: null });
-		registry.register({ id: "Peer", displayName: "task", kind: "sub", parentId: SELF_ID, session: null });
+		registry.register({ id: SELF_ID, displayName: "main", kind: "main", endpoint: { kind: "local", session: null, sessionFile: null }});
+		registry.register({ id: "Peer", displayName: "task", kind: "sub", parentId: SELF_ID, endpoint: { kind: "local", session: null, sessionFile: null }});
 
 		const manager = new AsyncJobManager({ onJobComplete: () => {} });
 		const job = registerHangingJob(manager, "quick job");
@@ -97,8 +97,8 @@ describe("hub unified wait", () => {
 
 	test("bare wait with no jobs and no running peers returns immediately", async () => {
 		const registry = AgentRegistry.global();
-		registry.register({ id: SELF_ID, displayName: "main", kind: "main", session: null });
-		registry.register({ id: "Sleeper", displayName: "task", kind: "sub", session: null, status: "idle" });
+		registry.register({ id: SELF_ID, displayName: "main", kind: "main", endpoint: { kind: "local", session: null, sessionFile: null }});
+		registry.register({ id: "Sleeper", displayName: "task", kind: "sub", endpoint: { kind: "local", session: null, sessionFile: null }, status: "idle" });
 
 		const manager = new AsyncJobManager({ onJobComplete: () => {} });
 		const tool = new HubTool(makeSession(manager));
@@ -112,13 +112,13 @@ describe("hub unified wait", () => {
 
 	test("bare wait ignores a detached ref whose running status is stale", async () => {
 		const registry = AgentRegistry.global();
-		registry.register({ id: SELF_ID, displayName: "main", kind: "main", session: null });
+		registry.register({ id: SELF_ID, displayName: "main", kind: "main", endpoint: { kind: "local", session: null, sessionFile: null }});
 		registry.register({
 			id: "Zombie",
 			displayName: "stale task",
 			kind: "sub",
 			parentId: SELF_ID,
-			session: null,
+			endpoint: { kind: "local", session: null, sessionFile: null },
 			status: "running",
 		});
 
@@ -143,13 +143,13 @@ describe("hub unified wait", () => {
 			id: SELF_ID,
 			displayName: "main",
 			kind: "main",
-			session: {
+			endpoint: { kind: "local", session: {
 				deliverIrcMessage: () => Promise.reject(new Error("session disposed")),
-			},
+			}, sessionFile: null }
 		} as unknown as Parameters<AgentRegistry["register"]>[0]);
 		// Idle peer: nothing is running, so the liveness gate would otherwise
 		// short-circuit the wait before the mailbox is ever consulted.
-		registry.register({ id: "Peer", displayName: "task", kind: "sub", session: null, status: "idle" });
+		registry.register({ id: "Peer", displayName: "task", kind: "sub", endpoint: { kind: "local", session: null, sessionFile: null }, status: "idle" });
 
 		const firstReceipt = await IrcBus.global().send({ from: "Peer", to: SELF_ID, body: "picked up the lock" });
 		const secondReceipt = await IrcBus.global().send({ from: "Peer", to: SELF_ID, body: "starting the edit" });

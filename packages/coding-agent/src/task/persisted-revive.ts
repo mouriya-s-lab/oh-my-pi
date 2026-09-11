@@ -7,7 +7,7 @@ import type { Settings } from "../config/settings";
 import { MCPManager } from "../mcp/manager";
 import { initializeExtensions } from "../modes/runtime-init";
 import type { PersistedSubagentReviverFactory } from "../registry/agent-lifecycle";
-import { AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
+import { AgentRegistry, getLocalSessionFile, MAIN_AGENT_ID } from "../registry/agent-registry";
 import { createAgentSession } from "../sdk";
 import type { AgentSession } from "../session/agent-session";
 import type { AuthStorage } from "../session/auth-storage";
@@ -60,7 +60,8 @@ export function createPersistedSubagentReviverFactory(
 ): PersistedSubagentReviverFactory {
 	const registry = AgentRegistry.global();
 	return async ref => {
-		const sessionFile = ref.sessionFile;
+		// D2 dependency: remote disk references/revival remain blocked on #14.
+		const sessionFile = getLocalSessionFile(ref);
 		if (!sessionFile) return undefined;
 		const peek = await SessionManager.peekSessionInit(sessionFile);
 		// No persisted contract (pre-session_init file) or the recorded workspace

@@ -58,6 +58,8 @@ const completedHubWait = {
 				id: "Sleeper1",
 				type: "task",
 				status: "completed",
+				endpointKind: "local",
+				exitCode: 0,
 				label: "Sleeper1",
 				durationMs: 11_300,
 			},
@@ -266,7 +268,7 @@ function createFixture(main = makeSession([danglingHubWait], true)) {
 		displayName: "Worker",
 		kind: "sub",
 		parentId: MAIN_AGENT_ID,
-		session: worker.session,
+		endpoint: { kind: "local", session: worker.session, sessionFile: null },
 		status: "running",
 	});
 	const lifecycle = new AgentLifecycleManager(registry);

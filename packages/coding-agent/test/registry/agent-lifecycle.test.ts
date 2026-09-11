@@ -1,8 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fsp from "node:fs/promises";
 import * as path from "node:path";
-import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
-import { AgentRegistry, MAIN_AGENT_ID } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import { AgentLifecycleManager, type LiveAgent } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
+import { AgentRegistry, getLocalSession, getLocalSessionFile, MAIN_AGENT_ID } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { registerPersistedSubagents } from "@oh-my-pi/pi-coding-agent/registry/persisted-agents";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { TempDir } from "@oh-my-pi/pi-utils";
@@ -32,6 +32,12 @@ function deferred(): { promise: Promise<void>; resolve: () => void } {
 	return { promise, resolve };
 }
 
+/** D2: `ensureLive` hands back a tagged agent; these tests drive local endpoints only. */
+function localSession(live: LiveAgent): AgentSession {
+	if (live.kind !== "local") throw new Error("expected a local live agent");
+	return live.session;
+}
+
 /** Settle the async park chain (timer callback → park() → dispose → setStatus). */
 async function flushAsync(): Promise<void> {
 	for (let i = 0; i < 5; i++) await Promise.resolve();
@@ -57,7 +63,7 @@ describe("AgentLifecycleManager", () => {
 	});
 
 	function registerIdleSub(id: string, session: AgentSession | null, sessionFile: string | null = `/tmp/${id}.jsonl`) {
-		return registry.register({ id, displayName: "task", kind: "sub", session, sessionFile, status: "idle" });
+		return registry.register({ id, displayName: "task", kind: "sub", endpoint: { kind: "local", session: session, sessionFile: sessionFile }, status: "idle" });
 	}
 
 	it("registerIfAvailable never replaces a collision and reuses only the exact expected ref", () => {
@@ -67,7 +73,7 @@ describe("AgentLifecycleManager", () => {
 			id: "generation-Sub",
 			displayName: "replacement",
 			kind: "sub" as const,
-			session: null,
+			endpoint: { kind: "local" as const, session: null, sessionFile: null },
 			status: "running" as const,
 		};
 
@@ -81,7 +87,7 @@ describe("AgentLifecycleManager", () => {
 		const staleSession = makeSessionStub().session;
 		expect(registry.attachSession("generation-Sub", staleSession, undefined, parked)).toBe(false);
 		expect(registry.setStatus("generation-Sub", "idle", parked)).toBe(false);
-		expect(registry.get("generation-Sub")).toMatchObject({ status: "aborted", session: null });
+		expect(registry.get("generation-Sub")).toMatchObject({ status: "aborted", endpoint: { kind: "local", session: null } });
 
 		registry.unregister("generation-Sub", parked);
 		expect(registry.registerIfAvailable(next, parked)).toBeUndefined();
@@ -100,8 +106,8 @@ describe("AgentLifecycleManager", () => {
 		const ref = registry.get("1-Sub");
 		expect(stub.disposeCalls()).toBe(1);
 		expect(ref?.status).toBe("parked");
-		expect(ref?.session).toBeNull();
-		expect(ref?.sessionFile).toBe("/tmp/1-Sub.jsonl");
+		expect(getLocalSession(ref)).toBeNull();
+		expect(getLocalSessionFile(ref)).toBe("/tmp/1-Sub.jsonl");
 		expect(lifecycle.has("1-Sub")).toBe(true);
 	});
 
@@ -115,7 +121,7 @@ describe("AgentLifecycleManager", () => {
 		vi.advanceTimersByTime(TTL * 10);
 		await flushAsync();
 		expect(registry.get("2-Sub")?.status).toBe("running");
-		expect(registry.get("2-Sub")?.session).toBe(stub.session);
+		expect(getLocalSession(registry.get("2-Sub"))).toBe(stub.session);
 		expect(stub.disposeCalls()).toBe(0);
 
 		registry.setStatus("2-Sub", "idle");
@@ -131,19 +137,18 @@ describe("AgentLifecycleManager", () => {
 			id: "3-Sub",
 			displayName: "task",
 			kind: "sub",
-			session: null,
-			sessionFile: "/tmp/3-Sub.jsonl",
+			endpoint: { kind: "local", session: null, sessionFile: "/tmp/3-Sub.jsonl" },
 			status: "parked",
 		});
 		lifecycle.adopt("3-Sub", { idleTtlMs: 0, revive: async () => revived.session });
 
-		const session = await lifecycle.ensureLive("3-Sub");
+		const session = localSession(await lifecycle.ensureLive("3-Sub"));
 
 		expect(session).toBe(revived.session);
 		const ref = registry.get("3-Sub");
 		expect(ref?.status).toBe("idle");
-		expect(ref?.session).toBe(revived.session);
-		expect(ref?.sessionFile).toBe("/tmp/3-Sub.jsonl");
+		expect(getLocalSession(ref)).toBe(revived.session);
+		expect(getLocalSessionFile(ref)).toBe("/tmp/3-Sub.jsonl");
 	});
 
 	it("reclaimDeadCorpse frees a parked, session-less, unadopted id and refuses live/adopted refs (#8490)", async () => {
@@ -154,8 +159,7 @@ describe("AgentLifecycleManager", () => {
 			id: "Corpse-Sub",
 			displayName: "task",
 			kind: "sub",
-			session: null,
-			sessionFile: "/tmp/Corpse-Sub.jsonl",
+			endpoint: { kind: "local", session: null, sessionFile: "/tmp/Corpse-Sub.jsonl" },
 			status: "running",
 		});
 		registry.setStatus("Corpse-Sub", "parked", corpse);
@@ -167,19 +171,18 @@ describe("AgentLifecycleManager", () => {
 			id: "Live-Sub",
 			displayName: "task",
 			kind: "sub",
-			session: live.session,
+			endpoint: { kind: "local", session: live.session, sessionFile: null },
 			status: "running",
 		});
 		expect(await lifecycle.reclaimDeadCorpse("Live-Sub", registry.get("Live-Sub")!)).toBe(false);
-		expect(registry.get("Live-Sub")?.session).toBe(live.session);
+		expect(getLocalSession(registry.get("Live-Sub"))).toBe(live.session);
 
 		// An adopted (revivable) parked agent is never reclaimed.
 		const adopted = registry.register({
 			id: "Adopted-Sub",
 			displayName: "task",
 			kind: "sub",
-			session: null,
-			sessionFile: "/tmp/Adopted-Sub.jsonl",
+			endpoint: { kind: "local", session: null, sessionFile: "/tmp/Adopted-Sub.jsonl" },
 			status: "parked",
 		});
 		lifecycle.adopt("Adopted-Sub", { idleTtlMs: 0, revive: async () => makeSessionStub().session }, adopted);
@@ -193,7 +196,7 @@ describe("AgentLifecycleManager", () => {
 		expect(await lifecycle.reclaimDeadCorpse("Corpse-Sub", corpse)).toBe(true);
 		expect(registry.get("Corpse-Sub")).toBeUndefined();
 		const respawn = registry.registerIfAvailable(
-			{ id: "Corpse-Sub", displayName: "task", kind: "sub", session: null, status: "running" },
+			{ id: "Corpse-Sub", displayName: "task", kind: "sub", endpoint: { kind: "local", session: null, sessionFile: null }, status: "running" },
 			null,
 		);
 		expect(respawn?.status).toBe("running");
@@ -206,8 +209,7 @@ describe("AgentLifecycleManager", () => {
 			id: "Cold-Sub",
 			displayName: "task",
 			kind: "sub",
-			session: null,
-			sessionFile: "/tmp/Cold-Sub.jsonl",
+			endpoint: { kind: "local", session: null, sessionFile: "/tmp/Cold-Sub.jsonl" },
 			status: "parked",
 		});
 		let factoryCalls = 0;
@@ -222,8 +224,8 @@ describe("AgentLifecycleManager", () => {
 		expect(factoryCalls).toBe(1);
 
 		// The preserved ref remains messageable through the normal cold-revive path.
-		expect(await lifecycle.ensureLive("Cold-Sub")).toBe(revived.session);
-		expect(registry.get("Cold-Sub")?.session).toBe(revived.session);
+		expect(localSession(await lifecycle.ensureLive("Cold-Sub"))).toBe(revived.session);
+		expect(getLocalSession(registry.get("Cold-Sub"))).toBe(revived.session);
 	});
 
 	it("concurrent ensureLive calls during a slow revive coalesce into one reviver run", async () => {
@@ -234,8 +236,7 @@ describe("AgentLifecycleManager", () => {
 			id: "4-Sub",
 			displayName: "task",
 			kind: "sub",
-			session: null,
-			sessionFile: "/tmp/4-Sub.jsonl",
+			endpoint: { kind: "local", session: null, sessionFile: "/tmp/4-Sub.jsonl" },
 			status: "parked",
 		});
 		lifecycle.adopt("4-Sub", {
@@ -253,8 +254,8 @@ describe("AgentLifecycleManager", () => {
 		const [a, b] = await Promise.all([first, second]);
 
 		expect(reviverRuns).toBe(1);
-		expect(a).toBe(revived.session);
-		expect(b).toBe(revived.session);
+		expect(localSession(a)).toBe(revived.session);
+		expect(localSession(b)).toBe(revived.session);
 	});
 
 	it("tombstoning a parked agent during revive prevents the stale session from attaching", async () => {
@@ -264,8 +265,7 @@ describe("AgentLifecycleManager", () => {
 			id: "Revive-Killed",
 			displayName: "task",
 			kind: "sub",
-			session: null,
-			sessionFile: "/tmp/Revive-Killed.jsonl",
+			endpoint: { kind: "local", session: null, sessionFile: "/tmp/Revive-Killed.jsonl" },
 			status: "parked",
 		});
 		lifecycle.adopt(
@@ -282,12 +282,12 @@ describe("AgentLifecycleManager", () => {
 
 		const revival = lifecycle.ensureLive("Revive-Killed");
 		expect(await lifecycle.release("Revive-Killed", ref, { tombstone: true })).toBe(true);
-		expect(registry.get("Revive-Killed")).toMatchObject({ status: "aborted", session: null });
+		expect(registry.get("Revive-Killed")).toMatchObject({ status: "aborted", endpoint: { kind: "local", session: null } });
 
 		gate.resolve();
 		await expect(revival).rejects.toThrow(/became terminal/);
 		expect(revived.disposeCalls()).toBe(1);
-		expect(registry.get("Revive-Killed")).toMatchObject({ status: "aborted", session: null });
+		expect(registry.get("Revive-Killed")).toMatchObject({ status: "aborted", endpoint: { kind: "local", session: null } });
 	});
 
 	it("ensureLive on an unknown id throws and points at history://", async () => {
@@ -295,7 +295,7 @@ describe("AgentLifecycleManager", () => {
 	});
 
 	it("ensureLive on a parked agent without a reviver throws as not revivable", async () => {
-		registry.register({ id: "5-Sub", displayName: "task", kind: "sub", session: null, status: "parked" });
+		registry.register({ id: "5-Sub", displayName: "task", kind: "sub", endpoint: { kind: "local", session: null, sessionFile: null }, status: "parked" });
 		lifecycle.adopt("5-Sub", { idleTtlMs: 0 });
 
 		await expect(lifecycle.ensureLive("5-Sub")).rejects.toThrow(/cannot be revived.*no reviver registered/);
@@ -309,8 +309,7 @@ describe("AgentLifecycleManager", () => {
 			id: "6-Sub",
 			displayName: "task",
 			kind: "sub",
-			session: null,
-			sessionFile: "/tmp/6-Sub.jsonl",
+			endpoint: { kind: "local", session: null, sessionFile: "/tmp/6-Sub.jsonl" },
 			status: "parked",
 		});
 		let factoryCalls = 0;
@@ -319,12 +318,12 @@ describe("AgentLifecycleManager", () => {
 			return async () => revived.session;
 		}, TTL);
 
-		const session = await lifecycle.ensureLive("6-Sub");
+		const session = localSession(await lifecycle.ensureLive("6-Sub"));
 
 		expect(factoryCalls).toBe(1);
 		expect(session).toBe(revived.session);
 		expect(registry.get("6-Sub")?.status).toBe("idle");
-		expect(registry.get("6-Sub")?.session).toBe(revived.session);
+		expect(getLocalSession(registry.get("6-Sub"))).toBe(revived.session);
 
 		// Adopted on demand with the configured TTL: it re-parks like any idle subagent.
 		vi.advanceTimersByTime(TTL);
@@ -338,8 +337,7 @@ describe("AgentLifecycleManager", () => {
 			id: "7-Sub",
 			displayName: "task",
 			kind: "sub",
-			session: null,
-			sessionFile: "/tmp/7-Sub.jsonl",
+			endpoint: { kind: "local", session: null, sessionFile: "/tmp/7-Sub.jsonl" },
 			status: "parked",
 		});
 		lifecycle.setPersistedSubagentReviverFactory(async () => undefined, TTL);
@@ -353,8 +351,7 @@ describe("AgentLifecycleManager", () => {
 			id: "8-Sub",
 			displayName: "task",
 			kind: "sub",
-			session: null,
-			sessionFile: "/tmp/8-Sub.jsonl",
+			endpoint: { kind: "local", session: null, sessionFile: "/tmp/8-Sub.jsonl" },
 			status: "parked",
 		});
 		let factoryCalls = 0;
@@ -370,7 +367,7 @@ describe("AgentLifecycleManager", () => {
 		await expect(lifecycle.ensureLive("8-Sub")).rejects.toThrow(/stale context/);
 		expect(registry.get("8-Sub")?.status).toBe("parked");
 
-		const session = await lifecycle.ensureLive("8-Sub");
+		const session = localSession(await lifecycle.ensureLive("8-Sub"));
 		expect(factoryCalls).toBe(2);
 		expect(session).toBe(revived.session);
 		expect(registry.get("8-Sub")?.status).toBe("idle");
@@ -445,7 +442,7 @@ describe("AgentLifecycleManager", () => {
 			id: MAIN_AGENT_ID,
 			displayName: "main",
 			kind: "main",
-			session: stub.session,
+			endpoint: { kind: "local", session: stub.session, sessionFile: null },
 			status: "idle",
 		});
 		lifecycle.adopt(MAIN_AGENT_ID, { idleTtlMs: TTL });
@@ -454,7 +451,7 @@ describe("AgentLifecycleManager", () => {
 		vi.advanceTimersByTime(TTL * 10);
 		await flushAsync();
 		expect(registry.get(MAIN_AGENT_ID)?.status).toBe("idle");
-		expect(registry.get(MAIN_AGENT_ID)?.session).toBe(stub.session);
+		expect(getLocalSession(registry.get(MAIN_AGENT_ID))).toBe(stub.session);
 		expect(stub.disposeCalls()).toBe(0);
 	});
 
@@ -470,7 +467,7 @@ describe("AgentLifecycleManager", () => {
 
 		expect(lifecycle.isParking("7-Sub")).toBe(true);
 		expect(registry.get("7-Sub")?.status).toBe("idle"); // cancel window not yet elapsed
-		expect(registry.get("7-Sub")?.session).toBe(stub.session);
+		expect(getLocalSession(registry.get("7-Sub"))).toBe(stub.session);
 
 		// Cancel window + detach + start dispose.
 		await Promise.resolve();
@@ -481,14 +478,14 @@ describe("AgentLifecycleManager", () => {
 		// Detach + parked happen BEFORE dispose resolves — callers never see a
 		// dying session attached to an idle ref.
 		expect(registry.get("7-Sub")?.status).toBe("parked");
-		expect(registry.get("7-Sub")?.session).toBeNull();
+		expect(getLocalSession(registry.get("7-Sub"))).toBeNull();
 
 		gate.resolve();
 		await parking;
 
 		expect(lifecycle.isParking("7-Sub")).toBe(false);
 		expect(registry.get("7-Sub")?.status).toBe("parked");
-		expect(registry.get("7-Sub")?.session).toBeNull();
+		expect(getLocalSession(registry.get("7-Sub"))).toBeNull();
 	});
 
 	it("ensureLive during pre-detach park cancels park and keeps the live session", async () => {
@@ -501,14 +498,14 @@ describe("AgentLifecycleManager", () => {
 		// Same tick as park start: cancel window is still open.
 		const live = lifecycle.ensureLive("Race-Keep");
 
-		const session = await live;
+		const session = localSession(await live);
 		await parking;
 
 		expect(session).toBe(stub.session);
 		expect(stub.disposeCalls()).toBe(0);
 		expect(lifecycle.isParking("Race-Keep")).toBe(false);
 		expect(registry.get("Race-Keep")?.status).toBe("idle");
-		expect(registry.get("Race-Keep")?.session).toBe(stub.session);
+		expect(getLocalSession(registry.get("Race-Keep"))).toBe(stub.session);
 	});
 
 	it("ensureLive after park detaches waits for dispose then revives once", async () => {
@@ -530,7 +527,7 @@ describe("AgentLifecycleManager", () => {
 		await Promise.resolve();
 		await Promise.resolve();
 		expect(registry.get("Race-Revive")?.status).toBe("parked");
-		expect(registry.get("Race-Revive")?.session).toBeNull();
+		expect(getLocalSession(registry.get("Race-Revive"))).toBeNull();
 		expect(stub.disposeCalls()).toBe(1);
 
 		const first = lifecycle.ensureLive("Race-Revive");
@@ -550,10 +547,10 @@ describe("AgentLifecycleManager", () => {
 		const [a, b] = await Promise.all([first, second, parking]);
 
 		expect(reviverRuns).toBe(1);
-		expect(a).toBe(revived.session);
-		expect(b).toBe(revived.session);
+		expect(localSession(a)).toBe(revived.session);
+		expect(localSession(b)).toBe(revived.session);
 		expect(registry.get("Race-Revive")?.status).toBe("idle");
-		expect(registry.get("Race-Revive")?.session).toBe(revived.session);
+		expect(getLocalSession(registry.get("Race-Revive"))).toBe(revived.session);
 		expect(stub.disposeCalls()).toBe(1);
 	});
 
@@ -568,7 +565,7 @@ describe("AgentLifecycleManager", () => {
 
 		expect(stub.disposeCalls()).toBe(1);
 		expect(registry.get("Race-ParkOnce")?.status).toBe("parked");
-		expect(registry.get("Race-ParkOnce")?.session).toBeNull();
+		expect(getLocalSession(registry.get("Race-ParkOnce"))).toBeNull();
 	});
 
 	it("dispose failure still leaves the agent parked and detached", async () => {
@@ -585,11 +582,11 @@ describe("AgentLifecycleManager", () => {
 
 		expect(stub.disposeCalls()).toBe(1);
 		expect(registry.get("Park-FailDispose")?.status).toBe("parked");
-		expect(registry.get("Park-FailDispose")?.session).toBeNull();
+		expect(getLocalSession(registry.get("Park-FailDispose"))).toBeNull();
 		expect(lifecycle.isParking("Park-FailDispose")).toBe(false);
 
 		// Still revivable after a failed dispose.
-		const session = await lifecycle.ensureLive("Park-FailDispose");
+		const session = localSession(await lifecycle.ensureLive("Park-FailDispose"));
 		expect(session).toBeTruthy();
 		expect(registry.get("Park-FailDispose")?.status).toBe("idle");
 	});
@@ -614,7 +611,7 @@ describe("AgentLifecycleManager", () => {
 
 		await expect(ensure).rejects.toThrow(/revive blew up/);
 		expect(registry.get("Park-FailRevive")?.status).toBe("parked");
-		expect(registry.get("Park-FailRevive")?.session).toBeNull();
+		expect(getLocalSession(registry.get("Park-FailRevive"))).toBeNull();
 		expect(lifecycle.has("Park-FailRevive")).toBe(true);
 	});
 
@@ -626,7 +623,7 @@ describe("AgentLifecycleManager", () => {
 
 		// Force an early park, then cancel it via ensureLive.
 		const parking = lifecycle.park("Park-Rearm");
-		const kept = await lifecycle.ensureLive("Park-Rearm");
+		const kept = localSession(await lifecycle.ensureLive("Park-Rearm"));
 		await parking;
 		expect(kept).toBe(stub.session);
 		expect(stub.disposeCalls()).toBe(0);
@@ -649,7 +646,7 @@ describe("AgentLifecycleManager", () => {
 		await flushAsync();
 		const ref = registry.get("8-Sub");
 		expect(ref?.status).toBe("idle");
-		expect(ref?.session).toBe(stub.session);
+		expect(getLocalSession(ref)).toBe(stub.session);
 		expect(stub.disposeCalls()).toBe(0);
 		expect(lifecycle.has("8-Sub")).toBe(true);
 	});
@@ -680,8 +677,7 @@ describe("AgentLifecycleManager", () => {
 			id: workerId,
 			displayName: "task",
 			kind: "sub",
-			session,
-			sessionFile: workerSessionFile,
+			endpoint: { kind: "local", session: session, sessionFile: workerSessionFile },
 			status: "running",
 		});
 
@@ -690,7 +686,7 @@ describe("AgentLifecycleManager", () => {
 		// terminal, hard-killed row (session detached) instead of removing it.
 		expect(disposeCalls).toBe(1);
 		expect(registry.get(workerId)?.status).toBe("aborted");
-		expect(registry.get(workerId)?.session).toBeNull();
+		expect(getLocalSession(registry.get(workerId))).toBeNull();
 		// The tombstone is terminal: ensureLive must not hand back the disposed
 		// session (the ref carries session === null), it treats it as unrevivable.
 		await expect(lifecycle.ensureLive(workerId)).rejects.toThrow(/aborted/);
@@ -709,14 +705,13 @@ describe("AgentLifecycleManager", () => {
 			id: "Published-Aborted",
 			displayName: "task",
 			kind: "sub",
-			session: stub.session,
-			sessionFile: null,
+			endpoint: { kind: "local", session: stub.session, sessionFile: null },
 			status: "running",
 		});
 		let observed: { status: string; session: AgentSession | null } | undefined;
 		const unsubscribe = registry.onChange(event => {
 			if (event.type === "status_changed" && event.ref.id === ref.id) {
-				observed = { status: event.ref.status, session: event.ref.session };
+				observed = { status: event.ref.status, session: getLocalSession(event.ref) };
 			}
 		});
 
@@ -742,8 +737,7 @@ describe("AgentLifecycleManager", () => {
 			id: workerId,
 			displayName: "task",
 			kind: "sub",
-			session,
-			sessionFile: workerSessionFile,
+			endpoint: { kind: "local", session: session, sessionFile: workerSessionFile },
 			status: "running",
 		});
 
@@ -772,7 +766,7 @@ describe("AgentLifecycleManager", () => {
 		// saw an aborted, detached ref and bailed: the row survives as `aborted`
 		// instead of vanishing from the registry.
 		expect(registry.get(workerId)?.status).toBe("aborted");
-		expect(registry.get(workerId)?.session).toBeNull();
+		expect(getLocalSession(registry.get(workerId))).toBeNull();
 		expect(disposeCalls).toBe(1);
 		expect(await Bun.file(`${workerSessionFile}.tombstone`).exists()).toBe(true);
 	});
@@ -783,8 +777,7 @@ describe("AgentLifecycleManager", () => {
 			id: "Persist-Failure",
 			displayName: "task",
 			kind: "sub",
-			session: stub.session,
-			sessionFile: "/tmp/Persist-Failure.jsonl",
+			endpoint: { kind: "local", session: stub.session, sessionFile: "/tmp/Persist-Failure.jsonl" },
 			status: "running",
 		});
 		const failure = Object.assign(new Error("no space left on device"), { code: "ENOSPC" });
@@ -795,7 +788,7 @@ describe("AgentLifecycleManager", () => {
 		// Persistence still surfaces to the caller, but the detached session cannot
 		// leak its MCP, kernel, browser, or nested-job resources.
 		expect(stub.disposeCalls()).toBe(1);
-		expect(registry.get("Persist-Failure")).toMatchObject({ status: "aborted", session: null });
+		expect(registry.get("Persist-Failure")).toMatchObject({ status: "aborted", endpoint: { kind: "local", session: null } });
 	});
 
 	it("a cold revive whose factory resolves after dispose rejects without adopting or arming a TTL", async () => {
@@ -808,8 +801,7 @@ describe("AgentLifecycleManager", () => {
 			id: "Cold-DisposeRace",
 			displayName: "task",
 			kind: "sub",
-			session: null,
-			sessionFile: "/tmp/Cold-DisposeRace.jsonl",
+			endpoint: { kind: "local", session: null, sessionFile: "/tmp/Cold-DisposeRace.jsonl" },
 			status: "parked",
 		});
 		lifecycle.setPersistedSubagentReviverFactory(async () => {
@@ -831,7 +823,7 @@ describe("AgentLifecycleManager", () => {
 		expect(revived.disposeCalls()).toBe(0);
 		// No adoption, no live session, no armed TTL that could fire a late park.
 		expect(lifecycle.has("Cold-DisposeRace")).toBe(false);
-		expect(registry.get("Cold-DisposeRace")?.session ?? null).toBeNull();
+		expect(getLocalSession(registry.get("Cold-DisposeRace")) ?? null).toBeNull();
 		expect(registry.get("Cold-DisposeRace")?.status).not.toBe("idle");
 		vi.advanceTimersByTime(TTL * 10);
 		await flushAsync();
@@ -845,8 +837,7 @@ describe("AgentLifecycleManager", () => {
 			id: "Cold-SessionRace",
 			displayName: "task",
 			kind: "sub",
-			session: null,
-			sessionFile: "/tmp/Cold-SessionRace.jsonl",
+			endpoint: { kind: "local", session: null, sessionFile: "/tmp/Cold-SessionRace.jsonl" },
 			status: "parked",
 		});
 		// Factory resolves immediately (cold-adopts), but the reviver — which builds
@@ -867,7 +858,7 @@ describe("AgentLifecycleManager", () => {
 		await expect(revival).rejects.toThrow(/disposed/);
 		expect(revived.disposeCalls()).toBe(1);
 		expect(lifecycle.has("Cold-SessionRace")).toBe(false);
-		expect(registry.get("Cold-SessionRace")?.session ?? null).toBeNull();
+		expect(getLocalSession(registry.get("Cold-SessionRace")) ?? null).toBeNull();
 	});
 
 	it("a new top-level owner can cold-revive after the previous global lifecycle was disposed", async () => {
@@ -877,16 +868,15 @@ describe("AgentLifecycleManager", () => {
 			id: "Next-Owner",
 			displayName: "task",
 			kind: "sub",
-			session: null,
-			sessionFile: "/tmp/Next-Owner.jsonl",
+			endpoint: { kind: "local", session: null, sessionFile: "/tmp/Next-Owner.jsonl" },
 			status: "parked",
 		});
 
 		const nextLifecycle = AgentLifecycleManager.global();
 		nextLifecycle.setPersistedSubagentReviverFactory(async () => async () => revived.session, 0);
 
-		await expect(nextLifecycle.ensureLive("Next-Owner")).resolves.toBe(revived.session);
-		expect(registry.get("Next-Owner")).toMatchObject({ status: "idle", session: revived.session });
+		await expect(nextLifecycle.ensureLive("Next-Owner")).resolves.toMatchObject({ kind: "local", session: revived.session });
+		expect(registry.get("Next-Owner")).toMatchObject({ status: "idle", endpoint: { kind: "local", session: revived.session } });
 		expect(revived.disposeCalls()).toBe(0);
 	});
 });

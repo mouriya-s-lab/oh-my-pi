@@ -147,7 +147,7 @@ import type { MnemopiSessionState } from "./mnemopi/state";
 import mcpXdevGuidanceTemplate from "./prompts/system/mcp-xdev-guidance.md" with { type: "text" };
 import lateDiagnosticTemplate from "./prompts/tools/lsp-late-diagnostic.md" with { type: "text" };
 import { AgentLifecycleManager } from "./registry/agent-lifecycle";
-import { type AgentKind, type AgentRef, AgentRegistry, MAIN_AGENT_ID } from "./registry/agent-registry";
+import { type AgentKind, type AgentRef, AgentRegistry, getLocalSession, MAIN_AGENT_ID } from "./registry/agent-registry";
 import {
 	buildSecretObfuscator,
 	deobfuscateSessionContext,
@@ -1758,7 +1758,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 	const unregisterUnlessParked = (): void => {
 		const ref = registeredAgentRef;
 		if (!ref || agentRegistry.get(resolvedAgentId) !== ref) return;
-		if (ref.status === "parked" || (ref.status === "aborted" && !ref.session)) return;
+		// D2 dependency: only the tagged local endpoint can retain an in-process session.
+		if (ref.status === "parked" || (ref.status === "aborted" && !getLocalSession(ref))) return;
 		if (AgentLifecycleManager.global().isParking(resolvedAgentId, ref)) return;
 		agentRegistry.unregister(resolvedAgentId, ref);
 	};
@@ -3316,8 +3317,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			displayName: resolvedAgentDisplayName,
 			kind: agentKind,
 			parentId: options.parentAgentId,
-			session: null,
-			sessionFile: sessionManager.getSessionFile() ?? null,
+			// D2 dependency: SDK construction claims local session ownership only.
+			endpoint: { kind: "local" as const, session: null, sessionFile: sessionManager.getSessionFile() ?? null },
 			status: "running" as const,
 		};
 		registeredAgentRef =

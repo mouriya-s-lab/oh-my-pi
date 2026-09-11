@@ -285,7 +285,7 @@ describe("AgentSession plan-mode convergence", () => {
 			sideResponses: [{ content: ["still planning — full reply once the plan settles"] }],
 		});
 		const registry = AgentRegistry.global();
-		registry.register({ id: "peer", displayName: "peer", kind: "sub", session: null, status: "running" });
+		registry.register({ id: "peer", displayName: "peer", kind: "sub", endpoint: { kind: "local", session: null, sessionFile: null }, status: "running" });
 		try {
 			const bus = IrcBus.global();
 			const replyPromise = bus.wait("peer", { from: "me" }, 0);

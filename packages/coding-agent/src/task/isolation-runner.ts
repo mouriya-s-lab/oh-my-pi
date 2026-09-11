@@ -339,6 +339,14 @@ export interface IsolationMergeOutcome {
  */
 export async function mergeIsolatedChanges(opts: IsolationMergeOptions): Promise<IsolationMergeOutcome> {
 	const { result, repoRoot, mergeMode } = opts;
+	if (result.exitCode === null) {
+		return {
+			summary: "\n\nExecution unknown; changes were not applied.",
+			changesApplied: null,
+			hadAnyChanges: false,
+			mergedBranchForNestedPatches: false,
+		};
+	}
 	const repo = vcs.requireGit(repoRoot);
 	try {
 		if (mergeMode === "branch") {

@@ -50,6 +50,10 @@ export class AgentProtocolHandler implements ProtocolHandler {
 		}
 
 		const registry = AgentRegistry.global();
+		// D2 dependency: remote output lookup cannot reuse a same-id local artifact (#13).
+		if (registry.get(outputId)?.endpoint.kind === "remote") {
+			throw new Error("Remote agent output reads are not implemented (#13).");
+		}
 		const rootSessionFile = context?.sessionFile
 			? await ensurePersistedRoster(registry, context.sessionFile)
 			: undefined;

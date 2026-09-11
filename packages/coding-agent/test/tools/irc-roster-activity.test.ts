@@ -42,12 +42,12 @@ describe("IRC roster activity", () => {
 	});
 
 	it("surfaces a peer's role and current activity in the list", async () => {
-		registry.register({ id: "Main", displayName: "main", kind: "main", session: null, status: "running" });
+		registry.register({ id: "Main", displayName: "main", kind: "main", endpoint: { kind: "local", session: null, sessionFile: null }, status: "running" });
 		registry.register({
 			id: "AuthScout",
 			displayName: "Auth-flow security reviewer",
 			kind: "sub",
-			session: null,
+			endpoint: { kind: "local", session: null, sessionFile: null },
 			status: "running",
 		});
 		registry.setActivity("AuthScout", "auditing the token refresh path");
@@ -58,8 +58,8 @@ describe("IRC roster activity", () => {
 	});
 
 	it("renders a peer with no activity without a dangling clause", async () => {
-		registry.register({ id: "Main", displayName: "main", kind: "main", session: null, status: "running" });
-		registry.register({ id: "Quiet", displayName: "task", kind: "sub", session: null, status: "running" });
+		registry.register({ id: "Main", displayName: "main", kind: "main", endpoint: { kind: "local", session: null, sessionFile: null }, status: "running" });
+		registry.register({ id: "Quiet", displayName: "task", kind: "sub", endpoint: { kind: "local", session: null, sessionFile: null }, status: "running" });
 
 		const text = await listText(registry, "Main");
 		const line = text.split("\n").find(l => l.includes("Quiet"));
@@ -73,7 +73,7 @@ describe("IRC roster activity", () => {
 		// lastActivity, so an activity update must refresh it or live work looks idle.
 		const now = spyOn(Date, "now");
 		now.mockReturnValue(1_000);
-		registry.register({ id: "Worker", displayName: "task", kind: "sub", session: null, status: "running" });
+		registry.register({ id: "Worker", displayName: "task", kind: "sub", endpoint: { kind: "local", session: null, sessionFile: null }, status: "running" });
 		now.mockReturnValue(60_000);
 		registry.setActivity("Worker", "running bash");
 		expect(registry.get("Worker")?.lastActivity).toBe(60_000);
@@ -85,7 +85,7 @@ describe("IRC roster activity", () => {
 	});
 
 	it("clears activity when a peer leaves running so finished work is not shown as current", () => {
-		registry.register({ id: "Done", displayName: "task", kind: "sub", session: null, status: "running" });
+		registry.register({ id: "Done", displayName: "task", kind: "sub", endpoint: { kind: "local", session: null, sessionFile: null }, status: "running" });
 		registry.setActivity("Done", "running bash");
 		expect(registry.get("Done")?.activity).toBe("running bash");
 		registry.setStatus("Done", "idle");
@@ -93,7 +93,7 @@ describe("IRC roster activity", () => {
 	});
 
 	it("ignores activity heartbeats for an agent that is no longer running", () => {
-		registry.register({ id: "Stopped", displayName: "task", kind: "sub", session: null, status: "idle" });
+		registry.register({ id: "Stopped", displayName: "task", kind: "sub", endpoint: { kind: "local", session: null, sessionFile: null }, status: "idle" });
 		registry.setActivity("Stopped", "running bash");
 		expect(registry.get("Stopped")?.activity).toBeUndefined();
 	});
@@ -101,7 +101,7 @@ describe("IRC roster activity", () => {
 	it("normalizes a multi-line activity gist to one bounded line", () => {
 		// A model-authored intent with newlines/tabs must not break out of its one
 		// roster row; setActivity collapses it centrally so every caller is safe.
-		registry.register({ id: "Noisy", displayName: "task", kind: "sub", session: null, status: "running" });
+		registry.register({ id: "Noisy", displayName: "task", kind: "sub", endpoint: { kind: "local", session: null, sessionFile: null }, status: "running" });
 		registry.setActivity("Noisy", "editing\n- fake roster line\twith tabs");
 		expect(registry.get("Noisy")?.activity).toBe("editing - fake roster line with tabs");
 	});

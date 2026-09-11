@@ -20,7 +20,7 @@ import { formatDuration, formatNumber, logger } from "@oh-my-pi/pi-utils";
 import type { KeyId } from "../../config/keybindings";
 import type { MessageRenderer } from "../../extensibility/extensions/types";
 import type { AgentLifecycleManager } from "../../registry/agent-lifecycle";
-import type { AgentRegistry, AgentStatus } from "../../registry/agent-registry";
+import { type AgentRegistry, type AgentStatus, getLocalSessionFile } from "../../registry/agent-registry";
 import type { FileEntry, SessionMessageEntry } from "../../session/session-entries";
 import { parseSessionEntries } from "../../session/session-loader";
 import { replaceTabs, shortenPath, truncateToWidth } from "../../tools/render-utils";
@@ -136,6 +136,8 @@ function statusBadge(status: AgentStatus): string {
 			return theme.fg("muted", "parked");
 		case "aborted":
 			return theme.fg("error", "aborted");
+		case "execution-unknown":
+			return theme.fg("warning", "execution-unknown");
 	}
 }
 
@@ -220,7 +222,8 @@ export class AgentTranscriptViewer implements Component {
 			this.#fetchRemote();
 			return;
 		}
-		const sessionFile = this.deps.registry.get(this.deps.agentId)?.sessionFile;
+		// D2 dependency: remote transcripts require endpoint resource routing (#13).
+		const sessionFile = getLocalSessionFile(this.deps.registry.get(this.deps.agentId));
 		if (!sessionFile) {
 			this.#clearLocal("none");
 			return;
@@ -538,10 +541,11 @@ export class AgentTranscriptViewer implements Component {
 		if (!lifecycle) return;
 		void (async () => {
 			try {
-				// Revives a parked agent; returns the live session for running/idle.
-				const session = await lifecycle().ensureLive(id);
+				// D2 dependency: remote chat routing cannot impersonate a local prompt (#11).
+				const live = await lifecycle().ensureLive(id);
+				if (live.kind !== "local") throw new Error("Remote agent chat is not implemented (#11).");
 				// Steers a mid-turn agent; sends a normal prompt to an idle one.
-				await session.prompt(trimmed, { streamingBehavior: "steer" });
+				await live.session.prompt(trimmed, { streamingBehavior: "steer" });
 			} catch (error) {
 				this.#notice = error instanceof Error ? error.message : String(error);
 			}
@@ -657,7 +661,7 @@ export class AgentTranscriptViewer implements Component {
 			if (this.#remoteUnavailable) return "Transcript lives on the host — not available.";
 			return this.#hasRemoteData ? "No messages yet." : "Loading transcript from host…";
 		}
-		if (!this.deps.registry.get(this.deps.agentId)?.sessionFile) return "No session file available yet.";
+		if (!getLocalSessionFile(this.deps.registry.get(this.deps.agentId))) return "No session file available yet.";
 		return "No messages yet.";
 	}
 }

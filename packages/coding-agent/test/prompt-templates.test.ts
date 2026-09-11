@@ -403,14 +403,14 @@ describe("subagent peer roster prompt", () => {
 			id: MAIN_AGENT_ID,
 			displayName: MAIN_AGENT_ID,
 			kind: "main",
-			session: null,
+			endpoint: { kind: "local", session: null, sessionFile: null },
 			status: "running",
 		});
 		registry.register({
 			id: "LiveWorker",
 			displayName: "implementer",
 			kind: "sub",
-			session: null,
+			endpoint: { kind: "local", session: null, sessionFile: null },
 			status: "running",
 			activity: "editing auth.ts",
 		});
@@ -418,14 +418,14 @@ describe("subagent peer roster prompt", () => {
 			id: "IdleReviewer",
 			displayName: "reviewer",
 			kind: "sub",
-			session: null,
+			endpoint: { kind: "local", session: null, sessionFile: null },
 			status: "idle",
 		});
 		registry.register({
 			id: "ParkedSecretId",
 			displayName: "secret parked label",
 			kind: "sub",
-			session: null,
+			endpoint: { kind: "local", session: null, sessionFile: null },
 			status: "parked",
 			activity: "reviewing classified.diff",
 		});

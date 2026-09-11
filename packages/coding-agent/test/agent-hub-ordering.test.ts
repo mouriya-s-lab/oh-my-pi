@@ -167,13 +167,13 @@ describe("Agent hub row ordering", () => {
 				id: "Parked",
 				displayName: "Parked",
 				kind: "sub",
-				session: null,
+				endpoint: { kind: "local", session: null, sessionFile: null },
 				status: "parked",
 			});
 			setSystemTime(1000);
-			agents.register({ id: "Older", displayName: "Older", kind: "sub", session: {} as AgentSession });
+			agents.register({ id: "Older", displayName: "Older", kind: "sub", endpoint: { kind: "local", session: {} as AgentSession, sessionFile: null }});
 			setSystemTime(2000);
-			agents.register({ id: "Newer", displayName: "Newer", kind: "sub", session: {} as AgentSession });
+			agents.register({ id: "Newer", displayName: "Newer", kind: "sub", endpoint: { kind: "local", session: {} as AgentSession, sessionFile: null }});
 
 			vi.advanceTimersByTime(100);
 			expect(renderedAgentIds(hub)).toEqual(["Newer", "Older", "Parked"]);
@@ -190,15 +190,15 @@ describe("Agent hub row ordering", () => {
 			const agents = new AgentRegistry();
 			setSystemTime(1000);
 			const sessionA = {} as AgentSession;
-			agents.register({ id: "A", displayName: "Alpha", kind: "sub", session: sessionA });
+			agents.register({ id: "A", displayName: "Alpha", kind: "sub", endpoint: { kind: "local", session: sessionA, sessionFile: null }});
 
 			setSystemTime(2000);
 			const sessionB = {} as AgentSession;
-			agents.register({ id: "B", displayName: "Beta", kind: "sub", session: sessionB });
+			agents.register({ id: "B", displayName: "Beta", kind: "sub", endpoint: { kind: "local", session: sessionB, sessionFile: null }});
 
 			setSystemTime(3000);
 			const sessionC = {} as AgentSession;
-			agents.register({ id: "C", displayName: "Gamma", kind: "sub", session: sessionC });
+			agents.register({ id: "C", displayName: "Gamma", kind: "sub", endpoint: { kind: "local", session: sessionC, sessionFile: null }});
 
 			hub = makeHub(agents);
 			// Captured once on open: status then recency (most-recent first).
@@ -213,7 +213,7 @@ describe("Agent hub row ordering", () => {
 			// captured order, and the newcomer appends at the end.
 			setSystemTime(5000);
 			const sessionD = {} as AgentSession;
-			agents.register({ id: "D", displayName: "Delta", kind: "sub", session: sessionD, status: "parked" });
+			agents.register({ id: "D", displayName: "Delta", kind: "sub", endpoint: { kind: "local", session: sessionD, sessionFile: null }, status: "parked" });
 			// Renders coalesce: the immediate frame still shows the captured order.
 			expect(renderedAgentIds(hub)).toEqual(["C", "B", "A"]);
 			vi.advanceTimersByTime(100);
@@ -222,7 +222,7 @@ describe("Agent hub row ordering", () => {
 			// Reusing an unregistered id creates a new agent generation. It must
 			// append rather than reclaiming the removed generation's old rank.
 			agents.unregister("B", sessionB);
-			agents.register({ id: "B", displayName: "Beta 2", kind: "sub", session: {} as AgentSession });
+			agents.register({ id: "B", displayName: "Beta 2", kind: "sub", endpoint: { kind: "local", session: {} as AgentSession, sessionFile: null }});
 			vi.advanceTimersByTime(100);
 			expect(renderedAgentIds(hub)).toEqual(["C", "A", "D", "B"]);
 		} finally {
@@ -239,9 +239,9 @@ describe("Agent hub row ordering", () => {
 			geometry = stubStdoutGeometry(120);
 			const agents = new AgentRegistry();
 			const sessionA = {} as AgentSession;
-			agents.register({ id: "alpha-one", displayName: "Alpha", kind: "sub", session: sessionA });
+			agents.register({ id: "alpha-one", displayName: "Alpha", kind: "sub", endpoint: { kind: "local", session: sessionA, sessionFile: null }});
 			const sessionB = {} as AgentSession;
-			agents.register({ id: "beta-two", displayName: "Beta", kind: "sub", session: sessionB });
+			agents.register({ id: "beta-two", displayName: "Beta", kind: "sub", endpoint: { kind: "local", session: sessionB, sessionFile: null }});
 
 			hub = makeHub(agents);
 			expect(renderedAgentIds(hub)).toEqual(["alpha-one", "beta-two"]);
@@ -264,7 +264,7 @@ describe("Agent hub row ordering", () => {
 		const agents = new AgentRegistry();
 		for (let i = 0; i < 10_000; i++) {
 			const id = `Agent-${i.toString().padStart(5, "0")}`;
-			agents.register({ id, displayName: id, kind: "sub", session: null, status: "parked" });
+			agents.register({ id, displayName: id, kind: "sub", endpoint: { kind: "local", session: null, sessionFile: null }, status: "parked" });
 		}
 
 		const observers = new SessionObserverRegistry();
@@ -318,7 +318,7 @@ describe("Agent hub row ordering", () => {
 				id,
 				displayName: id,
 				kind: "sub",
-				session: null,
+				endpoint: { kind: "local", session: null, sessionFile: null },
 				status: "parked",
 			});
 		}
@@ -366,7 +366,7 @@ describe("Agent hub row ordering", () => {
 			id: "RevAgentStream",
 			displayName: "Agent runtime + compaction reviewer\u0007",
 			kind: "sub",
-			session: sessionA,
+			endpoint: { kind: "local", session: sessionA, sessionFile: null }
 		});
 
 		const observers = new SessionObserverRegistry();
@@ -412,7 +412,7 @@ describe("Agent hub row ordering", () => {
 				id: `Agent${i}`,
 				displayName: `Agent ${i}`,
 				kind: "sub",
-				session: {} as AgentSession,
+				endpoint: { kind: "local", session: {} as AgentSession, sessionFile: null }
 			});
 		}
 
@@ -433,11 +433,11 @@ describe("Agent hub row ordering", () => {
 		geometry = stubStdoutGeometry(120);
 		const agents = new AgentRegistry();
 		setSystemTime(1_000);
-		agents.register({ id: "Alpha", displayName: "Alpha", kind: "sub", session: {} as AgentSession });
+		agents.register({ id: "Alpha", displayName: "Alpha", kind: "sub", endpoint: { kind: "local", session: {} as AgentSession, sessionFile: null }});
 		setSystemTime(2_000);
-		agents.register({ id: "Beta", displayName: "Beta", kind: "sub", session: {} as AgentSession });
+		agents.register({ id: "Beta", displayName: "Beta", kind: "sub", endpoint: { kind: "local", session: {} as AgentSession, sessionFile: null }});
 		setSystemTime(3_000);
-		agents.register({ id: "Gamma", displayName: "Gamma", kind: "sub", session: {} as AgentSession });
+		agents.register({ id: "Gamma", displayName: "Gamma", kind: "sub", endpoint: { kind: "local", session: {} as AgentSession, sessionFile: null }});
 
 		const focused: string[] = [];
 		const done = vi.fn();
@@ -474,7 +474,7 @@ describe("Agent hub row ordering", () => {
 		const agents = new AgentRegistry();
 		// A collab guest / observer-only row carries no live AgentSession, so the
 		// badge must come from the executor-reported progress instead.
-		agents.register({ id: "GuestAgent", displayName: "Guest Agent", kind: "sub", session: null });
+		agents.register({ id: "GuestAgent", displayName: "Guest Agent", kind: "sub", endpoint: { kind: "local", session: null, sessionFile: null }});
 
 		const observers = new SessionObserverRegistry();
 		vi.spyOn(observers, "getSession").mockReturnValue({
@@ -510,7 +510,7 @@ describe("Agent hub row ordering", () => {
 			thinkingLevel: "high",
 			servingModel: { selector: "anthropic/claude-sonnet-5", isFallback: false },
 		} as unknown as AgentSession;
-		agents.register({ id: "MainAgent", displayName: "Main Agent", kind: "sub", session });
+		agents.register({ id: "MainAgent", displayName: "Main Agent", kind: "sub", endpoint: { kind: "local", session: session, sessionFile: null }});
 
 		const hub = makeHub(agents, { observers: new SessionObserverRegistry() });
 
@@ -537,7 +537,7 @@ describe("Agent hub row ordering", () => {
 			// still flagged as fallback-routed.
 			servingModel: { selector: "openai-codex/gpt-5.6-sol", isFallback: true },
 		} as unknown as AgentSession;
-		agents.register({ id: "UnprovenAgent", displayName: "Unproven Agent", kind: "sub", session });
+		agents.register({ id: "UnprovenAgent", displayName: "Unproven Agent", kind: "sub", endpoint: { kind: "local", session: session, sessionFile: null }});
 
 		const hub = makeHub(agents, { observers: new SessionObserverRegistry() });
 
@@ -556,7 +556,7 @@ describe("Agent hub row ordering", () => {
 		// arming `#activeRetryFallback`, so the badge must fall back to the
 		// executor-reported progress flag.
 		const session = { model: { id: "kimi-k2" }, servingModel: undefined } as unknown as AgentSession;
-		agents.register({ id: "FastAgent", displayName: "Fast Agent", kind: "sub", session });
+		agents.register({ id: "FastAgent", displayName: "Fast Agent", kind: "sub", endpoint: { kind: "local", session: session, sessionFile: null }});
 
 		const observers = new SessionObserverRegistry();
 		vi.spyOn(observers, "getSession").mockReturnValue({
@@ -589,13 +589,13 @@ describe("Agent hub row ordering", () => {
 			id: "InheritedLevel",
 			displayName: "Inherited level",
 			kind: "sub",
-			session: inheritedSession,
+			endpoint: { kind: "local", session: inheritedSession, sessionFile: null }
 		});
 		agents.register({
 			id: "ExplicitLevel",
 			displayName: "Explicit level",
 			kind: "sub",
-			session: explicitSession,
+			endpoint: { kind: "local", session: explicitSession, sessionFile: null }
 		});
 		const observers = new SessionObserverRegistry();
 		vi.spyOn(observers, "getSessions").mockReturnValue([
@@ -642,7 +642,7 @@ describe("Agent hub row ordering", () => {
 			displayName: "Security Reviewer",
 			kind: "sub",
 			parentId: "Main",
-			session: null,
+			endpoint: { kind: "local", session: null, sessionFile: null },
 			history: {
 				outputPath: "/tmp/Reviewer.md",
 				patchPath: "/tmp/Reviewer.patch",
@@ -722,13 +722,13 @@ describe("Agent hub row ordering", () => {
 		geometry = stubStdoutGeometry(160);
 		geometry.setRows(32);
 		const agents = new AgentRegistry();
-		agents.register({ id: "Running", displayName: "Running", kind: "sub", session: null, status: "running" });
-		agents.register({ id: "Completed", displayName: "Completed", kind: "sub", session: null, status: "idle" });
+		agents.register({ id: "Running", displayName: "Running", kind: "sub", endpoint: { kind: "local", session: null, sessionFile: null }, status: "running" });
+		agents.register({ id: "Completed", displayName: "Completed", kind: "sub", endpoint: { kind: "local", session: null, sessionFile: null }, status: "idle" });
 		agents.register({
 			id: "Historical",
 			displayName: "Historical",
 			kind: "sub",
-			session: null,
+			endpoint: { kind: "local", session: null, sessionFile: null },
 			status: "parked",
 			activity: "Restored task",
 		});
@@ -831,9 +831,9 @@ describe("Agent hub row ordering", () => {
 			id: "Incomplete",
 			displayName: "Incomplete",
 			kind: "sub",
-			session: { getSessionStats } as unknown as AgentSession,
+			endpoint: { kind: "local", session: { getSessionStats } as unknown as AgentSession, sessionFile: null }
 		});
-		agents.register({ id: "NonFinite", displayName: "Non-finite", kind: "sub", session: null });
+		agents.register({ id: "NonFinite", displayName: "Non-finite", kind: "sub", endpoint: { kind: "local", session: null, sessionFile: null }});
 		const observers = new SessionObserverRegistry();
 		vi.spyOn(observers, "getSessions").mockReturnValue([
 			{
@@ -879,8 +879,8 @@ describe("Agent hub row ordering", () => {
 	it("shows configured role text beside a resolved model but not for an explicit selector", () => {
 		geometry = stubStdoutGeometry(160);
 		const agents = new AgentRegistry();
-		agents.register({ id: "RoleAgent", displayName: "Role Agent", kind: "sub", session: null });
-		agents.register({ id: "ExplicitAgent", displayName: "Explicit Agent", kind: "sub", session: null });
+		agents.register({ id: "RoleAgent", displayName: "Role Agent", kind: "sub", endpoint: { kind: "local", session: null, sessionFile: null }});
+		agents.register({ id: "ExplicitAgent", displayName: "Explicit Agent", kind: "sub", endpoint: { kind: "local", session: null, sessionFile: null }});
 		const observers = new SessionObserverRegistry();
 		vi.spyOn(observers, "getSessions").mockReturnValue([
 			{
@@ -957,11 +957,11 @@ describe("Agent hub row ordering", () => {
 		geometry = stubStdoutGeometry(120);
 		const agents = new AgentRegistry();
 		setSystemTime(1_000);
-		agents.register({ id: "Parent", displayName: "Parent", kind: "sub", parentId: "Main", session: null });
+		agents.register({ id: "Parent", displayName: "Parent", kind: "sub", parentId: "Main", endpoint: { kind: "local", session: null, sessionFile: null }});
 		setSystemTime(2_000);
-		agents.register({ id: "Peer", displayName: "Peer", kind: "sub", parentId: "Main", session: null });
+		agents.register({ id: "Peer", displayName: "Peer", kind: "sub", parentId: "Main", endpoint: { kind: "local", session: null, sessionFile: null }});
 		setSystemTime(3_000);
-		agents.register({ id: "Child", displayName: "Child", kind: "sub", parentId: "Parent", session: null });
+		agents.register({ id: "Child", displayName: "Child", kind: "sub", parentId: "Parent", endpoint: { kind: "local", session: null, sessionFile: null }});
 		const hub = makeHub(agents);
 
 		try {
@@ -998,10 +998,10 @@ describe("Agent hub row ordering", () => {
 		geometry = stubStdoutGeometry(120);
 		geometry.setRows(32);
 		const agents = new AgentRegistry();
-		agents.register({ id: "Parent", displayName: "Parent", kind: "sub", parentId: "Main", session: null });
-		agents.register({ id: "First", displayName: "First", kind: "sub", parentId: "Parent", session: null });
-		agents.register({ id: "Grandchild", displayName: "Grandchild", kind: "sub", parentId: "First", session: null });
-		agents.register({ id: "Last", displayName: "Last", kind: "sub", parentId: "Parent", session: null });
+		agents.register({ id: "Parent", displayName: "Parent", kind: "sub", parentId: "Main", endpoint: { kind: "local", session: null, sessionFile: null }});
+		agents.register({ id: "First", displayName: "First", kind: "sub", parentId: "Parent", endpoint: { kind: "local", session: null, sessionFile: null }});
+		agents.register({ id: "Grandchild", displayName: "Grandchild", kind: "sub", parentId: "First", endpoint: { kind: "local", session: null, sessionFile: null }});
+		agents.register({ id: "Last", displayName: "Last", kind: "sub", parentId: "Parent", endpoint: { kind: "local", session: null, sessionFile: null }});
 		const hub = makeHub(agents);
 
 		try {
@@ -1017,13 +1017,13 @@ describe("Agent hub row ordering", () => {
 		geometry = stubStdoutGeometry(120);
 		geometry.setRows(32);
 		const agents = new AgentRegistry();
-		agents.register({ id: "Parent", displayName: "Parent", kind: "sub", parentId: "Main", session: null });
+		agents.register({ id: "Parent", displayName: "Parent", kind: "sub", parentId: "Main", endpoint: { kind: "local", session: null, sessionFile: null }});
 		agents.setActivity("Parent", "Parent task");
-		agents.register({ id: "First", displayName: "First", kind: "sub", parentId: "Parent", session: null });
+		agents.register({ id: "First", displayName: "First", kind: "sub", parentId: "Parent", endpoint: { kind: "local", session: null, sessionFile: null }});
 		agents.setActivity("First", "First task");
-		agents.register({ id: "Grandchild", displayName: "Grandchild", kind: "sub", parentId: "First", session: null });
+		agents.register({ id: "Grandchild", displayName: "Grandchild", kind: "sub", parentId: "First", endpoint: { kind: "local", session: null, sessionFile: null }});
 		agents.setActivity("Grandchild", "Grandchild task");
-		agents.register({ id: "Last", displayName: "Last", kind: "sub", parentId: "Parent", session: null });
+		agents.register({ id: "Last", displayName: "Last", kind: "sub", parentId: "Parent", endpoint: { kind: "local", session: null, sessionFile: null }});
 		agents.setActivity("Last", "Last task");
 		const hub = makeHub(agents);
 
@@ -1053,8 +1053,8 @@ describe("Agent hub row ordering", () => {
 
 	it("keeps cyclic parent links renderable in tree mode", () => {
 		const agents = new AgentRegistry();
-		agents.register({ id: "CycleA", displayName: "Cycle A", kind: "sub", parentId: "CycleB", session: null });
-		agents.register({ id: "CycleB", displayName: "Cycle B", kind: "sub", parentId: "CycleA", session: null });
+		agents.register({ id: "CycleA", displayName: "Cycle A", kind: "sub", parentId: "CycleB", endpoint: { kind: "local", session: null, sessionFile: null }});
+		agents.register({ id: "CycleB", displayName: "Cycle B", kind: "sub", parentId: "CycleA", endpoint: { kind: "local", session: null, sessionFile: null }});
 		const hub = makeHub(agents);
 
 		try {
@@ -1071,7 +1071,7 @@ describe("Agent hub row ordering", () => {
 		geometry = stubStdoutGeometry(80);
 		geometry.setRows(12);
 		const agents = new AgentRegistry();
-		agents.register({ id: "NarrowAgent", displayName: "Narrow Agent", kind: "sub", session: null });
+		agents.register({ id: "NarrowAgent", displayName: "Narrow Agent", kind: "sub", endpoint: { kind: "local", session: null, sessionFile: null }});
 		const observers = new SessionObserverRegistry();
 		vi.spyOn(observers, "getSessions").mockReturnValue([
 			{
@@ -1122,7 +1122,7 @@ describe("Agent hub row ordering", () => {
 		geometry = stubStdoutGeometry(120);
 		geometry.setRows(28);
 		const agents = new AgentRegistry();
-		agents.register({ id: "Worker", displayName: "Worker", kind: "sub", parentId: "Main", session: null });
+		agents.register({ id: "Worker", displayName: "Worker", kind: "sub", parentId: "Main", endpoint: { kind: "local", session: null, sessionFile: null }});
 		const activity = new AgentActivityIndex();
 		activity.setLive("Worker", [
 			{

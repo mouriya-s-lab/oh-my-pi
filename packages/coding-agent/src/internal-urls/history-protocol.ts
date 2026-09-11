@@ -17,7 +17,7 @@
  * - history://<agentId> - Concise markdown transcript of that agent
  */
 import type { AgentRef } from "../registry/agent-registry";
-import { AgentRegistry } from "../registry/agent-registry";
+import { AgentRegistry, getLocalSession, getLocalSessionFile } from "../registry/agent-registry";
 import { ensurePersistedRoster } from "../registry/persisted-agents";
 import { formatSessionHistoryMarkdown } from "../session/session-history-format";
 import { loadSessionMessagesReadOnly } from "../session/session-loader";
@@ -103,14 +103,18 @@ export class HistoryProtocolHandler implements ProtocolHandler {
 			const knownStr = known.length > 0 ? known.join(", ") : "none";
 			throw new Error(`Unknown agent: ${agentId}\nKnown agents: ${knownStr}\nList all with history://`);
 		}
+		// D2 dependency: a remote identity must not fall back to a same-id local transcript (#13).
+		if (ref.endpoint.kind === "remote") throw new Error("Remote history reads are not implemented (#13).");
+		const session = getLocalSession(ref);
+		const sessionFile = getLocalSessionFile(ref);
 
 		const notes: string[] = [];
 		let messages: unknown[];
-		if (ref.session) {
-			messages = ref.session.messages;
+		if (session) {
+			messages = session.messages;
 			notes.push("Source: live session");
-		} else if (ref.sessionFile) {
-			messages = await loadSessionMessagesReadOnly(ref.sessionFile);
+		} else if (sessionFile) {
+			messages = await loadSessionMessagesReadOnly(sessionFile);
 			notes.push(`Source: session file (read-only, ${ref.status})`);
 		} else {
 			// No live session and no retained sessionFile — try the disk scan before
@@ -126,7 +130,7 @@ export class HistoryProtocolHandler implements ProtocolHandler {
 			content,
 			contentType: "text/markdown",
 			size: Buffer.byteLength(content, "utf-8"),
-			sourcePath: ref.sessionFile ?? undefined,
+			sourcePath: sessionFile ?? undefined,
 			notes,
 		};
 	}

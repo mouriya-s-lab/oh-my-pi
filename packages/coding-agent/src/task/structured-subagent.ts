@@ -561,7 +561,7 @@ function attachStructuredOutputMetadata(result: SingleResult, schema: Structured
 	const output: StructuredSubagentOutput = {
 		source: schema.source,
 		mode: schema.mode,
-		status: result.exitCode === 0 ? "valid" : "invalid",
+		status: result.exitCode === null ? "unavailable" : result.exitCode === 0 ? "valid" : "invalid",
 		data: fallbackData,
 		...(result.error ? { error: result.error } : {}),
 	};

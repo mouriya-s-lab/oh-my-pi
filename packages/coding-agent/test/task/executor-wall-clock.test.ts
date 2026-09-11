@@ -230,7 +230,7 @@ describe("runSubprocess wall clock (task.maxRuntimeMs)", () => {
 					displayName: "late A",
 					kind: "sub",
 					parentId: "Main",
-					session: null,
+					endpoint: { kind: "local", session: null, sessionFile: null },
 					status: "running",
 				},
 				options.expectedAgentRef ?? null,
@@ -265,7 +265,7 @@ describe("runSubprocess wall clock (task.maxRuntimeMs)", () => {
 			displayName: "replacement B",
 			kind: "sub",
 			parentId: "Main",
-			session: replacementSession,
+			endpoint: { kind: "local", session: replacementSession, sessionFile: null },
 			status: "idle",
 		});
 		creationGate.resolve();
@@ -273,7 +273,7 @@ describe("runSubprocess wall clock (task.maxRuntimeMs)", () => {
 
 		expect(lateInstall).toBeUndefined();
 		expect(registry.get("late-generation")).toBe(replacement);
-		expect(replacement).toMatchObject({ status: "idle", session: replacementSession });
+		expect(replacement).toMatchObject({ status: "idle", endpoint: { kind: "local", session: replacementSession } });
 	});
 
 	it("a late successful yield does not flip a timed-out run to success", async () => {

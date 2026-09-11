@@ -13,8 +13,11 @@ import { persistedVibeChildIds } from "../vibe/lifecycle";
 import {
 	type AgentHistorySummary,
 	type AgentMetricsSummary,
+	type AgentRef,
 	type AgentRegistry,
 	getAgentTombstonePath,
+	getLocalSession,
+	getLocalSessionFile,
 	MAIN_AGENT_ID,
 } from "./agent-registry";
 
@@ -436,13 +439,13 @@ interface RegistryWithPersistedRosterLatches extends AgentRegistry {
 function latchOwnershipValid(registry: AgentRegistry, owned: Map<string, string>): boolean {
 	for (const [id, sessionFile] of owned) {
 		const ref = registry.get(id);
-		if (!ref || ref.sessionFile !== sessionFile) return false;
+		if (!ref || getLocalSessionFile(ref) !== sessionFile) return false;
 	}
 	return true;
 }
 
 async function resolveRootSessionFile(registry: AgentRegistry, hint?: string | null): Promise<string | undefined> {
-	const mainFile = registry.get(MAIN_AGENT_ID)?.sessionFile;
+	const mainFile = getLocalSessionFile(registry.get(MAIN_AGENT_ID));
 	const candidate =
 		typeof hint === "string" && hint.endsWith(".jsonl")
 			? hint
@@ -475,11 +478,12 @@ function sessionFileBelongsToRoot(sessionFile: string, rootSessionFile: string):
 
 /** Keep old parked trees out of a new/current session's model-facing roster. */
 export function isCurrentSessionRosterRef(
-	ref: { status: string; sessionFile: string | null },
+	ref: AgentRef,
 	rootSessionFile: string | undefined,
 ): boolean {
-	if (ref.status !== "parked" || !rootSessionFile || !ref.sessionFile) return true;
-	return sessionFileBelongsToRoot(ref.sessionFile, rootSessionFile);
+	const sessionFile = getLocalSessionFile(ref);
+	if (ref.status !== "parked" || !rootSessionFile || !sessionFile) return true;
+	return sessionFileBelongsToRoot(sessionFile, rootSessionFile);
 }
 
 /**
@@ -685,8 +689,9 @@ async function registerPersistedSubagentsFromDir(
 			const existing = registry.get(advisorId);
 			// Never clobber a non-advisor ref that happens to share this id (a freak
 			// user task literally named `<owner>/advisor`): leave it, skip the advisor.
-			if (existing && existing.kind !== "advisor") continue;
-			if (existing?.sessionFile !== sessionFile) {
+			// D2 dependency: persisted discovery cannot replace remote refs; their disk format waits for #14.
+			if (existing && (existing.kind !== "advisor" || existing.endpoint.kind === "remote")) continue;
+			if (getLocalSessionFile(existing) !== sessionFile) {
 				const metadata = await readPersistedAgentMetadata(sessionFile);
 				if (!shouldContinue()) return;
 				// The id is reused across `/new`; refresh it to the current session's file.
@@ -696,8 +701,7 @@ async function registerPersistedSubagentsFromDir(
 					displayName,
 					kind: "advisor",
 					parentId: owner,
-					session: null,
-					sessionFile,
+					endpoint: { kind: "local", session: null, sessionFile },
 					activity: metadata.activity,
 					createdAt: metadata.createdAt,
 					lastActivity: metadata.lastActivity,
@@ -724,7 +728,7 @@ async function registerPersistedSubagentsFromDir(
 		}
 		const id = entry.name.slice(0, -6);
 		const existing = registry.get(id);
-		if (vibeOwnedIds.has(id) && existing?.sessionFile !== sessionFile) continue;
+		if (vibeOwnedIds.has(id) && getLocalSessionFile(existing) !== sessionFile) continue;
 		let tombstoned = false;
 		try {
 			await fs.promises.access(getAgentTombstonePath(sessionFile));
@@ -736,15 +740,16 @@ async function registerPersistedSubagentsFromDir(
 			if (isFilesystemError(error)) throw error;
 		}
 		if (!shouldContinue()) return;
+		const existingFile = getLocalSessionFile(existing);
 		const replaceable =
 			existing !== undefined &&
 			existing.kind === "sub" &&
 			existing.status === "parked" &&
-			existing.session === null &&
-			typeof existing.sessionFile === "string" &&
-			!sessionFileBelongsToRoot(existing.sessionFile, rootSessionFile);
+			getLocalSession(existing) === null &&
+			existingFile !== null &&
+			!sessionFileBelongsToRoot(existingFile, rootSessionFile);
 		if (existing && !replaceable) {
-			if (existing.sessionFile === sessionFile) {
+			if (getLocalSessionFile(existing) === sessionFile) {
 				owned?.set(id, sessionFile);
 				transcripts.push({
 					id,
@@ -763,7 +768,8 @@ async function registerPersistedSubagentsFromDir(
 			const current = registry.get(id);
 			const stillUnclaimed = expected === null && !current;
 			const stillReplaceable =
-				expected !== null && current === expected && current.status === "parked" && current.session === null;
+				expected !== null && current === expected && current.status === "parked" &&
+					current.endpoint.kind === "local" && getLocalSession(current) === null;
 			// SessionManager.open writes title+session before createAgentSession
 			// claims the id. Parking that stub makes the spawn's expectedAgentRef:null
 			// CAS fail with "already owned by another session generation".
@@ -773,8 +779,7 @@ async function registerPersistedSubagentsFromDir(
 					displayName: id,
 					kind: "sub" as const,
 					parentId: parentId ?? MAIN_AGENT_ID,
-					session: null,
-					sessionFile,
+					endpoint: { kind: "local" as const, session: null, sessionFile },
 					activity: metadata.activity,
 					createdAt: metadata.createdAt,
 					lastActivity: metadata.lastActivity,

@@ -38,8 +38,11 @@ import type { Settings } from "../../config/settings";
 import type { MessageRenderer } from "../../extensibility/extensions/types";
 import { IrcBus } from "../../irc/bus";
 import { AgentLifecycleManager } from "../../registry/agent-lifecycle";
-import { type AgentRef, AgentRegistry, type AgentStatus, MAIN_AGENT_ID } from "../../registry/agent-registry";
+import {
+	type AgentRef, AgentRegistry, type AgentStatus, getLocalSession, getLocalSessionFile, MAIN_AGENT_ID,
+} from "../../registry/agent-registry";
 import { registerPersistedSubagents } from "../../registry/persisted-agents";
+import type { AgentSession } from "../../session/agent-session";
 import { USER_INTERRUPT_LABEL } from "../../session/messages";
 import { shortenPath, truncateToWidth } from "../../tools/render-utils";
 import { formatLocalDateTimeWithOffset } from "../../utils/local-date";
@@ -106,6 +109,7 @@ const LEFT_TAP_WINDOW_MS = 500;
 function activityGlyph(row: AgentActivityRow): string {
 	if (row.status === "error") return theme.fg("error", theme.status.error);
 	if (row.status === "aborted") return theme.fg("warning", theme.status.aborted);
+	if (row.status === "execution-unknown") return theme.fg("warning", "?");
 	if (row.status === "pending") return theme.fg("accent", theme.status.running);
 	switch (row.kind) {
 		case "response":
@@ -220,7 +224,7 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 
 	// Table state
 	#rows: AgentRef[] = [];
-	#statusCounts: Record<AgentStatus, number> = { running: 0, idle: 0, parked: 0, aborted: 0 };
+	#statusCounts: Record<AgentStatus, number> = { running: 0, idle: 0, parked: 0, aborted: 0, "execution-unknown": 0 };
 	#selectedRow = 0;
 	/** Stable roster order captured on first refresh: keyboard navigation must
 	 *  not jump as agents heartbeat. Existing agent generations keep their rank
@@ -578,7 +582,7 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 			if (children) children.push(ref);
 			else this.#childrenByParent.set(parent, [ref]);
 		}
-		this.#statusCounts = { running: 0, idle: 0, parked: 0, aborted: 0 };
+		this.#statusCounts = { running: 0, idle: 0, parked: 0, aborted: 0, "execution-unknown": 0 };
 		for (const ref of rosterRows) this.#statusCounts[ref.status]++;
 		this.#refreshAggregate();
 		this.#refreshActivityData(rosterRows);
@@ -603,11 +607,13 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 		const generation = ++this.#activitySyncGeneration;
 		const pending: Promise<void>[] = [];
 		for (const ref of refs) {
-			if (!this.#remote && !ref.sessionFile) continue;
-			const stamp = `${ref.sessionFile ?? ""}:${ref.lastActivity}`;
+			// D2 dependency: local activity readers cannot open a remote endpoint reference.
+			const sessionFile = getLocalSessionFile(ref);
+			if (!this.#remote && !sessionFile) continue;
+			const stamp = `${sessionFile ?? ""}:${ref.lastActivity}`;
 			if (this.#activitySyncStamp.get(ref.id) === stamp) continue;
 			this.#activitySyncStamp.set(ref.id, stamp);
-			pending.push(this.#activity.sync(ref.id, ref.sessionFile));
+			pending.push(this.#activity.sync(ref.id, sessionFile));
 		}
 		if (pending.length === 0) return;
 		void Promise.all(pending)
@@ -668,9 +674,9 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 	#fallbackStatsSession(
 		ref: AgentRef,
 		observed: ObservableSession | undefined,
-	): NonNullable<AgentRef["session"]> | undefined {
+	): AgentSession | undefined {
 		if (observed?.progress) return undefined;
-		const session = ref.session;
+		const session = getLocalSession(ref);
 		return session && typeof session.getSessionStats === "function" ? session : undefined;
 	}
 
@@ -1002,7 +1008,7 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 
 	#statusSummary(): string {
 		const parts: string[] = [];
-		for (const status of ["running", "idle", "parked", "aborted"] as const) {
+		for (const status of ["running", "idle", "execution-unknown", "parked", "aborted"] as const) {
 			const count = this.#statusCounts[status];
 			if (count > 0) parts.push(`${statusGlyph(status)} ${statusText(status, `${count} ${status}`)}`);
 		}
@@ -1473,7 +1479,7 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 		const focusAgent = this.#focusAgent;
 		// Aborted agents and advisor refs are read-only transcripts with no
 		// revivable session; open the in-hub viewer instead of failing ensureLive.
-		if (ref.kind === "advisor" || ref.status === "aborted" || this.#remote || !focusAgent) {
+		if (ref.kind === "advisor" || ref.status === "aborted" || ref.endpoint.kind === "remote" || this.#remote || !focusAgent) {
 			this.openChat(ref.id);
 			return;
 		}
@@ -1496,8 +1502,8 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 			this.#requestRender();
 			return;
 		}
-		if (ref.status !== "parked") {
-			this.#notice = `Agent "${ref.id}" is ${ref.status} — only parked agents can be revived.`;
+		if (ref.status !== "parked" && ref.status !== "execution-unknown") {
+			this.#notice = `Agent "${ref.id}" is ${ref.status} — only parked or execution-unknown agents can be revived.`;
 			this.#requestRender();
 			return;
 		}
@@ -1534,8 +1540,9 @@ export class AgentHubOverlayComponent extends Container implements SelectListMou
 		}
 		void (async () => {
 			try {
-				if (ref.status === "running" && ref.session) {
-					await ref.session.abort({ reason: USER_INTERRUPT_LABEL });
+				const session = getLocalSession(ref);
+				if (ref.status === "running" && session) {
+					await session.abort({ reason: USER_INTERRUPT_LABEL });
 				}
 				await this.#lifecycle().release(ref.id, ref, { tombstone: true });
 			} catch (error) {

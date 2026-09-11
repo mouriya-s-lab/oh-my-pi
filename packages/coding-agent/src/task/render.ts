@@ -82,6 +82,8 @@ function getStatusIcon(status: AgentProgress["status"], theme: Theme, spinnerFra
 			return formatStatusIcon("error", theme);
 		case "aborted":
 			return formatStatusIcon("aborted", theme);
+		case "execution-unknown":
+			return "";
 	}
 }
 
@@ -930,6 +932,8 @@ function renderAgentProgress(
 		// Finished rows keep the dot but settle from accent to the plain
 		// foreground: completion reads as a color change, not a new glyph.
 		statusLine = `${indent}${theme.styledSymbol("status.done", "text")} ${theme.fg("text", titlePart)}`;
+	} else if (progress.status === "execution-unknown") {
+		statusLine = `${indent}${theme.fg("text", titlePart)}`;
 	} else {
 		statusLine = `${indent}${theme.fg(iconColor, icon)} ${theme.fg("accent", titlePart)}`;
 	}
@@ -946,6 +950,8 @@ function renderAgentProgress(
 	} else if (progress.status === "failed" || progress.status === "aborted") {
 		const statusLabel = progress.status === "failed" ? "failed" : "aborted";
 		statusLine += ` ${formatBadge(statusLabel, iconColor, theme)}`;
+	} else if (progress.status === "execution-unknown") {
+		statusLine += ` ${theme.fg("text", "execution-unknown")}`;
 	}
 
 	const showBadge = settings.get("task.showResolvedModelBadge");
@@ -1000,7 +1006,7 @@ function renderAgentProgress(
 			`retrying ${progress.retryState.attempt}/${progress.retryState.maxAttempts} ${waitLabel}: ` +
 			previewLine(sanitizeText(progress.retryState.errorMessage), 60);
 		lines.push(`${continuePrefix}${theme.tree.hook} ${theme.fg("warning", summary)}`);
-	} else if (progress.retryFailure && progress.status !== "running") {
+	} else if (progress.retryFailure && (progress.status === "failed" || progress.status === "aborted")) {
 		const summary = `auto-retry gave up after ${progress.retryFailure.attempt} attempt${
 			progress.retryFailure.attempt === 1 ? "" : "s"
 		}: ${previewLine(sanitizeText(progress.retryFailure.errorMessage), 80)}`;
@@ -1222,27 +1228,34 @@ function renderAgentResult(
 	const lines: string[] = [];
 
 	const { warning: missingCompleteWarning, rest: outputWithoutWarning } = extractMissingYieldWarning(result.output);
-	const aborted = result.aborted ?? false;
+	const executionUnknown = result.exitCode === null;
+	const aborted = !executionUnknown && (result.aborted ?? false);
 	const mergeFailed = !aborted && result.exitCode === 0 && !!result.error;
 	const success = !aborted && result.exitCode === 0 && !result.error;
 	const needsWarning = Boolean(missingCompleteWarning) && success;
-	const icon = aborted
-		? theme.status.aborted
-		: needsWarning
-			? theme.status.warning
-			: success
-				? theme.styledSymbol("status.done", "text")
-				: theme.status.error;
-	const iconColor = needsWarning ? "warning" : success ? "success" : mergeFailed ? "warning" : "error";
-	const statusText = aborted
-		? "aborted"
-		: needsWarning
-			? "warning"
-			: success
-				? "done"
-				: mergeFailed
-					? "merge failed"
-					: "failed";
+	const icon = executionUnknown
+		? ""
+		: aborted
+			? theme.status.aborted
+			: needsWarning
+				? theme.status.warning
+				: success
+					? theme.styledSymbol("status.done", "text")
+					: theme.status.error;
+	const iconColor = executionUnknown
+		? "text"
+		: needsWarning ? "warning" : success ? "success" : mergeFailed ? "warning" : "error";
+	const statusText = executionUnknown
+		? "execution-unknown"
+		: aborted
+			? "aborted"
+			: needsWarning
+				? "warning"
+				: success
+					? "done"
+					: mergeFailed
+						? "merge failed"
+						: "failed";
 
 	// Main status line: id: description [status] · stats · ⟨agent⟩
 	const trimmedDescription = result.description ? sanitizeText(result.description).trim() : undefined;
@@ -1397,7 +1410,7 @@ function renderAgentResult(
 	// Error message
 	if (result.error && (!success || mergeFailed) && (!aborted || result.error !== result.abortReason)) {
 		lines.push(
-			`${continuePrefix}${theme.fg(mergeFailed ? "warning" : "error", previewLine(sanitizeText(result.error), 70))}`,
+			`${continuePrefix}${theme.fg(executionUnknown ? "text" : mergeFailed ? "warning" : "error", previewLine(sanitizeText(result.error), 70))}`,
 		);
 	}
 
@@ -1441,6 +1454,7 @@ function formatHiddenProgressLine(hidden: readonly AgentProgress[], theme: Theme
 		completed: 0,
 		failed: 0,
 		aborted: 0,
+		"execution-unknown": 0,
 	};
 	for (const p of hidden) counts[p.status]++;
 	const parts: string[] = [];
@@ -1449,6 +1463,7 @@ function formatHiddenProgressLine(hidden: readonly AgentProgress[], theme: Theme
 	if (counts.pending > 0) parts.push(theme.fg("dim", `${counts.pending} pending`));
 	if (counts.failed > 0) parts.push(theme.fg("error", `${counts.failed} failed`));
 	if (counts.aborted > 0) parts.push(theme.fg("error", `${counts.aborted} aborted`));
+	if (counts["execution-unknown"] > 0) parts.push(theme.fg("text", `${counts["execution-unknown"]} execution-unknown`));
 	const breakdown =
 		parts.length > 0
 			? `${theme.fg("dim", " (")}${parts.join(theme.fg("dim", theme.sep.dot))}${theme.fg("dim", ")")}`
@@ -1527,10 +1542,15 @@ export function renderResult(
 	let failCount = 0;
 	let mergeFailedCount = 0;
 	let successCount = 0;
+	let unknownCount = 0;
 	let requestTotal = 0;
 	if (hasResults) {
 		for (const r of details.results) {
 			requestTotal += r.requests ?? 0;
+			if (r.exitCode === null) {
+				unknownCount++;
+				continue;
+			}
 			if (r.aborted) abortedCount++;
 			else if (r.exitCode !== 0) failCount++;
 			else if (r.error) mergeFailedCount++;
@@ -1540,9 +1560,10 @@ export function renderResult(
 	const aborted = abortedCount > 0;
 	const failed = failCount > 0;
 	const mergeFailed = mergeFailedCount > 0;
+	const executionUnknown = unknownCount > 0 || details.progress?.some(progress => progress.status === "execution-unknown") === true;
 	const isError = aborted || failed;
 	const agentCount = hasResults ? details.results.length : (details.progress?.length ?? 0);
-	const icon: ToolUIStatus = options.isPartial ? "running" : isError ? "error" : mergeFailed ? "warning" : "success";
+	const icon: ToolUIStatus = options.isPartial ? "running" : isError ? "error" : mergeFailed || executionUnknown ? "warning" : "success";
 	// Header meta is the spawn count only; each row carries its own ⟨agent⟩
 	// badge, so a joined type list here would repeat them. Before anything
 	// spawns, fall back to the flat form's agent type from the call args.
@@ -1624,6 +1645,7 @@ export function renderResult(
 			if (successCount > 0) summaryParts.push(theme.fg("success", `${successCount} succeeded`));
 			if (mergeFailedCount > 0) summaryParts.push(theme.fg("warning", `${mergeFailedCount} merge failed`));
 			if (failCount > 0) summaryParts.push(theme.fg("error", `${failCount} failed`));
+			if (unknownCount > 0) summaryParts.push(theme.fg("text", `${unknownCount} execution-unknown`));
 			const totalRequests = requestTotal;
 			if (totalRequests > 0) summaryParts.push(theme.fg("dim", `${formatNumber(totalRequests)} req`));
 			summaryParts.push(theme.fg("dim", formatDuration(details.totalDurationMs)));
@@ -1636,7 +1658,7 @@ export function renderResult(
 			);
 		}
 
-		const state = isPartial ? "running" : isError ? "error" : mergeFailed ? "warning" : "success";
+		const state = isPartial ? "running" : isError ? "error" : mergeFailed || executionUnknown ? "warning" : "success";
 		const borderColor = isError ? "error" : "borderMuted";
 
 		if (lines.length === 0) {

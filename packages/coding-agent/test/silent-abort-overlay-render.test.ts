@@ -47,8 +47,7 @@ function makeViewer(sessionFile: string, observed: ObservableSession[]): AgentTr
 		displayName: SESSION_ID,
 		kind: "sub",
 		parentId: "Main",
-		session: null,
-		sessionFile,
+		endpoint: { kind: "local", session: null, sessionFile: sessionFile },
 		status: "parked",
 	});
 	const ui = { requestRender: () => {}, requestComponentRender: () => {} } as unknown as TUI;

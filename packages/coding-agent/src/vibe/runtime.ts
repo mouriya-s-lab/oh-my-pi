@@ -17,14 +17,20 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { logger, prompt, Snowflake } from "@oh-my-pi/pi-utils";
-import type { AsyncJob, AsyncJobManager } from "../async/job-manager";
+import type { AsyncJob, AsyncJobManager, AsyncJobRunResult } from "../async/job-manager";
 import { resolveAgentModelSelection } from "../config/model-resolver";
 import type { LocalProtocolOptions } from "../internal-urls";
 import { registerArtifactsDir } from "../internal-urls/registry-helpers";
 import { MCPManager } from "../mcp/manager";
 import vibeTurnResultTemplate from "../prompts/tools/vibe-turn-result.md" with { type: "text" };
 import { AgentLifecycleManager } from "../registry/agent-lifecycle";
-import { type AgentRef, AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
+import {
+	type AgentRef,
+	AgentRegistry,
+	getLocalSession,
+	getLocalSessionFile,
+	MAIN_AGENT_ID,
+} from "../registry/agent-registry";
 import { SessionManager, SessionPersistenceIndeterminateError } from "../session/session-manager";
 import { getBundledAgent } from "../task/agents";
 import { type ExecutorOptions, runSubagentFollowUpTurn, runSubprocess } from "../task/executor";
@@ -215,7 +221,8 @@ export interface VibeKillOutcome {
 export interface VibeWaitOutcome {
 	/** Watched sessions whose snapshotted turn settled during (or before) the wait.
 	 * May overlap `stillRunning` when a queued follow-up turn already started. */
-	settled: Array<{ id: string; jobId: string; status: "completed" | "failed" | "cancelled"; resultText: string }>;
+	// D2: retain every managed terminal verdict, including transport loss.
+	settled: Array<{ id: string; jobId: string; status: Exclude<AsyncJob["status"], "running">; resultText: string }>;
 	/** Watched sessions with a turn in flight when the wait returned. */
 	stillRunning: string[];
 	timedOut: boolean;
@@ -548,8 +555,8 @@ export class VibeSessionRegistry {
 
 	#registeredAgent(record: VibeRecord): AgentRef | undefined {
 		const ref = AgentRegistry.global().get(record.id);
-		if (ref?.kind !== "sub" || ref.parentId !== record.ownerId) return undefined;
-		if (record.childSessionFile && ref.sessionFile !== record.childSessionFile) return undefined;
+		if (ref?.kind !== "sub" || ref.parentId !== record.ownerId || ref.endpoint.kind !== "local") return undefined;
+		if (record.childSessionFile && getLocalSessionFile(ref) !== record.childSessionFile) return undefined;
 		return ref;
 	}
 
@@ -698,18 +705,19 @@ export class VibeSessionRegistry {
 		if (expected !== undefined && existing !== undefined && existing !== expected) return;
 		if (
 			existing &&
-			(existing.kind !== "sub" || existing.parentId !== ownerId || existing.sessionFile !== childSessionFile)
+			(existing.kind !== "sub" || existing.parentId !== ownerId || getLocalSessionFile(existing) !== childSessionFile)
 		) {
 			return;
 		}
-		if (existing?.status === "aborted" && !existing.session) return;
+		const localSession = getLocalSession(existing);
+		if (existing?.status === "aborted" && !localSession) return;
 		if (existing && !registry.setStatus(id, "aborted", existing)) return;
 		if (existing && teardownDeadline !== undefined) {
 			await this.#releaseRefWithinDeadline(id, existing, teardownDeadline, "release");
 		} else if (existing && AgentLifecycleManager.global().has(id, existing)) {
 			await AgentLifecycleManager.global().release(id, existing);
-		} else if (existing?.session) {
-			await existing.session.dispose();
+		} else if (localSession) {
+			await localSession.dispose();
 		}
 		const current = registry.get(id);
 		if (current && current !== existing) return;
@@ -719,8 +727,7 @@ export class VibeSessionRegistry {
 			displayName: id,
 			kind: "sub",
 			parentId: ownerId,
-			session: null,
-			sessionFile: childSessionFile,
+			endpoint: { kind: "local", session: null, sessionFile: childSessionFile },
 			status: "aborted",
 		});
 	}
@@ -796,7 +803,7 @@ export class VibeSessionRegistry {
 			const existingIsResumable =
 				existing?.kind === "sub" &&
 				existing.parentId === scope.ownerId &&
-				existing.sessionFile === childSessionFile &&
+				getLocalSessionFile(existing) === childSessionFile &&
 				(existing.status === "idle" || existing.status === "parked");
 			const blockedByCollision = Boolean(existing && !existingIsResumable);
 			const { agent, modelOverride, modelRole } = this.#resolveWorker(session, spawn.cli);
@@ -806,8 +813,7 @@ export class VibeSessionRegistry {
 					displayName: spawn.id,
 					kind: "sub",
 					parentId: scope.ownerId,
-					session: null,
-					sessionFile: childSessionFile,
+					endpoint: { kind: "local", session: null, sessionFile: childSessionFile },
 					status: "parked",
 				});
 			}
@@ -946,7 +952,7 @@ export class VibeSessionRegistry {
 		}
 
 		if (record.turn) {
-			const live = registered?.session;
+			const live = getLocalSession(registered);
 			if (live?.isStreaming) {
 				await live.steer(message);
 				record.lastActivityAt = Date.now();
@@ -1512,12 +1518,13 @@ export class VibeSessionRegistry {
 		settledJobId: string,
 		turnIndex: number,
 		result: SingleResult,
-	): Promise<string> {
+	): Promise<string | AsyncJobRunResult> {
 		await this.#finishTurn(session, manager, record, settledJobId);
-		const failed = result.exitCode !== 0 || result.aborted === true;
-		const status = result.aborted ? "aborted" : failed ? "failed" : "completed";
+		const executionUnknown = result.exitCode === null;
+		const failed = !executionUnknown && (result.exitCode !== 0 || result.aborted === true);
+		const status = executionUnknown ? "execution-unknown" : result.aborted ? "aborted" : failed ? "failed" : "completed";
 		record.lastActivity = firstLine(
-			failed
+			failed || executionUnknown
 				? `turn ${turnIndex} ${status}: ${result.abortReason ?? result.error ?? ""}`
 				: (result.lastIntent ?? result.output),
 		);
@@ -1570,6 +1577,7 @@ export class VibeSessionRegistry {
 				response,
 			].join("\n");
 		}
+		if (executionUnknown) return { status: "execution-unknown", text, structured: result.structuredOutput };
 		if (failed) throw new VibeTurnError(text);
 		return text;
 	}
@@ -1593,7 +1601,7 @@ export function aggregateVibeWorkerTokensPerSecond(ownerId: string): number | nu
 	let any = false;
 	const registry = AgentRegistry.global();
 	for (const id of ids) {
-		const workerSession = registry.get(id)?.session;
+		const workerSession = getLocalSession(registry.get(id));
 		if (!workerSession?.isStreaming) continue;
 		const rate = calculateTokensPerSecond(workerSession.state.messages, true);
 		if (rate !== null) {

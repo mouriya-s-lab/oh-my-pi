@@ -33,8 +33,7 @@ function createRef(sessionFile: string): AgentRef {
 		kind: "sub",
 		parentId: "Main",
 		status: "parked",
-		session: null,
-		sessionFile,
+		endpoint: { kind: "local", session: null, sessionFile },
 		createdAt: 0,
 		lastActivity: 0,
 	};
@@ -445,8 +444,7 @@ describe("persisted subagent revival", () => {
 			id: ref.id,
 			displayName: ref.displayName,
 			kind: "sub",
-			session: null,
-			sessionFile,
+			endpoint: { kind: "local", session: null, sessionFile: sessionFile },
 			status: "parked",
 		});
 		const reviver = await createFactory(cwd, eventBus)(ref);
@@ -499,8 +497,7 @@ describe("persisted subagent revival", () => {
 			id: ref.id,
 			displayName: ref.displayName,
 			kind: "sub",
-			session: null,
-			sessionFile,
+			endpoint: { kind: "local", session: null, sessionFile: sessionFile },
 			status: "parked",
 		});
 		const reviver = await createFactory(cwd)(ref);
@@ -548,13 +545,12 @@ describe("persisted subagent revival", () => {
 			});
 			const ref = createRef(sessionFile);
 			const registry = AgentRegistry.global();
-			registry.register({ id: "Main", displayName: "Main", kind: "main", session: null, status: "idle" });
+			registry.register({ id: "Main", displayName: "Main", kind: "main", endpoint: { kind: "local", session: null, sessionFile: null }, status: "idle" });
 			registry.register({
 				id: ref.id,
 				displayName: ref.displayName,
 				kind: "sub",
-				session: null,
-				sessionFile,
+				endpoint: { kind: "local", session: null, sessionFile: sessionFile },
 				status: "parked",
 			});
 			const reviver = await createFactory(cwd)(ref);
@@ -638,12 +634,12 @@ describe("persisted subagent revival", () => {
 				displayName: "Peer",
 				kind: "sub",
 				status: "idle",
-				session: {
+				endpoint: { kind: "local", session: {
 					deliverIrcMessage: async (msg: IrcMessage) => {
 						delivered.push(msg);
 						return "injected" as const;
 					},
-				} as unknown as AgentSession,
+				} as unknown as AgentSession, sessionFile: null }
 			});
 			const relayRecord: CustomMessage = {
 				...wakeRecord("Peer"),

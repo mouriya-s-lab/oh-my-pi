@@ -12,8 +12,10 @@ import { settings } from "../../config/settings";
 import type { RenderResultOptions } from "../../extensibility/custom-tools/types";
 import { shimmerEnabled, shimmerText } from "../../modes/theme/shimmer";
 import type { Theme } from "../../modes/theme/theme";
+import { getLocalSession } from "../../registry/agent-registry";
 import { renderStructuredJson } from "../../session/async-job-delivery";
 import { USER_INTERRUPT_LABEL } from "../../session/messages";
+import type { AgentEndpointKind } from "../../task/endpoint";
 import type { StructuredSubagentOutput } from "../../task/types";
 import { Ellipsis, Hasher, type RenderCache, renderStatusLine, renderTreeList, truncateToWidth } from "../../tui";
 import type { ToolSession } from "..";
@@ -106,7 +108,8 @@ export function runningAgentsOutsideJobs(session: ToolSession): AgentActivitySna
 	const covered = new Set<string>();
 	const manager = session.asyncJobManager;
 	if (manager) {
-		for (const job of manager.getRunningJobs(selfId ? { ownerId: selfId } : undefined)) {
+		for (const job of manager.getAllJobs(selfId ? { ownerId: selfId } : undefined)) {
+			if (job.status !== "running" && job.status !== "execution-unknown") continue;
 			covered.add(job.id);
 			if (job.agentId) covered.add(job.agentId);
 		}
@@ -114,10 +117,13 @@ export function runningAgentsOutsideJobs(session: ToolSession): AgentActivitySna
 	const now = Date.now();
 	const out: AgentActivitySnapshot[] = [];
 	for (const ref of registry.list()) {
-		if (ref.kind !== "sub" || ref.status !== "running") continue;
+		if (ref.kind !== "sub" || (ref.status !== "running" && ref.status !== "execution-unknown")) continue;
 		if (ref.id === selfId || covered.has(ref.id)) continue;
 		out.push({
 			id: ref.id,
+			// D2: an unreachable endpoint stays visible without pretending it is running.
+			endpointKind: ref.endpoint.kind,
+			status: ref.status,
 			...(ref.parentId ? { parentId: ref.parentId } : {}),
 			...(ref.activity ? { activity: ref.activity } : {}),
 			ageMs: Math.max(0, now - ref.createdAt),
@@ -129,15 +135,18 @@ export function runningAgentsOutsideJobs(session: ToolSession): AgentActivitySna
 
 /** Model-facing lines for the running-agents section shared by `jobs` and empty-wait results. */
 function describeAgents(agents: AgentActivitySnapshot[]): string[] {
-	const lines = [`## Running Agents (${agents.length}) — not job-backed\n`];
+	const lines = [`## Agents (${agents.length}) — not job-backed\n`];
 	for (const agent of agents) {
 		const parent = agent.parentId ? ` (spawned by \`${agent.parentId}\`)` : "";
 		const activity = agent.activity ? ` — ${agent.activity}` : "";
-		const stale = agent.live ? "" : " — no turn in flight (stale registration?)";
-		lines.push(`- \`${agent.id}\`${parent} — up ${formatDuration(agent.ageMs)}${activity}${stale}`);
+		const stale =
+			agent.status === "execution-unknown"
+				? " — execution-unknown"
+				: agent.live ? "" : " — no turn in flight (stale registration?)";
+		lines.push(`- \`${agent.id}\` [${agent.endpointKind}]${parent} — up ${formatDuration(agent.ageMs)}${activity}${stale}`);
 	}
-	lines.push("", "These agents have no job entry; message them via `hub` send, transcripts at `history://<id>`.");
-	if (agents.some(agent => !agent.live)) {
+	lines.push("", "These agents have no job entry; remote messaging is pending #11.");
+	if (agents.some(agent => agent.status === "running" && !agent.live)) {
 		lines.push(
 			"An agent with no turn in flight cannot answer a message and never satisfies a bare `wait`; clear it with `hub` cancel.",
 		);
@@ -148,7 +157,9 @@ function describeAgents(agents: AgentActivitySnapshot[]): string[] {
 interface TrackedJobLike {
 	id: string;
 	type: AsyncJobType;
-	status: string;
+	status: AsyncJob["status"];
+	endpointKind?: AgentEndpointKind;
+	exitCode?: number | null;
 	label: string;
 	startTime: number;
 	latestDetails?: Record<string, unknown>;
@@ -187,7 +198,10 @@ export function snapshotJobs(session: ToolSession, jobs: TrackedJobLike[]): JobS
 		return {
 			id: latest.id,
 			type: latest.type,
-			status: latest.status as JobSnapshot["status"],
+			status: latest.status,
+			// D2: snapshot consumers must not infer local success from a lost remote observer.
+			endpointKind: latest.endpointKind ?? "local",
+			exitCode: latest.status === "execution-unknown" ? null : latest.exitCode ?? (latest.status === "completed" ? 0 : null),
 			label: latest.label,
 			durationMs: Math.max(0, now - latest.startTime),
 			...(resolvedModel ? { resolvedModel } : {}),
@@ -232,9 +246,9 @@ export function buildJobResult(
 	}
 
 	if (completed.length > 0) {
-		lines.push(`## Completed (${completed.length})\n`);
+		lines.push(`## Settled (${completed.length})\n`);
 		for (const j of completed) {
-			lines.push(`### ${j.id} [${j.type}] — ${j.status}`);
+			lines.push(`### ${j.id} [${j.type} · ${j.endpointKind}] — ${j.status}`);
 			lines.push(`Label: ${j.label}`);
 			if (j.status !== "cancelled") {
 				lines.push(
@@ -272,7 +286,7 @@ export function buildJobResult(
 	if (running.length > 0) {
 		lines.push(`## Still Running (${running.length})\n`);
 		for (const j of running) {
-			lines.push(`- \`${j.id}\` [${j.type}] — ${j.label}`);
+			lines.push(`- \`${j.id}\` [${j.type} · ${j.endpointKind}] — ${j.label}`);
 		}
 	}
 
@@ -366,6 +380,11 @@ export async function executeCancel(
 			cancelOutcomes.push(await cancelAgentRegistration(session, ownerId, id));
 			continue;
 		}
+		// D2: cancelling an uncertain run does not turn its observation into a known exit.
+		if (existing.status === "execution-unknown") {
+			cancelOutcomes.push({ id, status: "execution-unknown", message: `Background job ${id} is execution-unknown.` });
+			continue;
+		}
 		if (existing.status !== "running") {
 			// The job row settled but may still be inside the retention window.
 			// The agent registration behind it (job id == agent id for task
@@ -386,7 +405,9 @@ export async function executeCancel(
 		const cancelled = manager.cancel(id, ownerFilter);
 		cancelOutcomes.push(
 			cancelled
-				? { id, status: "cancelled", message: `Cancelled background job ${id}.` }
+				? existing.endpoint
+					? { id, status: "requested", message: `Cancellation requested for endpoint job ${id}; its outcome remains authoritative.` }
+					: { id, status: "cancelled", message: `Cancelled background job ${id}.` }
 				: { id, status: "already_completed", message: `Background job ${id} is already completed.` },
 		);
 	}
@@ -418,15 +439,39 @@ async function cancelAgentRegistration(
 	if (ownerId && ref.parentId !== ownerId) {
 		return { id, status: "not_found", message: `Agent ${id} was not spawned by you and cannot be cancelled.` };
 	}
+	// D2: remote cancellation targets its run, never a fabricated resident session.
+	if (ref.endpoint.kind === "remote") {
+		const endpoint = ref.endpoint.endpoint;
+		const runId = endpoint?.asJobSnapshot().runId;
+		if (!endpoint || !runId) {
+			return { id, status: "execution-unknown", message: `Remote agent ${id} has no reachable current run.` };
+		}
+		try {
+			await endpoint.cancelRun(runId);
+		} catch (error) {
+			return { id, status: "execution-unknown", message: `Remote cancellation was not confirmed: ${String(error)}` };
+		}
+		const status = endpoint.asJobSnapshot().status;
+		if (status === "execution-unknown") {
+			registry?.setStatus(id, "execution-unknown", ref);
+			return { id, status, message: `Remote agent ${id} remains execution-unknown.` };
+		}
+		if (status === "cancelled" || status === "failed") {
+			registry?.setStatus(id, "aborted", ref);
+			return { id, status: "cancelled", message: `Remote agent ${id} reported ${status}.` };
+		}
+		return { id, status: "requested", message: `Cancellation requested for remote agent ${id}.` };
+	}
+	const localSession = getLocalSession(ref);
 	const lifecycle = session.agentLifecycle?.();
 	try {
-		if (ref.status === "running" && ref.session) {
-			await ref.session.abort({ reason: USER_INTERRUPT_LABEL });
+		if (ref.status === "running" && localSession) {
+			await localSession.abort({ reason: USER_INTERRUPT_LABEL });
 		}
 		if (lifecycle) {
 			await lifecycle.release(id);
 		} else {
-			await ref.session?.dispose();
+			await localSession?.dispose();
 			registry?.unregister(id);
 		}
 	} catch (error) {
@@ -491,6 +536,8 @@ function statusToIcon(status: JobSnapshot["status"]): ToolUIStatus {
 			return "error";
 		case "cancelled":
 			return "aborted";
+		case "execution-unknown":
+			return "warning";
 		case "running":
 			return "running";
 	}
@@ -503,6 +550,8 @@ function statusToColor(status: JobSnapshot["status"]): ToolUIColor {
 		case "failed":
 			return "error";
 		case "cancelled":
+			return "warning";
+		case "execution-unknown":
 			return "warning";
 		case "running":
 			return "accent";
@@ -583,7 +632,7 @@ export function jobsRenderResult(
 		}
 	}
 
-	const counts = { completed: 0, failed: 0, cancelled: 0, running: 0 };
+	const counts = { completed: 0, failed: 0, cancelled: 0, running: 0, "execution-unknown": 0 };
 	for (const job of jobs) counts[job.status]++;
 
 	// The title already carries the running count, so meta lists only the
@@ -592,16 +641,17 @@ export function jobsRenderResult(
 	if (counts.completed > 0) meta.push(uiTheme.fg("success", `${counts.completed} done`));
 	if (counts.failed > 0) meta.push(uiTheme.fg("error", `${counts.failed} failed`));
 	if (counts.cancelled > 0) meta.push(uiTheme.fg("warning", `${counts.cancelled} cancelled`));
+	if (counts["execution-unknown"] > 0) meta.push(uiTheme.fg("warning", `${counts["execution-unknown"]} execution-unknown`));
 	if (agents.length > 0 && jobs.length > 0) {
 		meta.push(uiTheme.fg("accent", `${agents.length} agent${agents.length === 1 ? "" : "s"}`));
 	}
 
 	const headerIcon: ToolUIStatus =
-		counts.failed > 0 ? "warning" : counts.running > 0 || agents.length > 0 ? "info" : "success";
+		counts.failed > 0 || counts["execution-unknown"] > 0 ? "warning" : counts.running > 0 || agents.length > 0 ? "info" : "success";
 	const jobsNoun = jobs.length === 1 ? "job" : "jobs";
 	const description =
 		jobs.length === 0
-			? `${agents.length} running agent${agents.length === 1 ? "" : "s"} — no jobs`
+			? `${agents.length} agent${agents.length === 1 ? "" : "s"} — no jobs`
 			: counts.running > 0
 				? counts.running === jobs.length
 					? `waiting on ${jobs.length} ${jobsNoun}`
@@ -621,6 +671,7 @@ export function jobsRenderResult(
 	// Sort: running first (so user sees what's still pending), then failed, then completed/cancelled.
 	const statusOrder: Record<JobSnapshot["status"], number> = {
 		running: 0,
+		"execution-unknown": 1,
 		failed: 1,
 		cancelled: 2,
 		completed: 3,
@@ -659,7 +710,7 @@ export function jobsRenderResult(
 							uiTheme,
 							job.status === "running" ? options.spinnerFrame : undefined,
 						);
-						const typeBadge = formatBadge(job.type, statusToColor(job.status), uiTheme);
+						const typeBadge = formatBadge(`${job.type} · ${job.endpointKind}${job.status === "execution-unknown" ? " · execution-unknown" : ""}`, statusToColor(job.status), uiTheme);
 						// Task jobs label themselves with their agent id, which is also
 						// the job id — drop the id column instead of stuttering it twice.
 						const idPart = job.label.trim() === job.id ? "" : ` ${uiTheme.fg("muted", job.id)}`;
@@ -737,9 +788,11 @@ export function jobsRenderResult(
 									const icon = agent.live
 										? formatStatusIcon("running", uiTheme, options.spinnerFrame)
 										: formatStatusIcon("warning", uiTheme);
-									const badge = agent.live
-										? formatBadge("agent", "accent", uiTheme)
-										: formatBadge("agent · no turn", "warning", uiTheme);
+									const badge = formatBadge(
+										`${agent.endpointKind} · ${agent.status === "execution-unknown" ? "execution-unknown" : agent.live ? "agent" : "agent · no turn"}`,
+										agent.live ? "accent" : "warning",
+										uiTheme,
+									);
 									const gist = agent.activity
 										? ` ${uiTheme.fg("toolOutput", truncateToWidth(replaceTabs(agent.activity), LABEL_MAX_WIDTH, Ellipsis.Unicode))}`
 										: "";

@@ -5,8 +5,9 @@
  */
 
 import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
-import type { AsyncJobType } from "../../async";
+import type { AsyncJobStatus, AsyncJobType } from "../../async";
 import type { IrcDeliveryReceipt, IrcMessage } from "../../irc/bus";
+import type { AgentEndpointKind } from "../../task/endpoint";
 import type { StructuredSubagentOutput } from "../../task/types";
 import type { LaunchParams, LaunchToolDetails } from "./launch";
 
@@ -34,6 +35,8 @@ export interface HubPeerInfo {
 	id: string;
 	displayName: string;
 	kind: string;
+	/** D2: remote peers never imply a resident local session. */
+	endpointKind: AgentEndpointKind;
 	status: string;
 	parentId?: string;
 	unread: number;
@@ -42,7 +45,7 @@ export interface HubPeerInfo {
 }
 
 /** Status values `op:"list"` can filter on. Advisor is a kind, not a status. */
-export type HubListStatus = "running" | "idle" | "parked";
+export type HubListStatus = "running" | "idle" | "parked" | "execution-unknown";
 /** Model-facing roster bounds shared by the hub schema and executor. */
 export const DEFAULT_HUB_LIST_LIMIT = 32;
 export const MAX_HUB_LIST_LIMIT = 100;
@@ -52,6 +55,7 @@ export interface HubRosterCounts {
 	running: number;
 	idle: number;
 	parked: number;
+	"execution-unknown": number;
 	shown: number;
 	truncated: number;
 }
@@ -60,7 +64,10 @@ export interface HubRosterCounts {
 export interface JobSnapshot {
 	id: string;
 	type: AsyncJobType;
-	status: "running" | "completed" | "failed" | "cancelled";
+	status: AsyncJobStatus;
+	endpointKind: AgentEndpointKind;
+	/** D2: unknown execution cannot claim a process exit code. */
+	exitCode: number | null;
 	label: string;
 	durationMs: number;
 	/** Effective task model selector, including an explicit reasoning suffix when configured. */
@@ -76,7 +83,7 @@ export interface JobSnapshot {
 	agentUrlId?: string;
 }
 
-export type CancelStatus = "cancelled" | "not_found" | "already_completed";
+export type CancelStatus = "cancelled" | "not_found" | "already_completed" | "execution-unknown" | "requested";
 
 export interface CancelOutcome {
 	id: string;
@@ -93,6 +100,8 @@ export interface CancelOutcome {
  */
 export interface AgentActivitySnapshot {
 	id: string;
+	endpointKind: AgentEndpointKind;
+	status: "running" | "execution-unknown";
 	parentId?: string;
 	/** Latest activity gist recorded by the registry (display-only). */
 	activity?: string;

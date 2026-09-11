@@ -22,7 +22,7 @@ import * as path from "node:path";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { InternalUrlRouter } from "@oh-my-pi/pi-coding-agent/internal-urls";
 import { resetRegisteredArtifactDirsForTests } from "@oh-my-pi/pi-coding-agent/internal-urls/registry-helpers";
-import { AgentRegistry, MAIN_AGENT_ID } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import { AgentRegistry, getLocalSessionFile, MAIN_AGENT_ID } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { ensurePersistedRoster } from "@oh-my-pi/pi-coding-agent/registry/persisted-agents";
 import { CURRENT_SESSION_VERSION } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
@@ -130,8 +130,7 @@ async function installGlobalMainB(registry: AgentRegistry, rootB: string): Promi
 		id: MAIN_AGENT_ID,
 		displayName: MAIN_AGENT_ID,
 		kind: "main",
-		session: null,
-		sessionFile: rootB,
+		endpoint: { kind: "local", session: null, sessionFile: rootB },
 		status: "running",
 	});
 }
@@ -167,14 +166,14 @@ describe("internal URL tools resolve against the caller root (A/B same ids)", ()
 	it("grep history://Worker serves the caller root's transcript when the global Main is the other root", async () => {
 		const registry = AgentRegistry.global();
 		await installGlobalMainB(registry, rootB);
-		expect(registry.get("Worker")?.sessionFile).toBe(childB);
+		expect(getLocalSessionFile(registry.get("Worker"))).toBe(childB);
 
 		const tool = new GrepTool(makeSession(dir, rootA));
 		const result = await tool.execute("grep-history-a", { pattern: "secret-A-line", path: "history://Worker" });
 		const text = getResultText(result);
 		expect(text).toContain("secret-A-line");
 		expect(text).not.toContain("secret-B-line");
-		expect(registry.get("Worker")?.sessionFile).toBe(childA);
+		expect(getLocalSessionFile(registry.get("Worker"))).toBe(childA);
 
 		// A settled roster latch: the second resolution reuses it — no re-scan.
 		const again = await tool.execute("grep-history-a-again", { pattern: "secret-A-line", path: "history://Worker" });
@@ -251,7 +250,7 @@ describe("internal URL tools resolve against the caller root (A/B same ids)", ()
 		const bHistory = await toolB.execute("grep-history-b", { pattern: "secret-B-line", path: "history://Worker" });
 		expect(getResultText(bHistory)).toContain("secret-B-line");
 		expect(getResultText(bHistory)).not.toContain("secret-A-line");
-		expect(registry.get("Worker")?.sessionFile).toBe(childB);
+		expect(getLocalSessionFile(registry.get("Worker"))).toBe(childB);
 		const bAgent = await toolB.execute("grep-agent-b", { pattern: "B OUTPUT", path: "agent://Worker" });
 		expect(getResultText(bAgent)).toContain("B OUTPUT");
 		expect(getResultText(bAgent)).not.toContain("A OUTPUT");

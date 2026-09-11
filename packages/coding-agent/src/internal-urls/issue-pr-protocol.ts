@@ -21,7 +21,7 @@
  *   `gh`.
  */
 import type { Settings } from "../config/settings";
-import { AgentRegistry } from "../registry/agent-registry";
+import { AgentRegistry, getLocalSession } from "../registry/agent-registry";
 import {
 	formatRepoRef,
 	getOrFetchIssue,
@@ -248,7 +248,8 @@ function parseUrl(url: InternalUrl, scheme: Scheme): Parsed {
 function resolveCwd(context: ResolveContext | undefined): string {
 	if (context?.cwd) return context.cwd;
 	for (const ref of AgentRegistry.global().list()) {
-		const cwd = ref.session?.sessionManager?.getCwd();
+		// D2 dependency: repository inference only reads local session workspaces.
+		const cwd = getLocalSession(ref)?.sessionManager?.getCwd();
 		if (cwd) return cwd;
 	}
 	return process.cwd();

@@ -240,7 +240,8 @@ export interface AgentSnapshot {
 	displayName: string;
 	kind: "main" | "sub";
 	parentId?: string;
-	status: "running" | "idle" | "parked" | "aborted";
+	/** D2 dependency: unknown execution is preserved across the existing collab snapshot. */
+	status: "running" | "idle" | "parked" | "aborted" | "execution-unknown";
 	/** Whether the host has a transcript file for this agent (gates remote transcript fetch). */
 	hasSessionFile: boolean;
 	createdAt: number;
@@ -255,7 +256,7 @@ export interface AgentProgress {
 	index: number;
 	id: string;
 	agent: string;
-	status: "pending" | "running" | "completed" | "failed" | "aborted";
+	status: "pending" | "running" | "completed" | "failed" | "aborted" | "execution-unknown";
 	task: string;
 	description?: string;
 	lastIntent?: string;
@@ -288,7 +289,7 @@ export interface SubagentLifecyclePayload {
 	id: string;
 	agent: string;
 	description?: string;
-	status: "started" | "completed" | "failed" | "aborted";
+	status: "started" | "completed" | "failed" | "aborted" | "execution-unknown";
 	sessionFile?: string;
 	parentToolCallId?: string;
 	index: number;

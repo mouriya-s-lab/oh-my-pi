@@ -361,8 +361,7 @@ describe("tool path arrays", () => {
 			displayName: "search-overlay-session",
 			kind: "sub",
 			parentId: "Main",
-			session: null,
-			sessionFile,
+			endpoint: { kind: "local", session: null, sessionFile: sessionFile },
 			status: "parked",
 		});
 

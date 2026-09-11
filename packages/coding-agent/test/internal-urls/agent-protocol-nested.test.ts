@@ -43,24 +43,21 @@ it("agent:// resolves a depth-2 subagent's .md output while its session is live 
 		id: "Main",
 		displayName: "main",
 		kind: "main",
-		session: fakeSession,
-		sessionFile: rootSessionFile,
+		endpoint: { kind: "local", session: fakeSession, sessionFile: rootSessionFile }
 	});
 	registry.register({
 		id: "CodexDeepDive",
 		displayName: "sub",
 		kind: "sub",
 		parentId: "Main",
-		session: fakeSession,
-		sessionFile: midSessionFile,
+		endpoint: { kind: "local", session: fakeSession, sessionFile: midSessionFile }
 	});
 	registry.register({
 		id: grandchildId,
 		displayName: "sub",
 		kind: "sub",
 		parentId: "CodexDeepDive",
-		session: fakeSession,
-		sessionFile: grandchildSessionFile,
+		endpoint: { kind: "local", session: fakeSession, sessionFile: grandchildSessionFile }
 	});
 
 	const resource = await new AgentProtocolHandler().resolve(new URL(`agent://${grandchildId}`) as never);
@@ -91,16 +88,14 @@ it("agent:// slash form resolves a nested subagent child (hierarchy separator)",
 		id: "Main",
 		displayName: "main",
 		kind: "main",
-		session: fakeSession,
-		sessionFile: rootSessionFile,
+		endpoint: { kind: "local", session: fakeSession, sessionFile: rootSessionFile }
 	});
 	registry.register({
 		id: "Parent",
 		displayName: "sub",
 		kind: "sub",
 		parentId: "Main",
-		session: fakeSession,
-		sessionFile: parentSessionFile,
+		endpoint: { kind: "local", session: fakeSession, sessionFile: parentSessionFile }
 	});
 
 	const handler = new AgentProtocolHandler();
@@ -129,8 +124,7 @@ it("agent:// path form falls back to JSON extraction when no nested output match
 		id: "Main",
 		displayName: "main",
 		kind: "main",
-		session: fakeSession,
-		sessionFile: rootSessionFile,
+		endpoint: { kind: "local", session: fakeSession, sessionFile: rootSessionFile }
 	});
 
 	const handler = new AgentProtocolHandler();
@@ -158,8 +152,7 @@ it("agent:// path extraction prefers the <id>.json sidecar over the markdown bod
 		id: "Main",
 		displayName: "main",
 		kind: "main",
-		session: fakeSession,
-		sessionFile: rootSessionFile,
+		endpoint: { kind: "local", session: fakeSession, sessionFile: rootSessionFile }
 	});
 
 	const handler = new AgentProtocolHandler();

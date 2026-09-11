@@ -276,7 +276,7 @@ describe("collab chunked welcome (#3144)", () => {
 			displayName: "local",
 			kind: "main",
 			parentId: undefined,
-			session: null,
+			endpoint: { kind: "local", session: null, sessionFile: null },
 			status: "running",
 		});
 

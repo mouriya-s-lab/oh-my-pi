@@ -209,8 +209,7 @@ describe("runSubprocess soft request budget", () => {
 			id,
 			displayName: id,
 			kind: "sub",
-			session,
-			sessionFile,
+			endpoint: { kind: "local", session: session, sessionFile: sessionFile },
 			status: "running",
 		});
 	}

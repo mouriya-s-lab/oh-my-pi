@@ -83,7 +83,7 @@ export interface VibeToolDetails {
 	spawned?: { id: string; cli: VibeCli; jobId: string };
 	send?: VibeSendOutcome;
 	wait?: {
-		settled: Array<{ id: string; jobId: string; status: "completed" | "failed" | "cancelled" }>;
+		settled: Array<{ id: string; jobId: string; status: VibeWaitOutcome["settled"][number]["status"] }>;
 		stillRunning: string[];
 		timedOut: boolean;
 		/** True on interim progress emissions while the wait is still blocking. */
@@ -383,15 +383,17 @@ function tvScreen(
 	uiTheme: Theme,
 	screen: VibeScreenSnapshot,
 	options: RenderResultOptions,
-	settledStatus?: "completed" | "failed" | "cancelled",
+	settledStatus?: VibeWaitOutcome["settled"][number]["status"],
 ): string[] {
 	const live = screen.state === "running" || screen.state === "starting";
 	const spinnerFrame = live ? options.spinnerFrame : undefined;
-	const icon = formatStatusIcon(
-		settledStatus === "failed" ? "error" : settledStatus === "cancelled" ? "aborted" : stateToIcon(screen.state),
-		uiTheme,
-		spinnerFrame,
-	);
+	const icon = settledStatus === "execution-unknown"
+		? ""
+		: formatStatusIcon(
+				settledStatus === "failed" ? "error" : settledStatus === "cancelled" ? "aborted" : stateToIcon(screen.state),
+				uiTheme,
+				spinnerFrame,
+			);
 	const badge = formatBadge(screen.cli, stateToColor(screen.state), uiTheme);
 	const idText =
 		live && options.spinnerFrame !== undefined && shimmerEnabled()
@@ -436,7 +438,7 @@ function tvScreen(
 	}
 	const footer = settledStatus
 		? uiTheme.fg(
-				settledStatus === "completed" ? "success" : settledStatus === "failed" ? "error" : "warning",
+				settledStatus === "execution-unknown" ? "text" : settledStatus === "completed" ? "success" : settledStatus === "failed" ? "error" : "warning",
 				`turn ${settledStatus} — result delivered`,
 			)
 		: undefined;
@@ -580,7 +582,10 @@ export function createVibeToolRenderer(op: VibeOp) {
 				const running = screens.filter(screen => screen.state === "running" || screen.state === "starting").length;
 				const meta: string[] = [];
 				if (running > 0) meta.push(uiTheme.fg("accent", `${running} on air`));
-				if (settledById.size > 0) meta.push(uiTheme.fg("success", `${settledById.size} settled`));
+				if (settledById.size > 0) {
+					const unknown = details.wait?.settled.some(entry => entry.status === "execution-unknown") === true;
+					meta.push(uiTheme.fg(unknown ? "text" : "success", `${settledById.size} settled`));
+				}
 				if (details.wait?.timedOut) meta.push(uiTheme.fg("warning", "timed out"));
 				const title =
 					op === "wait"

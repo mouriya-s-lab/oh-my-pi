@@ -12,7 +12,7 @@ import type { CustomMessage } from "./messages";
 export type AgentSessionEvent =
 	| Exclude<AgentEvent, { type: "agent_end" }>
 	| (Extract<AgentEvent, { type: "agent_end" }> & {
-			/** False when an async delivery will resume the session before its true final settle. */
+			/** D2: false marks a scheduling pause, not completion; omitted retains legacy terminal semantics. */
 			isTerminal?: boolean;
 	  })
 	| {

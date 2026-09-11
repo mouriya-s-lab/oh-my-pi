@@ -232,8 +232,7 @@ describe("collab read-only links", () => {
 			id,
 			displayName: "remote kill",
 			kind: "sub",
-			session,
-			sessionFile: "/tmp/Remote-Killed-Sub.jsonl",
+			endpoint: { kind: "local", session: session, sessionFile: "/tmp/Remote-Killed-Sub.jsonl" },
 			status: "running",
 		});
 		const killed = Promise.withResolvers<void>();
@@ -244,7 +243,7 @@ describe("collab read-only links", () => {
 			guest.socket.send({ t: "agent-cmd", cmd: "kill", agentId: id });
 			await killed.promise;
 			expect(aborts).toBe(1);
-			expect(registry.get(id)).toMatchObject({ status: "aborted", session: null });
+			expect(registry.get(id)).toMatchObject({ status: "aborted", endpoint: { kind: "local", session: null } });
 		} finally {
 			unsubscribe();
 			registry.unregister(id, ref);

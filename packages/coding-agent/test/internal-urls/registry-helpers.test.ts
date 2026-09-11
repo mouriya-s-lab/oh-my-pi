@@ -42,7 +42,7 @@ describe("hasResolvableTranscript", () => {
 			id: "Live",
 			displayName: "task",
 			kind: "sub",
-			session: fakeLiveSession(),
+			endpoint: { kind: "local", session: fakeLiveSession(), sessionFile: null },
 			status: "idle",
 		});
 		expect(await hasResolvableTranscript("Live")).toBe(true);
@@ -54,8 +54,7 @@ describe("hasResolvableTranscript", () => {
 			id: "Aborted",
 			displayName: "task",
 			kind: "sub",
-			session: null,
-			sessionFile: null,
+			endpoint: { kind: "local", session: null, sessionFile: null },
 			status: "aborted",
 		});
 		expect(await hasResolvableTranscript("Aborted")).toBe(false);
@@ -66,8 +65,7 @@ describe("hasResolvableTranscript", () => {
 			id: "Stale",
 			displayName: "task",
 			kind: "sub",
-			session: null,
-			sessionFile: "/nonexistent/definitely/gone.jsonl",
+			endpoint: { kind: "local", session: null, sessionFile: "/nonexistent/definitely/gone.jsonl" },
 			status: "aborted",
 		});
 		expect(await hasResolvableTranscript("Stale")).toBe(false);
@@ -82,8 +80,7 @@ describe("hasResolvableTranscript", () => {
 				id: "Parked",
 				displayName: "task",
 				kind: "sub",
-				session: null,
-				sessionFile,
+				endpoint: { kind: "local", session: null, sessionFile: sessionFile },
 				status: "parked",
 			});
 			expect(await hasResolvableTranscript("Parked")).toBe(true);
@@ -113,7 +110,7 @@ describe("hasResolvableTranscript", () => {
 			id: "__advisor1",
 			displayName: "advisor",
 			kind: "advisor",
-			session: fakeLiveSession(),
+			endpoint: { kind: "local", session: fakeLiveSession(), sessionFile: null },
 			status: "running",
 		});
 		expect(await hasResolvableTranscript("__advisor1")).toBe(false);

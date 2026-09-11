@@ -1,8 +1,9 @@
 import { logger, prompt } from "@oh-my-pi/pi-utils";
+import type { AsyncJobRunResult } from "../async/job-manager";
 import type { CustomTool } from "../extensibility/custom-tools/types";
 import workpoolBatchTemplate from "../prompts/tools/workpool-batch.md" with { type: "text" };
 import workpoolTurnResultTemplate from "../prompts/tools/workpool-turn-result.md" with { type: "text" };
-import { AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
+import { AgentRegistry, getLocalSession, MAIN_AGENT_ID } from "../registry/agent-registry";
 import type { CustomMessage } from "../session/messages";
 import type { ToolSession } from "../tools";
 import { isIrcEnabled } from "../tools/hub";
@@ -30,7 +31,7 @@ export interface WorkPoolItem {
 	text: string;
 	agentId?: string;
 	batchId?: string;
-	status: "queued" | "running" | "completed" | "failed" | "cancelled";
+	status: "queued" | "running" | "completed" | "failed" | "cancelled" | "execution-unknown";
 }
 
 /** Keep-alive subagent and its queued work within a pool. */
@@ -39,7 +40,7 @@ export interface WorkPoolAgent {
 	index: number;
 	/** Execution target bound at pool creation and inherited by this worker. */
 	target: ExecutionTarget;
-	state: "running" | "idle" | "dead";
+	state: "running" | "idle" | "dead" | "execution-unknown";
 	queue: WorkPoolItem[];
 	turns: number;
 	contextTokens?: number;
@@ -54,7 +55,7 @@ export interface WorkPoolBatch {
 	items: WorkPoolItem[];
 	jobId: string;
 	startedAt: number;
-	status: "running" | "completed" | "failed" | "cancelled";
+	status: "running" | "completed" | "failed" | "cancelled" | "execution-unknown";
 	output?: string;
 }
 
@@ -104,7 +105,7 @@ export interface WorkPoolCreateOptions {
 }
 
 interface TurnOutcome {
-	exitCode: number;
+	exitCode: number | null;
 	output: string;
 	error?: string;
 	aborted?: boolean;
@@ -237,8 +238,11 @@ export class WorkPool {
 					manager.unwatchJobs(batchIds);
 					this.closed = true;
 					const summary = `Pool \`${this.name}\` drained: ${this.items.length} item(s), ${this.batches.length} batch(es).`;
-					this.#card(signal.aborted ? "cancelled" : "completed", this.ownerId, summary);
-					return this.#renderAggregateResult();
+					// D2 dependency: draining an unobservable batch does not turn its outcome into success.
+					const unknown = this.batches.some(batch => batch.status === "execution-unknown");
+					this.#card(unknown ? "execution-unknown" : signal.aborted ? "cancelled" : "completed", this.ownerId, summary);
+					const text = this.#renderAggregateResult();
+					return unknown ? { status: "execution-unknown" as const, text } : text;
 				} finally {
 					signal.removeEventListener("abort", onAbort);
 				}
@@ -520,23 +524,27 @@ export class WorkPool {
 		manager.watchJobs([jobId]);
 	}
 
-	#settleTurn(agent: WorkPoolAgent, batch: WorkPoolBatch, result: TurnOutcome): string {
+	#settleTurn(agent: WorkPoolAgent, batch: WorkPoolBatch, result: TurnOutcome): string | AsyncJobRunResult {
 		this.#finishTurn(agent, batch, result);
 		const delivery = this.#renderTurnResult(agent, batch, result);
+		if (batch.status === "execution-unknown") return { status: "execution-unknown", text: delivery };
 		if (batch.status !== "completed") throw new Error(delivery);
 		return delivery;
 	}
 
 	#finishTurn(agent: WorkPoolAgent, batch: WorkPoolBatch, result: TurnOutcome): void {
-		batch.status = result.aborted ? "cancelled" : result.exitCode !== 0 || result.error ? "failed" : "completed";
+		// D2 dependency: a missing exit verdict is neither failure nor cancellation.
+		batch.status = result.exitCode === null
+			? "execution-unknown"
+			: result.aborted ? "cancelled" : result.exitCode !== 0 || result.error ? "failed" : "completed";
 		batch.output = result.output;
 		for (const item of batch.items) item.status = batch.status;
 		agent.turns++;
 		agent.jobId = undefined;
 		const ref = AgentRegistry.global().get(agent.id);
-		ref?.session?.setWorkPoolYieldItems([]);
+		getLocalSession(ref)?.setWorkPoolYieldItems([]);
 		if (this.freshAgents) {
-			agent.state = "dead";
+			agent.state = batch.status === "execution-unknown" ? "execution-unknown" : "dead";
 			const index = this.agents.indexOf(agent);
 			if (index !== -1) this.agents.splice(index, 1);
 			const next = this.#freshQueue.shift();
@@ -547,7 +555,7 @@ export class WorkPool {
 		if (ref && (ref.status === "idle" || ref.status === "parked")) {
 			this.#drain(agent);
 		} else {
-			agent.state = "dead";
+			agent.state = batch.status === "execution-unknown" ? "execution-unknown" : "dead";
 			const stranded = agent.queue.splice(0);
 			const index = this.agents.indexOf(agent);
 			if (index !== -1) this.agents.splice(index, 1);
@@ -599,7 +607,9 @@ export class WorkPool {
 
 	/** Return current workers, item counts, and context usage. */
 	status(): WorkPoolStatus {
-		const counts: WorkPoolStatus["items"] = { queued: 0, running: 0, completed: 0, failed: 0, cancelled: 0 };
+		const counts: WorkPoolStatus["items"] = {
+			queued: 0, running: 0, completed: 0, failed: 0, cancelled: 0, "execution-unknown": 0,
+		};
 		for (const item of this.items) counts[item.status]++;
 		return {
 			name: this.name,
@@ -651,7 +661,7 @@ export class WorkPool {
 	}
 
 	#card(
-		mode: "spawned" | "dispatched" | "queued" | "batch" | "completed" | "cancelled",
+		mode: "spawned" | "dispatched" | "queued" | "batch" | "completed" | "cancelled" | "execution-unknown",
 		agentId: string,
 		body: string,
 	): void {
@@ -667,7 +677,7 @@ export class WorkPool {
 			timestamp,
 		};
 		try {
-			AgentRegistry.global().get(this.ownerId)?.session?.emitIrcRelayObservation(record);
+			getLocalSession(AgentRegistry.global().get(this.ownerId))?.emitIrcRelayObservation(record);
 		} catch (error) {
 			logger.debug("workpool: card emission failed", {
 				pool: this.name,

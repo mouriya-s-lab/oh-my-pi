@@ -45,15 +45,14 @@ async function withMemoryFixture(fn: (fixture: MemoryFixture) => Promise<void>):
 			id: "test-main",
 			displayName: "test",
 			kind: "main",
-			session: {
+			endpoint: { kind: "local", session: {
 				sessionManager: {
 					getCwd: () => cwd,
 					getArtifactsDir: () => null,
 					getSessionId: () => "test",
 				},
 				settings: Settings.isolated({ "memory.backend": "local" }),
-			} as unknown as AgentSession,
-			sessionFile: null,
+			} as unknown as AgentSession, sessionFile: null }
 		});
 		await fn({ cwd, memoryRoot, agentDir, cleanupRoot });
 	} finally {
@@ -118,11 +117,10 @@ describe("MemoryProtocolHandler", () => {
 				id: "custom-session",
 				displayName: "custom-session",
 				kind: "main",
-				session: {
+				endpoint: { kind: "local", session: {
 					sessionManager: { getCwd: () => cwd, getSessionId: () => "custom-session" },
 					settings,
-				} as unknown as AgentSession,
-				sessionFile: null,
+				} as unknown as AgentSession, sessionFile: null }
 			});
 			const tool = new ReadTool({
 				cwd,
@@ -163,8 +161,7 @@ describe("MemoryProtocolHandler", () => {
 				id: "journal-owner",
 				displayName: "journal-owner",
 				kind: "main",
-				sessionFile: null,
-				session: { settings, sessionManager: manager } as unknown as AgentSession,
+				endpoint: { kind: "local", session: { settings, sessionManager: manager } as unknown as AgentSession, sessionFile: null }
 			});
 			await Bun.write(path.join(memoryRoot, "memory_summary.md"), "journal-only summary");
 			const tool = new ReadTool({
@@ -225,29 +222,27 @@ describe("MemoryProtocolHandler", () => {
 				id: "first-session",
 				displayName: "first-session",
 				kind: "main",
-				session: {
+				endpoint: { kind: "local", session: {
 					sessionManager: {
 						getCwd: () => firstCwd,
 						getArtifactsDir: () => null,
 						getSessionId: () => "first-session",
 					},
 					settings: Settings.isolated({ "memory.backend": "local" }),
-				} as unknown as AgentSession,
-				sessionFile: null,
+				} as unknown as AgentSession, sessionFile: null }
 			});
 			AgentRegistry.global().register({
 				id: "second-session",
 				displayName: "second-session",
 				kind: "main",
-				session: {
+				endpoint: { kind: "local", session: {
 					sessionManager: {
 						getCwd: () => secondCwd,
 						getArtifactsDir: () => null,
 						getSessionId: () => "second-session",
 					},
 					settings: Settings.isolated({ "memory.backend": "local" }),
-				} as unknown as AgentSession,
-				sessionFile: null,
+				} as unknown as AgentSession, sessionFile: null }
 			});
 
 			const router = InternalUrlRouter.instance();
@@ -280,16 +275,14 @@ describe("MemoryProtocolHandler", () => {
 					id,
 					displayName: id,
 					kind: "main",
-					session: {
+					endpoint: { kind: "local", session: {
 						sessionManager: {
 							getCwd: () => cwd,
 							getArtifactsDir: () => null,
 							getSessionId: () => id,
 						},
 						settings: Settings.isolated({ "memory.backend": "local" }),
-					} as unknown as AgentSession,
-					// SDK/embedded sessions are only addressable by their id.
-					sessionFile: null,
+					} as unknown as AgentSession, sessionFile: null }
 				});
 			}
 
@@ -342,29 +335,27 @@ describe("MemoryProtocolHandler", () => {
 				id: "test-first",
 				displayName: "test first",
 				kind: "main",
-				session: {
+				endpoint: { kind: "local", session: {
 					sessionManager: {
 						getCwd: () => firstCwd,
 						getArtifactsDir: () => null,
 						getSessionId: () => "test-first",
 					},
 					settings: Settings.isolated({ "memory.backend": "local" }),
-				} as unknown as AgentSession,
-				sessionFile: null,
+				} as unknown as AgentSession, sessionFile: null }
 			});
 			AgentRegistry.global().register({
 				id: "test-second",
 				displayName: "test second",
 				kind: "main",
-				session: {
+				endpoint: { kind: "local", session: {
 					sessionManager: {
 						getCwd: () => secondCwd,
 						getArtifactsDir: () => null,
 						getSessionId: () => "test-second",
 					},
 					settings: Settings.isolated({ "memory.backend": "local" }),
-				} as unknown as AgentSession,
-				sessionFile: null,
+				} as unknown as AgentSession, sessionFile: null }
 			});
 
 			const resource = await InternalUrlRouter.instance().resolve("memory://root/memory_summary.md", {
@@ -568,8 +559,7 @@ async function withMnemopiSession(fn: (fixture: MnemopiFixture) => Promise<void>
 		id: "test-mnemopi",
 		displayName: "test-mnemopi",
 		kind: "main",
-		session: fixture.session,
-		sessionFile: null,
+		endpoint: { kind: "local", session: fixture.session, sessionFile: null }
 	});
 	await fn(fixture);
 }
@@ -709,8 +699,7 @@ describe("MemoryProtocolHandler — mnemopi bridge (issue #4443)", () => {
 					id: "peer-mnemopi",
 					displayName: "peer-mnemopi",
 					kind: "main",
-					session: peerSession,
-					sessionFile: null,
+					endpoint: { kind: "local", session: peerSession, sessionFile: null }
 				});
 
 				const ownId = state.rememberInScope("caller bank row");
@@ -767,8 +756,7 @@ describe("MemoryProtocolHandler — mnemopi bridge (issue #4443)", () => {
 					id: "twin-mnemopi",
 					displayName: "twin-mnemopi",
 					kind: "main",
-					session: twinSession,
-					sessionFile: null,
+					endpoint: { kind: "local", session: twinSession, sessionFile: null }
 				});
 				const twinId = twinState.rememberInScope("twin bank row");
 				if (!twinId) throw new Error("Expected the twin mnemopi fixture to store a memory id");
@@ -808,8 +796,7 @@ describe("MemoryProtocolHandler — mnemopi bridge (issue #4443)", () => {
 				displayName: "autocomplete-child",
 				kind: "sub",
 				parentId: "test-mnemopi",
-				session: childSession,
-				sessionFile: childSessionFile,
+				endpoint: { kind: "local", session: childSession, sessionFile: childSessionFile }
 			});
 			// The child shares this cwd, so a cwd-only context names no caller and
 			// identifies no bank — what the prompt used to send.
@@ -858,8 +845,7 @@ describe("MemoryProtocolHandler — mnemopi bridge (issue #4443)", () => {
 				displayName: "hindsight-child",
 				kind: "sub",
 				parentId: "test-mnemopi",
-				session: childSession,
-				sessionFile: childSessionFile,
+				endpoint: { kind: "local", session: childSession, sessionFile: childSessionFile }
 			});
 
 			const id = state.rememberInScope("mnemopi peer row");
@@ -905,8 +891,7 @@ function withHindsightSession(fn: () => Promise<void>): Promise<void> {
 		id: "test-hindsight",
 		displayName: "test-hindsight",
 		kind: "main",
-		session,
-		sessionFile: null,
+		endpoint: { kind: "local", session: session, sessionFile: null }
 	});
 	return fn();
 }

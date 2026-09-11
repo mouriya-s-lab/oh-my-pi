@@ -7,8 +7,9 @@ import { getTaskSchema, oneLineLabel } from "@oh-my-pi/pi-coding-agent/task/type
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 
 // Contract: the task tool's wire shape is flat `{ name?, agent?, task, isolated? }`
-// (batch: `{ context, tasks[] }` of the same items). `agent` defaults to the
-// schema's spawn-policy default, and unknown keys sent by stale callers (`role`,
+// (batch: `{ context, tasks[] }` of the same items). `agent` stays optional with
+// no wire-level default — the dispatch normalizer resolves the spawn-policy
+// default before preflight — and unknown keys sent by stale callers (`role`,
 // `description`) are stripped by the schema's `+: "delete"` — never rejected.
 
 describe("oneLineLabel", () => {
@@ -58,11 +59,11 @@ describe("task wire schema", () => {
 		}
 	});
 
-	it("defaults a missing agent to 'task'", () => {
+	it("keeps an omitted agent unresolved for the dispatch normalizer", () => {
 		const parsed = taskSchema({ task: "x" });
 		expect(parsed instanceof type.errors).toBe(false);
 		if (!(parsed instanceof type.errors)) {
-			expect(parsed.agent).toBe("task");
+			expect("agent" in parsed).toBe(false);
 		}
 	});
 
@@ -76,17 +77,18 @@ describe("task wire schema", () => {
 		}
 	});
 
-	it("defaults batch item agents to 'task' on the fast path and keeps names", () => {
+	it("leaves omitted batch item agents unresolved and keeps names", () => {
 		const batch = getTaskSchema({ isolationEnabled: false, batchEnabled: true });
 		const items = parsedItems(batch({ context: "ctx", tasks: [{ name: "DbMigrator", task: "x" }] }));
-		expect(items[0]?.agent).toBe("task");
-		expect(items[0]?.name).toBe("DbMigrator");
+		const item = items[0] ?? {};
+		expect("agent" in item).toBe(false);
+		expect(item.name).toBe("DbMigrator");
 	});
 
-	it("defaults batch item agents to the schema's defaultAgent", () => {
-		const batch = getTaskSchema({ isolationEnabled: false, batchEnabled: true, defaultAgent: "scout" });
+	it("preserves an explicit batch item agent and never fills a default", () => {
+		const batch = getTaskSchema({ isolationEnabled: false, batchEnabled: true });
 		const items = parsedItems(batch({ context: "ctx", tasks: [{ task: "x" }, { agent: "reviewer", task: "y" }] }));
-		expect(items[0]?.agent).toBe("scout");
+		expect("agent" in (items[0] ?? {})).toBe(false);
 		expect(items[1]?.agent).toBe("reviewer");
 	});
 

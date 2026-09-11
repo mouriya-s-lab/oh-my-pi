@@ -41,11 +41,13 @@ describe("task spawn policy surfaces", () => {
 		vi.restoreAllMocks();
 	});
 
-	it("uses the first allowed spawn as the schema default", () => {
-		const schema = getTaskSchema({ isolationEnabled: false, batchEnabled: false, defaultAgent: "fact-finder" });
+	it("does not bake the first allowed spawn into the wire schema", () => {
+		// D1: the wire schema leaves `agent` unset; the dispatch normalizer applies
+		// the first allowed spawn as the default before local preflight (#7).
+		const schema = getTaskSchema({ isolationEnabled: false, batchEnabled: false });
 		const parsed = schema({ task: "check" });
 
-		expect(parsed).toEqual({ agent: "fact-finder", task: "check" });
+		expect(parsed).toEqual({ task: "check" });
 	});
 
 	it("filters the agent list to the restricted spawn policy in the description", async () => {

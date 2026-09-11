@@ -109,10 +109,11 @@ export const LABEL_MAX = 80;
 
 // Keep this explicit: ArkType serializes `unknown` as a boolean subschema, which llama.cpp grammars reject.
 const outputSchemaInputSchema = type("object | boolean | string | null");
-// Discriminated execution target for the flat `task` form. Both branches are
-// closed (`delete`) so undeclared keys are dropped instead of smuggled into a
-// spawn; batch variants stay target-free until per-item routing (#7).
-const targetInputSchema = type({ kind: "'local'", "+": "delete" }).or(
+// Discriminated execution target carried by the flat `task` call and by every
+// batch item. Both branches are closed (`delete`) so undeclared keys are
+// dropped instead of smuggled into a spawn; the shared dispatcher normalizes
+// and authorizes each value before any local resolution (#7).
+export const targetInputSchema = type({ kind: "'local'", "+": "delete" }).or(
 	type({
 		kind: "'ssh'",
 		host: "string",
@@ -127,20 +128,22 @@ const effortRule = '"lo" | "med" | "hi"' as const;
 
 export const taskItemSchema = type({
 	"name?": "string",
-	agent: "string = 'task'",
+	"agent?": "string>0",
 	task: "string",
 	"outputSchema?": outputSchemaInputSchema,
 	"schemaMode?": '"permissive" | "strict"',
 	"tools?": "string[]",
+	"target?": targetInputSchema,
 	"+": "delete",
 });
 const taskItemSchemaIsolated = type({
 	"name?": "string",
-	agent: "string = 'task'",
+	"agent?": "string>0",
 	task: "string",
 	"outputSchema?": outputSchemaInputSchema,
 	"schemaMode?": '"permissive" | "strict"',
 	"tools?": "string[]",
+	"target?": targetInputSchema,
 	"isolated?": "boolean",
 	"+": "delete",
 });
@@ -149,7 +152,10 @@ const taskItemSchemaIsolated = type({
 export interface TaskItem {
 	/** Stable agent name; becomes the registry/IRC id. Default = generated AdjectiveNoun. */
 	name?: string;
-	/** Agent type to run this item (e.g. "scout"). Defaults to the spawn policy's default agent. */
+	/**
+	 * Agent type to run this item (e.g. "scout"). Omitted = the spawn policy's
+	 * default agent, resolved by the dispatch normalizer, never by the wire schema.
+	 */
 	agent?: string;
 	/** The work; required by the schema. */
 	task?: string;
@@ -163,13 +169,13 @@ export interface TaskItem {
 	tools?: string[];
 	/** Run this spawn in an isolated worktree (batch form; flat form carries it top-level). */
 	isolated?: boolean;
-	/** Execution target for this spawn. Only the flat form carries it in this slice; batch per-item routing lands with #7. */
+	/** Execution target for this spawn; omitted = local. Each batch item routes independently. */
 	target?: ExecutionTarget;
 }
 
 export const taskSchema = type({
 	"name?": "string",
-	agent: "string = 'task'",
+	"agent?": "string>0",
 	task: "string",
 	"outputSchema?": outputSchemaInputSchema,
 	"schemaMode?": '"permissive" | "strict"',
@@ -180,7 +186,7 @@ export const taskSchema = type({
 });
 const taskSchemaNoIsolation = type({
 	"name?": "string",
-	agent: "string = 'task'",
+	"agent?": "string>0",
 	task: "string",
 	"outputSchema?": outputSchemaInputSchema,
 	"schemaMode?": '"permissive" | "strict"',
@@ -205,37 +211,31 @@ export type TaskSchema = typeof taskSchema;
 /** Active task tool parameter schema for the current isolation / batch flags */
 export type TaskToolSchemaInstance = DynamicTaskSchema | BaseType;
 
-const TASK_AGENT_NAME_PATTERN = /^[A-Za-z0-9_-]+$/;
 const taskSchemaCache = new Map<string, BaseType>();
-
-function taskAgentSchemaRule(defaultAgent: string): string {
-	const trimmed = defaultAgent.trim();
-	if (TASK_AGENT_NAME_PATTERN.test(trimmed)) {
-		return `string = '${trimmed}'`;
-	}
-	return "string";
-}
 
 function createTaskSchema(options: {
 	isolationEnabled: boolean;
 	batchEnabled: boolean;
-	defaultAgent: string;
 	effortEnabled: boolean;
 	evalToolsEnabled: boolean;
 }): BaseType {
-	const agent = taskAgentSchemaRule(options.defaultAgent);
+	// `agent` stays optional with no schema default: the dispatch normalizer
+	// resolves the spawn-policy default for local items and leaves a remote
+	// role unresolved until prepare (#7).
+	const agentField = { "agent?": "string>0" } as const;
 	const effortField = options.effortEnabled ? { "effort?": effortRule } : {};
 	const toolsField = options.evalToolsEnabled ? { "tools?": "string[]" } : {};
 	if (options.batchEnabled) {
 		if (options.isolationEnabled) {
 			const item = type.raw({
 				"name?": "string",
-				agent,
+				...agentField,
 				task: "string",
 				...effortField,
 				"outputSchema?": outputSchemaInputSchema,
 				"schemaMode?": '"permissive" | "strict"',
 				...toolsField,
+				"target?": targetInputSchema,
 				"isolated?": "boolean",
 				"+": "delete",
 			});
@@ -247,12 +247,13 @@ function createTaskSchema(options: {
 		}
 		const item = type.raw({
 			"name?": "string",
-			agent,
+			...agentField,
 			task: "string",
 			...effortField,
 			"outputSchema?": outputSchemaInputSchema,
 			"schemaMode?": '"permissive" | "strict"',
 			...toolsField,
+			"target?": targetInputSchema,
 			"+": "delete",
 		});
 		return type.raw({
@@ -264,7 +265,7 @@ function createTaskSchema(options: {
 	if (options.isolationEnabled) {
 		return type.raw({
 			"name?": "string",
-			agent,
+			...agentField,
 			task: "string",
 			...effortField,
 			"outputSchema?": outputSchemaInputSchema,
@@ -277,7 +278,7 @@ function createTaskSchema(options: {
 	}
 	return type.raw({
 		"name?": "string",
-		agent,
+		...agentField,
 		task: "string",
 		...effortField,
 		"outputSchema?": outputSchemaInputSchema,
@@ -295,19 +296,17 @@ export function getTaskSchema(options: {
 	effortEnabled?: boolean;
 	/** Advertise the `tools` field for eval-defined tools (`eval.tools.enabled`, default on). */
 	evalToolsEnabled?: boolean;
-	defaultAgent?: string;
 }): TaskToolSchemaInstance {
-	const defaultAgent = options.defaultAgent ?? "task";
 	const effortEnabled = options.effortEnabled ?? false;
 	const evalToolsEnabled = options.evalToolsEnabled ?? true;
-	if (defaultAgent === "task" && !effortEnabled && evalToolsEnabled) {
+	if (!effortEnabled && evalToolsEnabled) {
 		if (options.batchEnabled) return options.isolationEnabled ? taskSchemaBatch : taskSchemaBatchNoIsolation;
 		return options.isolationEnabled ? taskSchema : taskSchemaNoIsolation;
 	}
-	const key = `${options.isolationEnabled ? "iso" : "flat"}:${options.batchEnabled ? "batch" : "single"}:${effortEnabled ? "effort" : "default"}:${evalToolsEnabled ? "tools" : "notools"}:${defaultAgent}`;
+	const key = `${options.isolationEnabled ? "iso" : "flat"}:${options.batchEnabled ? "batch" : "single"}:${effortEnabled ? "effort" : "default"}:${evalToolsEnabled ? "tools" : "notools"}`;
 	const cached = taskSchemaCache.get(key);
 	if (cached) return cached;
-	const schema = createTaskSchema({ ...options, effortEnabled, evalToolsEnabled, defaultAgent });
+	const schema = createTaskSchema({ ...options, effortEnabled, evalToolsEnabled });
 	taskSchemaCache.set(key, schema);
 	return schema;
 }
@@ -339,7 +338,7 @@ export interface TaskParams {
 	context?: string;
 	/** Run in an isolated worktree (flat form; per-item in batch form). */
 	isolated?: boolean;
-	/** Execution target for the flat form: omitted / `{ kind: "local" }` keeps the local path; `ssh` is validated before any spawn and rejected until the endpoint lands (#7). */
+	/** Execution target for the flat form: omitted / `{ kind: "local" }` keeps the local path; an `ssh` route is normalized and authorized before any local resolution, then rejected until the AgentEndpoint dispatch lands (#8). */
 	target?: ExecutionTarget;
 }
 

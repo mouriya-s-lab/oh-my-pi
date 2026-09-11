@@ -1,4 +1,5 @@
 import { MAIN_AGENT_ID } from "../registry/agent-registry";
+import { normalizeAndAuthorize, REMOTE_EXECUTION_NOT_WIRED } from "../task/dispatch";
 import { createEvalCustomTools, describeEvalTools } from "../task/eval-tools";
 import { resolveEffectiveSubagentPolicy } from "../task/structured-subagent";
 import { type WorkPoolPeekResult, type WorkPoolStatus, WorkPoolRegistry } from "../task/workpool";
@@ -73,14 +74,31 @@ export async function runEvalWorkpool(args: unknown, options: EvalWorkpoolBridge
 		const requestedName = optionalString(record, "name");
 		const context = optionalString(record, "context");
 		const tools = optionalTools(record);
+		const targetInput = record.target;
+		const gate = await normalizeAndAuthorize(targetInput, {
+			session: options.session,
+			entryPoint: "workpool",
+			...(agent ? { agent } : {}),
+		});
+		if (gate.status === "error") {
+			throw new ToolError(`${gate.error.message} (code: ${gate.error.code})`, { code: gate.error.code });
+		}
+		if (gate.status === "ssh") {
+			throw new ToolError(REMOTE_EXECUTION_NOT_WIRED);
+		}
+		// Only an explicitly supplied target is carried into the pool; pools that
+		// omitted one stay on the pre-target local path with no target authorization.
+		const boundTarget = targetInput === undefined || targetInput === null ? undefined : gate.target;
 		if (tools?.length && options.session.getPlanModeState?.()?.enabled === true) {
 			throw new ToolError("Eval-defined tools are unavailable in plan mode.");
 		}
+		// The shared dispatcher already resolved the local default role for a
+		// target-carrying call; passing it here keeps one normalized identity.
 		const policy = await resolveEffectiveSubagentPolicy({
 			session: options.session,
 			invocationKind: "eval",
 			assignment: `Create workpool ${requestedName ?? agent ?? "worker"}`,
-			...(agent ? { agent } : {}),
+			agent: gate.agent,
 		});
 		const customTools = tools?.length
 			? createEvalCustomTools(options.session, await describeEvalTools(options.session, tools, options.signal))
@@ -95,17 +113,30 @@ export async function runEvalWorkpool(args: unknown, options: EvalWorkpoolBridge
 				name = `${base}-${suffix++}`;
 			}
 		}
-		const pool = registry.create(options.session, {
-			name,
-			policy,
-			...(context ? { context } : {}),
-			customTools,
-		});
+		// Target-carrying creation awaits the pool's own creation-time authorization
+		// before it is registered; target-less creation keeps the synchronous path.
+		const pool = boundTarget
+			? await registry.createAuthorized(options.session, {
+					name,
+					policy,
+					...(context ? { context } : {}),
+					customTools,
+					target: boundTarget,
+				})
+			: registry.create(options.session, {
+					name,
+					policy,
+					...(context ? { context } : {}),
+					customTools,
+				});
 		options.emitStatus?.({ op: "workpool", action: "create", pool: name, count: pool.limit() });
 		return { name, agent: policy.agentName, limit: pool.limit() };
 	}
 
 	const name = requireName(record);
+	if (record.target !== undefined) {
+		throw new ToolError("workpool binds target at creation");
+	}
 	const pool = getPool(options, name);
 	if (op === "push") {
 		if (!Array.isArray(record.items) || !record.items.every(item => typeof item === "string")) {

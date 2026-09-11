@@ -7,12 +7,19 @@ import type { CustomMessage } from "../session/messages";
 import type { ToolSession } from "../tools";
 import { isIrcEnabled } from "../tools/hub";
 import { ToolError } from "../tools/tool-errors";
+import {
+	DispatchAuthorizationError,
+	type NormalizeResult,
+	normalizeAndAuthorize,
+	REMOTE_EXECUTION_NOT_WIRED,
+} from "./dispatch";
 import { runSubagentFollowUpTurn } from "./executor";
 import {
 	type EffectiveSubagentPolicy,
 	reserveStructuredSubagentId,
 	runStructuredSubagent,
 } from "./structured-subagent";
+import type { ExecutionTarget, TargetValidationError } from "./target";
 import { type AgentProgress, oneLineLabel, type SingleResult, type TaskToolDetails } from "./types";
 import { buildWorkPoolOutputSchema, type WorkPoolYieldItem } from "./workpool-yield";
 
@@ -30,6 +37,8 @@ export interface WorkPoolItem {
 export interface WorkPoolAgent {
 	id: string;
 	index: number;
+	/** Execution target bound at pool creation and inherited by this worker. */
+	target: ExecutionTarget;
 	state: "running" | "idle" | "dead";
 	queue: WorkPoolItem[];
 	turns: number;
@@ -87,6 +96,11 @@ export interface WorkPoolCreateOptions {
 	policy: EffectiveSubagentPolicy;
 	context?: string;
 	customTools?: CustomTool[];
+	/**
+	 * Normalized execution target bound to the pool at creation; every worker
+	 * and follow-up inherits it. Omitted keeps the pre-target local path.
+	 */
+	target?: ExecutionTarget;
 }
 
 interface TurnOutcome {
@@ -99,12 +113,39 @@ interface TurnOutcome {
 
 const DELIVERY_OUTPUT_LIMIT = 6_000;
 
+/** One ToolError shape for both creation-time and per-run target verdicts. */
+function workpoolTargetError(error: TargetValidationError | DispatchAuthorizationError): ToolError {
+	return new ToolError(`${error.message} (code: ${error.code})`, { code: error.code });
+}
+
+/** Shared immutable local binding for pools created without an explicit target. */
+const LOCAL_TARGET: ExecutionTarget = Object.freeze({ kind: "local" });
+
+/**
+ * Keep a frozen shallow copy of a bound target so the caller's object cannot be
+ * mutated into a different endpoint after creation. The copy is verbatim: shape
+ * validation stays the target validator's job, never this boundary's.
+ */
+function freezeBoundTarget(target: ExecutionTarget): ExecutionTarget {
+	return Object.freeze({ ...target });
+}
+
 /** Dispatches queued items across keep-alive subagents under one aggregate job. */
 export class WorkPool {
 	readonly name: string;
 	readonly ownerId: string;
 	readonly session: ToolSession;
 	readonly policy: EffectiveSubagentPolicy;
+	/** Immutable execution target bound at creation; workers and follow-ups inherit it. */
+	readonly target: ExecutionTarget;
+	/**
+	 * Creation-time authorization of {@link target} through the shared dispatcher.
+	 * Always resolves: `undefined` for target-less pools (which stay on the legacy
+	 * local path), otherwise the dispatcher verdict. Never rejects, so the
+	 * synchronous constructor cannot leak an unhandled rejection; target-carrying
+	 * creation awaits it before the pool becomes reachable or accepts work.
+	 */
+	readonly ready: Promise<NormalizeResult | undefined>;
 	readonly context?: string;
 	readonly customTools: CustomTool[];
 	readonly freshAgents: boolean;
@@ -114,6 +155,8 @@ export class WorkPool {
 	closed = false;
 	rrCursor = 0;
 
+	/** Caller-supplied binding only: `undefined` keeps target-less pools on the legacy ungated local path. */
+	readonly #boundTarget: ExecutionTarget | undefined;
 	#nextSeq = 1;
 	#nextAgentIndex = 1;
 	#lastCardTs = 0;
@@ -129,6 +172,11 @@ export class WorkPool {
 		this.policy = options.policy;
 		this.context = options.context;
 		this.customTools = options.customTools ?? [];
+		const boundTarget = options.target === undefined ? undefined : freezeBoundTarget(options.target);
+		this.target = boundTarget ?? LOCAL_TARGET;
+		this.#boundTarget = boundTarget;
+		this.ready =
+			this.#boundTarget === undefined ? Promise.resolve(undefined) : this.#gateCreationTarget(this.#boundTarget);
 		this.freshAgents = session.settings.get("eval.workpool.freshAgents");
 		if (!session.asyncJobManager) {
 			throw new ToolError("workpool() needs the session's async job manager; unavailable here");
@@ -289,7 +337,7 @@ export class WorkPool {
 		const index = this.#nextAgentIndex++;
 		const id = await reserveStructuredSubagentId(this.session, { label: `${this.name}-${index}` });
 		if (this.closed || item.status !== "queued") return;
-		const agent: WorkPoolAgent = { id, index, state: "running", queue: [item], turns: 0 };
+		const agent: WorkPoolAgent = { id, index, target: this.target, state: "running", queue: [item], turns: 0 };
 		item.agentId = id;
 		this.agents.push(agent);
 		this.#card("spawned", id, `[${item.id}] ${item.text}`);
@@ -346,6 +394,55 @@ export class WorkPool {
 		});
 	}
 
+	/** Normalize and authorize a target through the shared dispatcher for this pool's entry point. */
+	async #normalizeTarget(target: ExecutionTarget): Promise<NormalizeResult> {
+		return await normalizeAndAuthorize(target, {
+			session: this.session,
+			entryPoint: "workpool",
+			agent: this.policy.agentName,
+		});
+	}
+
+	/** Creation gate that resolves every outcome as data instead of rejecting. */
+	async #gateCreationTarget(target: ExecutionTarget): Promise<NormalizeResult> {
+		try {
+			return await this.#normalizeTarget(target);
+		} catch (error) {
+			return {
+				status: "error",
+				error: new DispatchAuthorizationError(
+					"target-invalid",
+					error instanceof Error ? error.message : String(error),
+				),
+			};
+		}
+	}
+
+	/**
+	 * Re-normalize and authorize the worker's inherited target before a run. A
+	 * pool created without a target skips this entirely, so legacy pools never
+	 * pick up target authorization; an explicit binding first honors the
+	 * creation-time verdict from {@link ready} — a pool built directly around an
+	 * unusable target cannot later run merely because host or policy state
+	 * changed — then clears the dispatcher again for this worker and follow-up
+	 * run (and has no production ssh execution path yet).
+	 */
+	async #authorizeTarget(worker: WorkPoolAgent): Promise<void> {
+		if (this.#boundTarget === undefined) return;
+		// The worker must still carry the creation-time binding object itself; a
+		// replaced/rebuilt target is an attempt to re-point the pool mid-flight.
+		if (worker.target !== this.#boundTarget) {
+			throw new ToolError("workpool binds target at creation");
+		}
+		const creation = await this.ready;
+		if (creation?.status === "error") throw workpoolTargetError(creation.error);
+		if (creation?.status === "ssh") throw new ToolError(REMOTE_EXECUTION_NOT_WIRED);
+		const gate = await this.#normalizeTarget(worker.target);
+		if (gate.status === "local") return;
+		if (gate.status === "error") throw workpoolTargetError(gate.error);
+		throw new ToolError(REMOTE_EXECUTION_NOT_WIRED);
+	}
+
 	#startTurn(agent: WorkPoolAgent, batch: WorkPoolBatch, message: string): void {
 		const manager = this.session.asyncJobManager;
 		if (!manager) throw new ToolError("workpool() needs the session's async job manager; unavailable here");
@@ -372,6 +469,7 @@ export class WorkPool {
 				};
 				let result: SingleResult;
 				try {
+					await this.#authorizeTarget(agent);
 					if (agent.turns === 0) {
 						const execution = await runStructuredSubagent({
 							session: this.session,
@@ -601,8 +699,35 @@ export class WorkPoolRegistry {
 		return `${ownerId}\0${name}`;
 	}
 
-	/** Create a uniquely named pool for the session owner. */
+	/**
+	 * Create a pool and complete its creation-time target authorization before
+	 * registering it. Target-carrying creation uses this async path so an
+	 * unauthorized target never registers a pool; the synchronous {@link create}
+	 * stays for target-less callers.
+	 */
+	async createAuthorized(session: ToolSession, options: WorkPoolCreateOptions): Promise<WorkPool> {
+		const ownerId = session.getAgentId?.() ?? MAIN_AGENT_ID;
+		const key = this.#key(ownerId, options.name);
+		if (this.#pools.has(key)) throw new ToolError(`workpool "${options.name}" already exists`);
+		const pool = new WorkPool(session, options);
+		const gate = await pool.ready;
+		if (gate?.status === "error") throw workpoolTargetError(gate.error);
+		if (gate?.status === "ssh") throw new ToolError(REMOTE_EXECUTION_NOT_WIRED);
+		// Re-check after the await: a concurrent create may have claimed the name.
+		if (this.#pools.has(key)) throw new ToolError(`workpool "${options.name}" already exists`);
+		this.#pools.set(key, pool);
+		return pool;
+	}
+
+	/**
+	 * Create a uniquely named pool for the session owner. Target-carrying
+	 * creation must go through {@link createAuthorized}, which completes the
+	 * creation-time authorization before the pool is registered.
+	 */
 	create(session: ToolSession, options: WorkPoolCreateOptions): WorkPool {
+		if (options.target !== undefined) {
+			throw new ToolError("workpool target binding requires createAuthorized()");
+		}
 		const ownerId = session.getAgentId?.() ?? MAIN_AGENT_ID;
 		const key = this.#key(ownerId, options.name);
 		if (this.#pools.has(key)) throw new ToolError(`workpool "${options.name}" already exists`);

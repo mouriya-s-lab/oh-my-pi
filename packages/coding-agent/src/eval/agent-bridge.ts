@@ -3,6 +3,7 @@
  */
 import { type } from "@oh-my-pi/omptype";
 import { MAIN_AGENT_ID } from "../registry/agent-registry";
+import { normalizeAndAuthorize, REMOTE_EXECUTION_NOT_WIRED } from "../task/dispatch";
 import { createEvalCustomTools, describeEvalTools } from "../task/eval-tools";
 import {
 	buildStructuredSubagentRecoveryHint,
@@ -14,7 +15,8 @@ import {
 	type StructuredSubagentResult,
 	type StructuredSubagentSchemaMode,
 } from "../task/structured-subagent";
-import type { AgentProgress, SingleResult } from "../task/types";
+import type { ExecutionTarget } from "../task/target";
+import { type AgentProgress, type SingleResult, targetInputSchema } from "../task/types";
 import type { NestedRepoPatch } from "../task/worktree";
 import type { ToolSession } from "../tools";
 import { ToolError } from "../tools/tool-errors";
@@ -35,6 +37,7 @@ const agentArgsSchema = type({
 	"apply?": "boolean",
 	"merge?": "boolean",
 	"tools?": "string[]",
+	"target?": targetInputSchema,
 	"+": "delete",
 });
 
@@ -48,6 +51,7 @@ interface EvalAgentArgs {
 	apply?: boolean;
 	merge?: boolean;
 	tools?: string[];
+	target?: ExecutionTarget;
 }
 
 export interface EvalAgentBridgeOptions {
@@ -165,6 +169,17 @@ async function buildEvalAgentResult(execution: StructuredSubagentResult): Promis
 /** Register a background subagent and return its handle immediately. */
 export async function runEvalAgent(args: unknown, options: EvalAgentBridgeOptions): Promise<EvalAgentHandleResult> {
 	const parsed = parseAgentArgs(args);
+	const gate = await normalizeAndAuthorize(parsed.target, {
+		session: options.session,
+		entryPoint: "eval-agent",
+		...(parsed.agent !== undefined ? { agent: parsed.agent } : {}),
+	});
+	if (gate.status === "error") {
+		throw new ToolError(`${gate.error.message} (code: ${gate.error.code})`, { code: gate.error.code });
+	}
+	if (gate.status === "ssh") {
+		throw new ToolError(REMOTE_EXECUTION_NOT_WIRED);
+	}
 	const turnBudget = options.session.getTurnBudget?.();
 	if (turnBudget?.hard && turnBudget.total !== null && turnBudget.spent >= turnBudget.total) {
 		throw new ToolError(
@@ -192,7 +207,7 @@ export async function runEvalAgent(args: unknown, options: EvalAgentBridgeOption
 			session: options.session,
 			invocationKind: "eval",
 			assignment: parsed.prompt,
-			...(parsed.agent !== undefined ? { agent: parsed.agent } : {}),
+			agent: gate.agent,
 			...(Object.hasOwn(parsed, "schema") ? { outputSchema: parsed.schema } : {}),
 			...(parsed.schemaMode !== undefined ? { schemaMode: parsed.schemaMode } : {}),
 			...(isolation ? { isolation } : {}),

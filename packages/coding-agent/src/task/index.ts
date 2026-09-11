@@ -45,6 +45,7 @@ import "../tools/review";
 import { AsyncJobError, type AsyncJobManager } from "../async";
 import { hasResolvableTranscript } from "../internal-urls/registry-helpers";
 import { AgentRegistry } from "../registry/agent-registry";
+import { normalizeAndAuthorize, REMOTE_EXECUTION_NOT_WIRED } from "./dispatch";
 import { type DiscoveryResult, discoverAgents } from "./discovery";
 import { createEvalCustomTools, describeEvalTools, evalToolsEnabled } from "./eval-tools";
 import { generateTaskName } from "./name-generator";
@@ -53,7 +54,6 @@ import { mapWithConcurrencyLimitAllSettled, Semaphore } from "./parallel";
 import { renderResult, renderCall as renderTaskCall } from "./render";
 import { repairTaskParams } from "./repair-args";
 import { resolveEffectiveSubagentPolicy, runStructuredSubagent, StructuredSubagentError } from "./structured-subagent";
-import { validateExecutionTarget } from "./target";
 
 function renderSubagentUserPrompt(assignment: string): string {
 	return prompt.render(subagentUserPromptTemplate, {
@@ -262,8 +262,9 @@ function validateSpawnParams(params: TaskParams, batchEnabled: boolean): string 
 /**
  * Normalize a validated call into its spawn list: the `tasks[]` batch when
  * provided, otherwise the single top-level spawn. The flat form's `isolated`
- * flag is only materialized when the caller sent one — `#runSpawn`
- * distinguishes an absent key from an explicit value.
+ * and `target` are only materialized when the caller sent one — `#runSpawn`
+ * distinguishes an absent key from an explicit value, and the router reads each
+ * item's `target` so both shapes route identically.
  */
 function resolveSpawnItems(params: TaskParams): TaskItem[] {
 	if (Array.isArray(params.tasks) && params.tasks.length > 0) {
@@ -282,7 +283,8 @@ function resolveSpawnItems(params: TaskParams): TaskItem[] {
 /**
  * Per-spawn params handed to the executor path: top-level call fields with the
  * item's identity substituted in. Each spawn's `agent` resolves here —
- * the item's own value, else `defaultAgent` from the session spawn policy.
+ * the item's own value, else the dispatcher-normalized local agent (the session
+ * spawn policy default).
  * `tasks` never leaks into a spawn; the shared `context` rides along
  * unchanged. Keys are only materialized when present — `#runSpawn`
  * distinguishes an absent `isolated` from an explicit one. The item's
@@ -586,13 +588,11 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 	get parameters(): TaskToolSchemaInstance {
 		const planMode = this.session.getPlanModeState?.()?.enabled === true;
 		const isolationEnabled = !planMode && this.session.settings.get("task.isolation.enabled");
-		const defaultAgent = resolveSpawnPolicy(this.session.getSessionSpawns()).defaultAgent;
 		return getTaskSchema({
 			isolationEnabled,
 			batchEnabled: this.#isBatchEnabled(),
 			effortEnabled: this.session.settings.get("task.enableEffort"),
 			evalToolsEnabled: evalToolsEnabled(this.session),
-			defaultAgent,
 		});
 	}
 
@@ -685,9 +685,10 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		onUpdate?: AgentToolUpdateCallback<TaskToolDetails>,
 	): Promise<AgentToolResult<TaskToolDetails>> {
 		const params = repairTaskParams(rawParams as TaskParams);
-		// Schema defaults fill `agent` for model calls, but internal callers
-		// and stale transcripts can bypass arktype. `spawnParamsFor` resolves each
-		// item's agent type against the session's actual default agent.
+		// The wire schema leaves `agent` optional — no default is filled on the
+		// way in. The dispatch normalizer below resolves each item's agent
+		// against the session spawn policy; `spawnParamsFor` keeps the same
+		// resolution for internal callers and stale transcripts that bypass arktype.
 		const defaultAgent = resolveSpawnPolicy(this.session.getSessionSpawns()).defaultAgent;
 		const batchEnabled = this.#isBatchEnabled();
 		const validationError = validateShapeParams(batchEnabled, params) ?? validateSpawnParams(params, batchEnabled);
@@ -696,18 +697,53 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		}
 
 		const spawnItems = resolveSpawnItems(params);
-		// Validate the execution target before anything else can run: illegal
-		// input and unsupported (`ssh`) targets must fail here, before eval-tool
-		// or agent discovery, preflight resolution, or the async job manager
-		// observes the call (stage-1 skeleton for issue #2).
-		const targetResult = await validateExecutionTarget(params.target, { cwd: this.session.cwd });
-		if ("error" in targetResult) {
-			return createTaskModeError(`Task execution failed: ${targetResult.error.message}`);
+		// Normalize and authorize every item's execution target before anything
+		// else can run — before eval-tool resolution, agent discovery, preflight,
+		// or the async job manager observes the call. Each item routes on its own
+		// `target`, so one remote item can never drag the rest local (#7).
+		const batchForm = Array.isArray(params.tasks) && params.tasks.length > 0;
+		const routed = await Promise.all(
+			spawnItems.map(async (item, index) => ({
+				item,
+				index,
+				normalized: await normalizeAndAuthorize(item.target, {
+					session: this.session,
+					entryPoint: batchForm ? "task-batch-item" : "task-flat",
+					...(batchForm ? { itemIndex: index } : {}),
+					...(item.agent !== undefined ? { agent: item.agent } : {}),
+				}),
+			})),
+		);
+		// Every item is gated before the first error is surfaced: a batch either
+		// reports all offending items or proceeds with every route authorized.
+		const routingErrors: string[] = [];
+		const localAgents: string[] = [];
+		let remoteRoute = false;
+		for (const { item, index, normalized } of routed) {
+			switch (normalized.status) {
+				case "error": {
+					const label = batchForm ? `Task ${item.name?.trim() || `#${index + 1}`} failed: ` : "";
+					routingErrors.push(`${label}${normalized.error.message} (code: ${normalized.error.code})`);
+					break;
+				}
+				case "ssh":
+					remoteRoute = true;
+					break;
+				case "local":
+					localAgents[index] = normalized.agent;
+					break;
+			}
 		}
-		if (targetResult.target.kind === "ssh") {
-			return createTaskModeError(
-				`Task execution failed: target ${JSON.stringify(targetResult.target.host)} is an SSH endpoint; SSH execution is not yet implemented in this build (issue #7).`,
-			);
+		if (routingErrors.length > 0) {
+			if (!batchForm) {
+				return createTaskModeError(`Task execution failed: ${routingErrors[0]}`);
+			}
+			return createTaskModeError(routingErrors.join("\n"));
+		}
+		// Remote routing is authorized but not wired: no local discovery,
+		// preflight, or session work may start for an item that runs elsewhere.
+		if (remoteRoute) {
+			return createTaskModeError(`Task execution failed: ${REMOTE_EXECUTION_NOT_WIRED}`);
 		}
 		const evalToolNames = spawnItems.flatMap(item => item.tools ?? []);
 		if (evalToolNames.length > 0) {
@@ -722,7 +758,9 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				);
 			}
 		}
-		const normalizedSpawnParams = spawnItems.map(item => spawnParamsFor(params, item, defaultAgent));
+		const normalizedSpawnParams = spawnItems.map((item, index) =>
+			spawnParamsFor(params, item, localAgents[index] ?? defaultAgent),
+		);
 		const resolvedAgents = normalizedSpawnParams.map(spawn => spawn.agent ?? defaultAgent);
 		// Resolve every item before choosing an execution path. No executor or
 		// job manager may observe a batch unless every effective policy is valid.

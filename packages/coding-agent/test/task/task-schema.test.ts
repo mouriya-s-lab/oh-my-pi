@@ -18,11 +18,11 @@ describe("task schema (single-spawn)", () => {
 		expect(parsed instanceof type.errors).toBe(false);
 	});
 
-	it("defaults agent to `task` when omitted", () => {
+	it("leaves an omitted agent absent so the dispatch normalizer owns the default", () => {
 		const parsed = taskSchema({ task: "Map the auth module." });
 		expect(parsed instanceof type.errors).toBe(false);
 		if (!(parsed instanceof type.errors)) {
-			expect(parsed.agent).toBe("task");
+			expect("agent" in parsed).toBe(false);
 		}
 	});
 

@@ -5,6 +5,7 @@
 ### Added
 
 - `task` tool accepts an optional `target` field with a discriminated `{ kind: "local" | "ssh", ... }` shape. Omitting it (or `kind: "local"`) preserves the existing local execution path; `kind: "ssh"` is validated (known host, absolute `cwd`, shell-metachar-free `executable`) before any remote start and today returns a "not yet implemented" error (skeleton for [mouriya-s-lab#2](https://github.com/mouriya-s-lab/oh-my-pi/issues/2); the SSH endpoint lands under [#7](https://github.com/mouriya-s-lab/oh-my-pi/issues/7)).
+- Added the `AgentEndpoint` four-method contract (`prepare` / `start` / `run` / `cancelRun` + `terminate`) with a passive `LocalAgentEndpoint` adapter that wraps an existing `AgentSession` without changing any local execution path; the new `execution-unknown` terminal state is emitted only by remote endpoints and is not yet consumed by the monitor/registry (skeleton for [mouriya-s-lab#3](https://github.com/mouriya-s-lab/oh-my-pi/issues/3); the monitor/registry migration lands under [#8](https://github.com/mouriya-s-lab/oh-my-pi/issues/8)).
 
 ## [18.1.12] - 2026-09-06
 

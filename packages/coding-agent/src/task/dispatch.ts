@@ -1,5 +1,6 @@
 import type { ToolSession } from "../tools";
 import type { AgentEndpoint, PrepareResult, RunAck } from "./endpoint";
+import type { RunContract } from "./params";
 import { resolveSpawnPolicy } from "./spawn-policy";
 import { type ExecutionTarget, type TargetValidationError, validateExecutionTarget } from "./target";
 import { canSpawnAtDepth } from "./types";
@@ -103,6 +104,7 @@ export async function startEndpoint(
 	assignment: string,
 	signal: AbortSignal | undefined,
 	ctx: DispatchContext,
+	contract?: RunContract,
 ): Promise<RunAck> {
 	signal?.throwIfAborted();
 	const prepared = preparedEndpoints.get(endpoint);
@@ -116,7 +118,7 @@ export async function startEndpoint(
 		throw new DispatchAuthorizationError("target-invalid", "Endpoint preparation was already used or superseded.");
 	}
 	preparedEndpoints.delete(endpoint);
-	const ack = await endpoint.start(assignment);
+	const ack = await (contract === undefined ? endpoint.start(assignment) : endpoint.start(assignment, { contract }));
 	if (signal?.aborted) {
 		await endpoint.cancelRun(ack.runId);
 		signal.throwIfAborted();

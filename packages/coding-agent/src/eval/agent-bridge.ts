@@ -1,22 +1,20 @@
 /**
  * Host-side handler for the eval `agent()` helper.
  */
-import { type } from "@oh-my-pi/omptype";
 import { MAIN_AGENT_ID } from "../registry/agent-registry";
 import { normalizeAndAuthorize, REMOTE_EXECUTION_NOT_WIRED } from "../task/dispatch";
 import { createEvalCustomTools, describeEvalTools } from "../task/eval-tools";
+import { distillRunContract } from "../task/params";
 import {
 	buildStructuredSubagentRecoveryHint,
 	reserveStructuredSubagentId,
 	resolveEffectiveSubagentPolicy,
 	runStructuredSubagent,
 	StructuredSubagentError,
-	type StructuredSubagentIsolationControls,
 	type StructuredSubagentResult,
 	type StructuredSubagentSchemaMode,
 } from "../task/structured-subagent";
-import type { ExecutionTarget } from "../task/target";
-import { type AgentProgress, type SingleResult, targetInputSchema } from "../task/types";
+import type { AgentProgress, SingleResult } from "../task/types";
 import type { NestedRepoPatch } from "../task/worktree";
 import type { ToolSession } from "../tools";
 import { ToolError } from "../tools/tool-errors";
@@ -27,32 +25,6 @@ import "../tools/review";
 /** Synthetic bridge name reserved for the `agent()` helper across both runtimes. */
 export const EVAL_AGENT_BRIDGE_NAME = "__agent__";
 
-const agentArgsSchema = type({
-	prompt: "string>0",
-	"agent?": "string>0",
-	"label?": "string",
-	"schema?": "unknown",
-	"schemaMode?": "'permissive' | 'strict'",
-	"isolated?": "boolean",
-	"apply?": "boolean",
-	"merge?": "boolean",
-	"tools?": "string[]",
-	"target?": targetInputSchema,
-	"+": "delete",
-});
-
-interface EvalAgentArgs {
-	prompt: string;
-	agent?: string;
-	label?: string;
-	schema?: unknown;
-	schemaMode?: StructuredSubagentSchemaMode;
-	isolated?: boolean;
-	apply?: boolean;
-	merge?: boolean;
-	tools?: string[];
-	target?: ExecutionTarget;
-}
 
 export interface EvalAgentBridgeOptions {
 	session: ToolSession;
@@ -87,13 +59,6 @@ export interface EvalAgentResult {
 	};
 }
 
-function parseAgentArgs(args: unknown): EvalAgentArgs {
-	const result = agentArgsSchema(args);
-	if (result instanceof type.errors) {
-		throw new ToolError(`agent() received invalid arguments: ${result.summary}`);
-	}
-	return result;
-}
 
 function trimToUndefined(value: string | undefined): string | undefined {
 	const trimmed = value?.trim();
@@ -168,8 +133,13 @@ async function buildEvalAgentResult(execution: StructuredSubagentResult): Promis
 
 /** Register a background subagent and return its handle immediately. */
 export async function runEvalAgent(args: unknown, options: EvalAgentBridgeOptions): Promise<EvalAgentHandleResult> {
-	const parsed = parseAgentArgs(args);
-	const gate = await normalizeAndAuthorize(parsed.target, {
+	const distilled = distillRunContract(args, "eval");
+	if ("error" in distilled) {
+		throw new ToolError(distilled.error.message, { paramsError: distilled.error, code: distilled.error.code });
+	}
+	const parsed = distilled.contract;
+	const target = args !== null && typeof args === "object" && "target" in args ? args.target : undefined;
+	const gate = await normalizeAndAuthorize(target, {
 		session: options.session,
 		entryPoint: "eval-agent",
 		...(parsed.agent !== undefined ? { agent: parsed.agent } : {}),
@@ -190,34 +160,24 @@ export async function runEvalAgent(args: unknown, options: EvalAgentBridgeOption
 		throw new ToolError("Eval-defined tools are unavailable in plan mode.");
 	}
 
-	const isolation: StructuredSubagentIsolationControls | undefined =
-		Object.hasOwn(parsed, "isolated") || Object.hasOwn(parsed, "apply") || Object.hasOwn(parsed, "merge")
-			? {
-					...(parsed.isolated !== undefined ? { requested: parsed.isolated } : {}),
-					...(parsed.merge === false ? { merge: "patch" } : {}),
-					...(parsed.apply !== undefined ? { apply: parsed.apply } : {}),
-				}
-			: undefined;
 	const customTools = parsed.tools?.length
-		? createEvalCustomTools(options.session, await describeEvalTools(options.session, parsed.tools, options.signal))
+		? createEvalCustomTools(options.session, await describeEvalTools(options.session, [...parsed.tools], options.signal))
 		: undefined;
 
 	try {
 		const policy = await resolveEffectiveSubagentPolicy({
 			session: options.session,
 			invocationKind: "eval",
-			assignment: parsed.prompt,
+			assignment: parsed.task,
+			contract: parsed,
 			agent: gate.agent,
-			...(Object.hasOwn(parsed, "schema") ? { outputSchema: parsed.schema } : {}),
-			...(parsed.schemaMode !== undefined ? { schemaMode: parsed.schemaMode } : {}),
-			...(isolation ? { isolation } : {}),
 			...(customTools ? { customTools } : {}),
 		});
 		const manager = options.session.asyncJobManager;
 		if (!manager) {
 			throw new ToolError("agent() needs the session's async job manager; unavailable here");
 		}
-		const id = await reserveStructuredSubagentId(options.session, { label: parsed.label });
+		const id = await reserveStructuredSubagentId(options.session, { label: distilled.local.label ?? distilled.local.name });
 		const ownerId = options.session.getAgentId?.() ?? MAIN_AGENT_ID;
 		manager.register(
 			"task",
@@ -229,12 +189,10 @@ export async function runEvalAgent(args: unknown, options: EvalAgentBridgeOption
 					const execution = await runStructuredSubagent({
 						session: options.session,
 						invocationKind: "eval",
-						assignment: parsed.prompt,
+						assignment: parsed.task,
+						contract: parsed,
 						...(parsed.agent !== undefined ? { agent: parsed.agent } : {}),
-						...(Object.hasOwn(parsed, "schema") ? { outputSchema: parsed.schema } : {}),
-						...(parsed.schemaMode !== undefined ? { schemaMode: parsed.schemaMode } : {}),
-						identity: { id, label: parsed.label },
-						...(isolation ? { isolation } : {}),
+						identity: { id, label: distilled.local.label ?? distilled.local.name },
 						...(customTools ? { customTools } : {}),
 						retainArtifacts: true,
 						keepAlive: true,

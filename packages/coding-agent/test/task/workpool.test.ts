@@ -102,6 +102,9 @@ function execution(id: string, output?: string): StructuredSubagentResult {
 	};
 }
 
+// #12: workpool item IDs are stable unique ULIDs minted at push, not name#seq counters.
+const ULID_RE = /^[0-9A-HJKMNP-TV-Z]{26}$/;
+
 function markIdle(id: string): void {
 	AgentRegistry.global().register({
 		id,
@@ -173,9 +176,12 @@ describe("WorkPool dispatch", () => {
 		});
 		const workpool = pool(session);
 
-		expect(workpool.push(["one", "two", "three", "four"])).toEqual(["review#1", "review#2", "review#3", "review#4"]);
+		const pushed = workpool.push(["one", "two", "three", "four"]);
+		expect(pushed).toHaveLength(4);
+		for (const id of pushed) expect(id).toMatch(ULID_RE);
+		expect(new Set(pushed).size).toBe(4);
 		await until(() => workpool.agents.length === 2 && workpool.agents.every(agent => agent.queue.length === 1));
-		expect(workpool.agents.map(agent => agent.queue[0]?.id)).toEqual(["review#3", "review#4"]);
+		expect(workpool.agents.map(agent => agent.queue[0]?.id)).toEqual([pushed[2], pushed[3]]);
 		expect(cards.map(cardMode)).toEqual(["spawned", "spawned", "queued", "queued"]);
 
 		gates.get(workpool.agents[0]!.id)?.resolve();
@@ -205,12 +211,14 @@ describe("WorkPool dispatch", () => {
 			return singleResult(options.id, "second batch");
 		});
 		const workpool = pool(session, "handoff");
-		workpool.push(["first", "second"]);
+		const pushed = workpool.push(["first", "second"]);
+		expect(pushed).toHaveLength(2);
+		for (const id of pushed) expect(id).toMatch(ULID_RE);
 		await until(() => workpool.agents[0]?.queue.length === 1);
 		first.resolve();
 		await until(() => followSpy.mock.calls.length === 1);
-		expect(workpool.batches.map(batch => batch.items.map(item => item.id))).toEqual([["handoff#1"], ["handoff#2"]]);
-		expect(followSpy.mock.calls[0]?.[0].workPoolYieldItems).toEqual([{ id: "handoff#2", index: 1 }]);
+		expect(workpool.batches.map(batch => batch.items.map(item => item.id))).toEqual([[pushed[0]], [pushed[1]]]);
+		expect(followSpy.mock.calls[0]?.[0].workPoolYieldItems).toEqual([{ id: pushed[1], index: 1 }]);
 		expect(followSpy.mock.calls[0]?.[0].message).toContain("After EACH item");
 		expect(followSpy.mock.calls[0]?.[0].message).not.toContain("todo");
 		follow.resolve();
@@ -372,9 +380,10 @@ describe("WorkPool dispatch", () => {
 			return execution(id);
 		});
 		const workpool = pool(session, "closing");
-		workpool.push(["running", "queued"]);
+		const pushed = workpool.push(["running", "queued"]);
+		for (const id of pushed) expect(id).toMatch(ULID_RE);
 		await until(() => workpool.items[0]?.status === "running" && workpool.items[1]?.status === "queued");
-		expect(workpool.close()).toEqual({ dropped: ["closing#2"] });
+		expect(workpool.close()).toEqual({ dropped: [pushed[1]] });
 		expect(workpool.items[1]?.status).toBe("cancelled");
 		first.resolve();
 		await finishPool(session, workpool);

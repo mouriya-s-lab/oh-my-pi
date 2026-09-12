@@ -52,10 +52,12 @@ import {
 	type ResourceRef,
 	type RunAck,
 	type RunOutcome,
+	type RunOpts,
 	UI_RESPONSE_DEFERRED,
 	type UiResponse,
 } from "../endpoint";
 import { ReplyDrainedBarrier, type ReplyDrainedFacts, type ReplyDrainedResult } from "../reply-drained";
+import { checkIsolationSupport, ParamsError, type RunContract, validateRunOutput } from "../params";
 import type { StructuredSubagentOutput } from "../types";
 
 /**
@@ -84,6 +86,8 @@ export interface LocalTerminalResult {
 	error?: string;
 	usage?: Usage;
 	structured?: StructuredSubagentOutput;
+	paramsError?: ParamsError;
+	remoteArtifacts?: RunOutcome["remoteArtifacts"];
 }
 
 export interface LocalAgentEndpointOptions {
@@ -100,6 +104,8 @@ export interface LocalAgentEndpointOptions {
 	managed?: boolean;
 	/** Resolves with the current run's terminal verdict. */
 	awaitTerminal: (signal?: AbortSignal) => Promise<LocalTerminalResult>;
+	/** Drives an explicit contract through the owning execution-domain runner. */
+	executeContract?: (contract: RunContract, signal?: AbortSignal) => Promise<LocalTerminalResult>;
 	/** Cancels the current run. The endpoint delegates; it never touches the session. */
 	cancelRun: (runId: string) => Promise<void>;
 	/** Releases the session's resources on `terminate()`. */
@@ -132,6 +138,9 @@ export class LocalAgentEndpoint implements AgentEndpoint {
 	readonly #barrier = new ReplyDrainedBarrier();
 	readonly #bus: IrcBus;
 	readonly #managed: boolean;
+	readonly #executeContract?: LocalAgentEndpointOptions["executeContract"];
+	#contract?: RunContract;
+	#signal?: AbortSignal;
 	#currentRunId: string | null = null;
 	#currentStatus: EndpointSnapshot["status"] = "idle";
 	#lastMessage: string | undefined;
@@ -154,6 +163,7 @@ export class LocalAgentEndpoint implements AgentEndpoint {
 		this.#terminateHook = options.terminate;
 		this.#bus = options.bus ?? IrcBus.global();
 		this.#managed = options.managed === true;
+		this.#executeContract = options.executeContract;
 		this.#events = new EndpointEventStream(this.handle.kind, () => this.#snapshot());
 	}
 
@@ -165,9 +175,11 @@ export class LocalAgentEndpoint implements AgentEndpoint {
 	}
 
 	/** Records the current run and returns immediately; the ACK is not an outcome. */
-	async start(assignment: string): Promise<RunAck> {
-		const runId = crypto.randomUUID();
+	async start(assignment: string, opts?: RunOpts): Promise<RunAck> {
+		const runId = opts?.runId ?? crypto.randomUUID();
 		const acceptedAt = Date.now();
+		this.#contract = opts?.contract;
+		this.#signal = opts?.signal;
 		this.#currentRunId = runId;
 		this.#currentStatus = "running";
 		this.#lastMessage = assignment.trim() || undefined;
@@ -185,9 +197,37 @@ export class LocalAgentEndpoint implements AgentEndpoint {
 	}
 
 	/** Waits for the session's terminal event and records its verdict on the shared run state. */
-	async run(runId: string, signal?: AbortSignal): Promise<RunOutcome> {
+	async run(runId: string, signalOrOpts?: AbortSignal | RunOpts): Promise<RunOutcome> {
 		this.#assertCurrent(runId, "run");
-		const terminal = await this.#awaitTerminal(signal);
+		const opts = signalOrOpts instanceof AbortSignal ? { signal: signalOrOpts } : signalOrOpts;
+		const signal = opts?.signal ?? this.#signal;
+		const contract = opts?.contract ?? this.#contract;
+		let terminal: LocalTerminalResult;
+		const unsupported = contract && !this.#executeContract ? this.#unsupportedContract(contract) : undefined;
+		if (unsupported) {
+			terminal = { status: "failed", error: unsupported.message, paramsError: unsupported };
+		} else {
+			try {
+				terminal = contract && this.#executeContract
+					? await this.#executeContract(contract, signal)
+					: await this.#awaitTerminal(signal);
+			} catch (error) {
+				if (!(error instanceof ParamsError)) throw error;
+				terminal = { status: "failed", error: error.message, paramsError: error };
+			}
+		}
+		if (contract && terminal.status === "completed") {
+			let data: unknown = terminal.structured?.data;
+			if (!terminal.structured && terminal.text !== undefined) {
+				try { data = JSON.parse(terminal.text); } catch { data = terminal.text; }
+			}
+			const error = validateRunOutput(contract, data) ??
+				(contract.schemaMode === "strict" && terminal.structured?.status !== undefined &&
+					terminal.structured.status !== "valid"
+					? new ParamsError("strict-schema-unsatisfied", terminal.structured.error ?? "Strict output is unavailable", "outputSchema")
+					: undefined);
+			if (error) terminal = { ...terminal, status: "failed", error: error.message, paramsError: error };
+		}
 		this.#currentStatus = terminal.status;
 		this.#verdictStatus = terminal.status;
 		const outcome: RunOutcome = { status: terminal.status, runId };
@@ -195,6 +235,8 @@ export class LocalAgentEndpoint implements AgentEndpoint {
 		if (terminal.error !== undefined) outcome.error = terminal.error;
 		if (terminal.usage !== undefined) outcome.usage = terminal.usage;
 		if (terminal.structured !== undefined) outcome.structured = terminal.structured;
+		if (terminal.paramsError !== undefined) outcome.paramsError = terminal.paramsError;
+		if (terminal.remoteArtifacts !== undefined) outcome.remoteArtifacts = terminal.remoteArtifacts;
 		this.#events.emit({ type: "run_outcome", runId, outcome });
 		const message = this.#lastMessage;
 		this.#events.emit({
@@ -383,6 +425,31 @@ export class LocalAgentEndpoint implements AgentEndpoint {
 		};
 		if (this.#lastMessage !== undefined) snapshot.message = this.#lastMessage;
 		return snapshot;
+	}
+
+	#unsupportedContract(contract: RunContract): ParamsError | undefined {
+		const isolation = checkIsolationSupport(contract, false);
+		if (isolation) return isolation;
+		for (const key of Object.keys(contract) as (keyof RunContract)[]) {
+			switch (key) {
+				case "task": case "outputSchema": case "schemaMode": case "detached":
+					break;
+				case "agent":
+					if (contract.agent !== this.#agent) return new ParamsError("conflict-with-remote-policy", "The wrapped session has a different agent", key);
+					break;
+				case "tools":
+					if (contract.tools?.length) return new ParamsError("host-tool-denied", "The wrapped session cannot grant explicit host tools", key);
+					break;
+				case "isolated":
+					break;
+				case "context": case "model": case "effort": case "apply": case "merge":
+				case "keepAlive": case "retainArtifacts": case "timeout": case "budget":
+				case "depth": case "spawns": case "workpoolItems": case "freshAgents":
+					if (contract[key] !== undefined) return new ParamsError("conflict-with-remote-policy", `The wrapped session cannot apply ${key}; an execution contract runner is required`, key);
+					break;
+			}
+		}
+		return undefined;
 	}
 
 	#assertCurrent(runId: string, method: string): void {

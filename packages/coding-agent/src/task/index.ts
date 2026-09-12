@@ -50,6 +50,7 @@ import { type DiscoveryResult, discoverAgents } from "./discovery";
 import { createEvalCustomTools, describeEvalTools, evalToolsEnabled } from "./eval-tools";
 import { generateTaskName } from "./name-generator";
 import { AgentOutputManager } from "./output-manager";
+import { distillRunContract, ParamsError, type RunContract } from "./params";
 import { mapWithConcurrencyLimitAllSettled, Semaphore } from "./parallel";
 import { renderResult, renderCall as renderTaskCall } from "./render";
 import { repairTaskParams } from "./repair-args";
@@ -175,10 +176,10 @@ function renderDescription(options: TaskDescriptionOptions): string {
 	});
 }
 
-function createTaskModeError(text: string): AgentToolResult<TaskToolDetails> {
+function createTaskModeError(text: string, paramsError?: ParamsError): AgentToolResult<TaskToolDetails> {
 	return {
 		content: [{ type: "text", text }],
-		details: { projectAgentsDir: null, results: [], totalDurationMs: 0 },
+		details: { projectAgentsDir: null, results: [], totalDurationMs: 0, ...(paramsError ? { paramsError } : {}) },
 	};
 }
 
@@ -270,13 +271,7 @@ function resolveSpawnItems(params: TaskParams): TaskItem[] {
 	if (Array.isArray(params.tasks) && params.tasks.length > 0) {
 		return params.tasks;
 	}
-	const item: TaskItem = { name: params.name, agent: params.agent, task: params.task };
-	if ("outputSchema" in params) item.outputSchema = params.outputSchema;
-	if ("schemaMode" in params) item.schemaMode = params.schemaMode;
-	if ("tools" in params) item.tools = params.tools;
-	if ("effort" in params) item.effort = params.effort;
-	if ("isolated" in params) item.isolated = params.isolated;
-	if ("target" in params) item.target = params.target;
+	const { tasks: _tasks, context: _context, ...item } = params;
 	return [item];
 }
 
@@ -291,20 +286,16 @@ function resolveSpawnItems(params: TaskParams): TaskItem[] {
  * `isolated` (batch form) wins over the top-level flag (flat form).
  */
 function spawnParamsFor(params: TaskParams, item: TaskItem, defaultAgent: string): TaskParams {
-	const spawn: TaskParams = { agent: item.agent?.trim() || defaultAgent };
-	if (item.name !== undefined) spawn.name = item.name;
-	if (item.task !== undefined) spawn.task = item.task;
+	const spawn: TaskParams = { ...item, agent: item.agent ?? defaultAgent };
 	if (params.context !== undefined) spawn.context = params.context;
-	if ("outputSchema" in item) spawn.outputSchema = item.outputSchema;
-	if ("schemaMode" in item) spawn.schemaMode = item.schemaMode;
-	if ("tools" in item) spawn.tools = item.tools;
-	if ("effort" in item) spawn.effort = item.effort;
-	if (item.isolated !== undefined) {
-		spawn.isolated = item.isolated;
-	} else if ("isolated" in params) {
-		spawn.isolated = params.isolated;
-	}
+	if (item.isolated === undefined && params.isolated !== undefined) spawn.isolated = params.isolated;
 	return spawn;
+}
+
+function taskRunContract(params: TaskParams): RunContract {
+	const distilled = distillRunContract(params, "task");
+	if ("error" in distilled) throw distilled.error;
+	return distilled.contract;
 }
 
 /** One sync-executed spawn: its item, position in the original call, and (for mixed calls) a pre-claimed agent id. */
@@ -656,6 +647,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		return resolveEffectiveSubagentPolicy({
 			session: this.session,
 			invocationKind: "task",
+			contract: taskRunContract(params),
 			assignment: (params.task ?? "").trim(),
 			context: this.#isBatchEnabled() ? params.context?.trim() || undefined : undefined,
 			agent: params.agent,
@@ -691,12 +683,21 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		// resolution for internal callers and stale transcripts that bypass arktype.
 		const defaultAgent = resolveSpawnPolicy(this.session.getSessionSpawns()).defaultAgent;
 		const batchEnabled = this.#isBatchEnabled();
+		// Shape validation owns the call-level diagnostics (missing `task`/`tasks`,
+		// `context`, duplicates) so a malformed call keeps its batch-aware message;
+		// the contract pass below only rejects unknown or mistyped parameters.
 		const validationError = validateShapeParams(batchEnabled, params) ?? validateSpawnParams(params, batchEnabled);
 		if (validationError) {
 			return createTaskModeError(validationError);
 		}
+		const distilled = distillRunContract(params, "task");
+		if ("error" in distilled) return createTaskModeError(distilled.error.message, distilled.error);
 
 		const spawnItems = resolveSpawnItems(params);
+		for (const item of spawnItems) {
+			const distilledItem = distillRunContract(item, "task");
+			if ("error" in distilledItem) return createTaskModeError(distilledItem.error.message, distilledItem.error);
+		}
 		// Normalize and authorize every item's execution target before anything
 		// else can run — before eval-tool resolution, agent discovery, preflight,
 		// or the async job manager observes the call. Each item routes on its own
@@ -1525,6 +1526,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			const execution = await runStructuredSubagent({
 				session: this.session,
 				invocationKind: "task",
+				contract: taskRunContract(params),
 				assignment,
 				context,
 				agent: params.agent,
@@ -1587,6 +1589,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					projectAgentsDir: null,
 					results: [],
 					totalDurationMs: Date.now() - startTime,
+					...(error instanceof ParamsError ? { paramsError: error } : {}),
 					...(latestProgress ? { progress: [latestProgress] } : {}),
 				},
 			};

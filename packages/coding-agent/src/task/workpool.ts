@@ -14,6 +14,9 @@ import {
 	normalizeAndAuthorize,
 	REMOTE_EXECUTION_NOT_WIRED,
 } from "./dispatch";
+import { RunBoundsLedger } from "./budget-tracker";
+import type { AgentEndpoint } from "./endpoint";
+import { createWorkpoolItem, ParamsError, type RunContract } from "./params";
 import { runSubagentFollowUpTurn } from "./executor";
 import {
 	type EffectiveSubagentPolicy,
@@ -27,7 +30,6 @@ import { buildWorkPoolOutputSchema, type WorkPoolYieldItem } from "./workpool-yi
 /** One user-supplied unit tracked through a workpool batch. */
 export interface WorkPoolItem {
 	id: string;
-	seq: number;
 	text: string;
 	agentId?: string;
 	batchId?: string;
@@ -97,6 +99,9 @@ export interface WorkPoolCreateOptions {
 	policy: EffectiveSubagentPolicy;
 	context?: string;
 	customTools?: CustomTool[];
+	/** Explicit endpoint binding; never resolved from the process registry. */
+	endpoint?: AgentEndpoint;
+	contract?: RunContract;
 	/**
 	 * Normalized execution target bound to the pool at creation; every worker
 	 * and follow-up inherits it. Omitted keeps the pre-target local path.
@@ -110,6 +115,7 @@ interface TurnOutcome {
 	error?: string;
 	aborted?: boolean;
 	abortReason?: string;
+	paramsError?: ParamsError;
 }
 
 const DELIVERY_OUTPUT_LIMIT = 6_000;
@@ -150,6 +156,9 @@ export class WorkPool {
 	readonly context?: string;
 	readonly customTools: CustomTool[];
 	readonly freshAgents: boolean;
+	readonly endpoint?: AgentEndpoint;
+	readonly contract?: RunContract;
+	readonly #bounds: RunBoundsLedger;
 	readonly agents: WorkPoolAgent[] = [];
 	readonly items: WorkPoolItem[] = [];
 	readonly batches: WorkPoolBatch[] = [];
@@ -158,7 +167,6 @@ export class WorkPool {
 
 	/** Caller-supplied binding only: `undefined` keeps target-less pools on the legacy ungated local path. */
 	readonly #boundTarget: ExecutionTarget | undefined;
-	#nextSeq = 1;
 	#nextAgentIndex = 1;
 	#lastCardTs = 0;
 	#dispatchChain: Promise<void> = Promise.resolve();
@@ -173,12 +181,15 @@ export class WorkPool {
 		this.policy = options.policy;
 		this.context = options.context;
 		this.customTools = options.customTools ?? [];
+		this.endpoint = options.endpoint;
+		this.contract = options.contract;
+		this.#bounds = new RunBoundsLedger(options.contract ?? {});
 		const boundTarget = options.target === undefined ? undefined : freezeBoundTarget(options.target);
 		this.target = boundTarget ?? LOCAL_TARGET;
 		this.#boundTarget = boundTarget;
 		this.ready =
 			this.#boundTarget === undefined ? Promise.resolve(undefined) : this.#gateCreationTarget(this.#boundTarget);
-		this.freshAgents = session.settings.get("eval.workpool.freshAgents");
+		this.freshAgents = options.contract?.freshAgents ?? session.settings.get("eval.workpool.freshAgents");
 		if (!session.asyncJobManager) {
 			throw new ToolError("workpool() needs the session's async job manager; unavailable here");
 		}
@@ -199,8 +210,7 @@ export class WorkPool {
 		if (texts.length === 0) return [];
 		const queued: WorkPoolItem[] = [];
 		for (const text of texts) {
-			const seq = this.#nextSeq++;
-			const item: WorkPoolItem = { id: `${this.name}#${seq}`, seq, text, status: "queued" };
+			const item: WorkPoolItem = { ...createWorkpoolItem(text), status: "queued" };
 			this.items.push(item);
 			queued.push(item);
 		}
@@ -256,7 +266,7 @@ export class WorkPool {
 	}
 
 	async #waitForDrain(): Promise<void> {
-		if (this.#isDrained()) return;
+		if (this.#isDrained() && (!this.contract?.keepAlive || this.closed)) return;
 		const waiter = Promise.withResolvers<void>();
 		this.#drainWaiters.push(waiter);
 		await waiter.promise;
@@ -267,7 +277,7 @@ export class WorkPool {
 	}
 
 	#notifyDrained(): void {
-		if (!this.#isDrained()) return;
+		if (!this.#isDrained() || (this.contract?.keepAlive && !this.closed)) return;
 		for (const waiter of this.#drainWaiters.splice(0)) waiter.resolve();
 	}
 
@@ -339,7 +349,9 @@ export class WorkPool {
 
 	async #spawn(item: WorkPoolItem): Promise<void> {
 		const index = this.#nextAgentIndex++;
-		const id = await reserveStructuredSubagentId(this.session, { label: `${this.name}-${index}` });
+		const id = this.endpoint
+			? crypto.randomUUID()
+			: await reserveStructuredSubagentId(this.session, { label: `${this.name}-${index}` });
 		if (this.closed || item.status !== "queued") return;
 		const agent: WorkPoolAgent = { id, index, target: this.target, state: "running", queue: [item], turns: 0 };
 		item.agentId = id;
@@ -448,6 +460,10 @@ export class WorkPool {
 	}
 
 	#startTurn(agent: WorkPoolAgent, batch: WorkPoolBatch, message: string): void {
+		if (this.endpoint) {
+			this.#startEndpointTurn(agent, batch, message);
+			return;
+		}
 		const manager = this.session.asyncJobManager;
 		if (!manager) throw new ToolError("workpool() needs the session's async job manager; unavailable here");
 		const workPoolYieldItems: WorkPoolYieldItem[] = batch.items.map((item, index) => ({
@@ -478,6 +494,8 @@ export class WorkPool {
 						const execution = await runStructuredSubagent({
 							session: this.session,
 							invocationKind: "eval",
+							contract: this.#initialContract(message),
+							boundsLedger: this.#bounds,
 							assignment: message,
 							...(this.context ? { context: this.context } : {}),
 							agent: this.policy.agentName,
@@ -497,6 +515,17 @@ export class WorkPool {
 					} else {
 						result = await runSubagentFollowUpTurn({
 							id: agent.id,
+							contract: {
+								task: message,
+								context: this.contract?.context,
+								outputSchema: this.contract?.outputSchema ?? outputSchema,
+								schemaMode: this.contract?.schemaMode ?? "strict",
+								timeout: this.contract?.timeout,
+								budget: this.contract?.budget,
+								depth: this.contract?.depth,
+								spawns: this.contract?.spawns,
+							},
+							boundsLedger: this.#bounds,
 							agent: this.policy.agent,
 							message,
 							outputSchema,
@@ -524,11 +553,72 @@ export class WorkPool {
 		manager.watchJobs([jobId]);
 	}
 
+	#initialContract(message: string): RunContract {
+		const { freshAgents: _freshAgents, workpoolItems: _items, ...contract } = this.contract ?? { task: message };
+		return { ...contract, task: message };
+	}
+
+	#startEndpointTurn(agent: WorkPoolAgent, batch: WorkPoolBatch, message: string): void {
+		const endpoint = this.endpoint!;
+		const manager = this.session.asyncJobManager!;
+		const jobId = manager.register(
+			"task",
+			batch.id,
+			async ({ signal, markRunning }) => {
+				markRunning();
+				let result: TurnOutcome;
+				try {
+					await this.#authorizeTarget(agent);
+					const denied = this.#bounds.reserve({ spawn: agent.turns === 0 });
+					if (denied) throw denied;
+					const remaining = this.#bounds.remainingTimeoutMs();
+					const runSignal = remaining === undefined
+						? signal
+						: AbortSignal.any([signal, AbortSignal.timeout(Math.max(0, Math.ceil(remaining)))]);
+					const contract: RunContract = {
+						...this.contract,
+						task: message,
+						workpoolItems: batch.items.map(({ id, text }) => ({ id, text })),
+						...(this.contract?.freshAgents === undefined ? {} : { freshAgents: this.freshAgents }),
+					};
+					const ack = await endpoint.start(message, { runId: batch.id, signal: runSignal, contract });
+					const outcome = await endpoint.run(ack.runId, { signal: runSignal, contract });
+					const boundsError = outcome.usage
+						? this.#bounds.recordUsage(outcome.usage.totalTokens)
+						: this.#bounds.check();
+					result = {
+						exitCode: outcome.status === "execution-unknown" ? null : outcome.status === "completed" ? 0 : 1,
+						output: outcome.text ?? "",
+						error: outcome.error ?? boundsError?.message,
+						paramsError: outcome.paramsError ?? boundsError,
+						aborted: outcome.status === "cancelled",
+					};
+				} catch (error) {
+					const output = error instanceof Error ? error.message : String(error);
+					result = {
+						exitCode: 1,
+						output,
+						error: output,
+						...(error instanceof ParamsError ? { paramsError: error } : {}),
+					};
+				}
+				return this.#settleTurn(agent, batch, result);
+			},
+			{ id: batch.id, agentId: agent.id, ownerId: this.ownerId },
+		);
+		batch.jobId = jobId;
+		agent.jobId = jobId;
+		manager.watchJobs([jobId]);
+	}
+
 	#settleTurn(agent: WorkPoolAgent, batch: WorkPoolBatch, result: TurnOutcome): string | AsyncJobRunResult {
 		this.#finishTurn(agent, batch, result);
 		const delivery = this.#renderTurnResult(agent, batch, result);
 		if (batch.status === "execution-unknown") return { status: "execution-unknown", text: delivery };
-		if (batch.status !== "completed") throw new Error(delivery);
+		if (batch.status !== "completed") {
+			if (result.paramsError) throw new ToolError(delivery, { paramsError: result.paramsError, code: result.paramsError.code });
+			throw new Error(delivery);
+		}
 		return delivery;
 	}
 
@@ -541,8 +631,8 @@ export class WorkPool {
 		for (const item of batch.items) item.status = batch.status;
 		agent.turns++;
 		agent.jobId = undefined;
-		const ref = AgentRegistry.global().get(agent.id);
-		getLocalSession(ref)?.setWorkPoolYieldItems([]);
+		const ref = this.endpoint ? undefined : AgentRegistry.global().get(agent.id);
+		if (!this.endpoint) getLocalSession(ref)?.setWorkPoolYieldItems([]);
 		if (this.freshAgents) {
 			agent.state = batch.status === "execution-unknown" ? "execution-unknown" : "dead";
 			const index = this.agents.indexOf(agent);
@@ -552,7 +642,7 @@ export class WorkPool {
 			this.#notifyDrained();
 			return;
 		}
-		if (ref && (ref.status === "idle" || ref.status === "parked")) {
+		if ((this.endpoint && batch.status === "completed") || (ref && (ref.status === "idle" || ref.status === "parked"))) {
 			this.#drain(agent);
 		} else {
 			agent.state = batch.status === "execution-unknown" ? "execution-unknown" : "dead";
@@ -665,6 +755,7 @@ export class WorkPool {
 		agentId: string,
 		body: string,
 	): void {
+		if (this.endpoint) return;
 		const timestamp = Math.max(Date.now(), this.#lastCardTs + 1);
 		this.#lastCardTs = timestamp;
 		const record: CustomMessage = {

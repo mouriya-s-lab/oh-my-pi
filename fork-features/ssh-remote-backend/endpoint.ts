@@ -73,6 +73,7 @@ import {
 	type ResourceReadResult,
 	type ResourceRef,
 	type RunAck,
+	type RunOpts,
 	type RunOutcome,
 	type RunOutcomeStatus,
 	UI_RESPONSE_DEFERRED,
@@ -196,7 +197,8 @@ export class SshBackendEndpoint implements AgentEndpoint {
 	 * nevertheless started stays tracked, so its terminal frame cannot land on
 	 * an endpoint that believes it is idle.
 	 */
-	async start(assignment: string): Promise<RunAck> {
+	async start(assignment: string, opts?: RunOpts): Promise<RunAck> {
+		opts?.signal?.throwIfAborted();
 		if (this.#terminated)
 			throw new Error("SshBackendEndpoint.start: the endpoint is terminated and cannot accept another run");
 		if (this.#pendingStart !== undefined)
@@ -217,7 +219,10 @@ export class SshBackendEndpoint implements AgentEndpoint {
 			// Both half-facts are required; `Promise.all` observes each rejection,
 			// so a failure on one arm never surfaces as an unhandled rejection on
 			// the other.
-			const prompt = this.#client.prompt(assignment).then(() => {
+			const request = opts?.contract === undefined
+				? this.#client.prompt(assignment)
+				: this.#client.startRun(assignment, opts.contract);
+			const prompt = request.then(() => {
 				if (this.#currentRunId === previousRunId) {
 					throw new RpcClientError("protocol-incompatible", "Prompt acknowledgement omitted its managed run-start frame");
 				}
@@ -230,7 +235,8 @@ export class SshBackendEndpoint implements AgentEndpoint {
 	}
 
 	/** Wait for the current run's single verdict, which the peer's terminal frame decides. */
-	async run(runId: string, signal?: AbortSignal): Promise<RunOutcome> {
+	async run(runId: string, signalOrOpts?: AbortSignal | RunOpts): Promise<RunOutcome> {
+		const signal = signalOrOpts instanceof AbortSignal ? signalOrOpts : signalOrOpts?.signal;
 		this.#assertCurrent(runId, "run");
 		// A verdict that already landed is a fact, not a pending wait: report it
 		// even when the caller's signal has aborted the wait it no longer needs.
@@ -405,7 +411,7 @@ export class SshBackendEndpoint implements AgentEndpoint {
 		if (event.runId !== this.#currentRunId) return;
 		if (this.#verdict !== undefined) return;
 		this.#terminalRevision = event.runStatusRevision;
-		this.#settleRun(event.runId, event.status);
+		this.#settleRun(event.runId, event.status, undefined, event);
 	}
 
 	/** Record the peer's acceptance and hand the waiting `start()` its receipt. */
@@ -441,13 +447,20 @@ export class SshBackendEndpoint implements AgentEndpoint {
 	 * a known ending. Text and usage gathered during the run ride along; a run
 	 * that reported none carries none.
 	 */
-	#settleRun(runId: string, status: RunOutcomeStatus, error?: string): void {
+	#settleRun(
+		runId: string,
+		status: RunOutcomeStatus,
+		error?: string,
+		terminal?: Extract<RpcManagedRunEvent, { type: "managed_run_end" }>,
+	): void {
 		if (this.#verdict !== undefined || runId !== this.#currentRunId) return;
 		const outcome: RunOutcome = { status, runId };
 		if (this.#capturedText.length > 0) outcome.text = this.#capturedText.join("");
 		const failure = error ?? this.#capturedError;
 		if (status !== "completed" && failure !== undefined) outcome.error = failure;
 		if (this.#capturedUsage !== undefined) outcome.usage = this.#capturedUsage;
+		if (terminal?.remoteArtifacts !== undefined) outcome.remoteArtifacts = terminal.remoteArtifacts;
+		if (terminal?.paramsError !== undefined) outcome.paramsError = terminal.paramsError;
 		this.#verdict = outcome;
 		this.#currentStatus = status;
 		this.#stopCapture();

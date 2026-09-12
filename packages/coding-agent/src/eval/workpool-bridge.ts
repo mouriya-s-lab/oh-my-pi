@@ -1,6 +1,7 @@
 import { MAIN_AGENT_ID } from "../registry/agent-registry";
 import { normalizeAndAuthorize, REMOTE_EXECUTION_NOT_WIRED } from "../task/dispatch";
 import { createEvalCustomTools, describeEvalTools } from "../task/eval-tools";
+import { distillRunContract } from "../task/params";
 import { resolveEffectiveSubagentPolicy } from "../task/structured-subagent";
 import { type WorkPoolPeekResult, type WorkPoolStatus, WorkPoolRegistry } from "../task/workpool";
 import type { ToolSession } from "../tools";
@@ -39,22 +40,6 @@ function requireName(args: Record<string, unknown>): string {
 	return args.name.trim();
 }
 
-function optionalString(args: Record<string, unknown>, key: string): string | undefined {
-	const value = args[key];
-	if (value === undefined) return undefined;
-	if (typeof value !== "string" || value.trim().length === 0) {
-		throw new ToolError(`workpool ${key} must be a non-empty string`);
-	}
-	return value.trim();
-}
-
-function optionalTools(args: Record<string, unknown>): string[] | undefined {
-	if (args.tools === undefined) return undefined;
-	if (!Array.isArray(args.tools) || !args.tools.every(tool => typeof tool === "string" && tool.length > 0)) {
-		throw new ToolError("workpool tools must be an array of non-empty strings");
-	}
-	return args.tools;
-}
 
 function getPool(options: EvalWorkpoolBridgeOptions, name: string) {
 	const ownerId = options.session.getAgentId?.() ?? MAIN_AGENT_ID;
@@ -70,10 +55,17 @@ export async function runEvalWorkpool(args: unknown, options: EvalWorkpoolBridge
 	if (typeof op !== "string") throw new ToolError("workpool() requires an op");
 
 	if (op === "create") {
-		const agent = optionalString(record, "agent");
-		const requestedName = optionalString(record, "name");
-		const context = optionalString(record, "context");
-		const tools = optionalTools(record);
+		// Only creation accepts a run contract; every other op addresses an
+		// already-bound pool and must not re-distill (its keys are pool verbs).
+		const distilled = distillRunContract(record, "workpool");
+		if ("error" in distilled) {
+			throw new ToolError(distilled.error.message, { paramsError: distilled.error, code: distilled.error.code });
+		}
+		const { contract, local } = distilled;
+		const agent = contract.agent;
+		const requestedName = local.name;
+		const context = contract.context;
+		const tools = contract.tools;
 		const targetInput = record.target;
 		const gate = await normalizeAndAuthorize(targetInput, {
 			session: options.session,
@@ -92,6 +84,10 @@ export async function runEvalWorkpool(args: unknown, options: EvalWorkpoolBridge
 		if (tools?.length && options.session.getPlanModeState?.()?.enabled === true) {
 			throw new ToolError("Eval-defined tools are unavailable in plan mode.");
 		}
+		const customTools = tools?.length
+			? createEvalCustomTools(options.session, await describeEvalTools(options.session, [...tools], options.signal))
+			: [];
+		const { freshAgents: _freshAgents, workpoolItems: _items, ...childContract } = contract;
 		// The shared dispatcher already resolved the local default role for a
 		// target-carrying call; passing it here keeps one normalized identity.
 		const policy = await resolveEffectiveSubagentPolicy({
@@ -99,10 +95,9 @@ export async function runEvalWorkpool(args: unknown, options: EvalWorkpoolBridge
 			invocationKind: "eval",
 			assignment: `Create workpool ${requestedName ?? agent ?? "worker"}`,
 			agent: gate.agent,
+			contract: { ...childContract, task: contract.task || `Create workpool ${requestedName ?? agent ?? "worker"}` },
+			customTools,
 		});
-		const customTools = tools?.length
-			? createEvalCustomTools(options.session, await describeEvalTools(options.session, tools, options.signal))
-			: [];
 		const ownerId = options.session.getAgentId?.() ?? MAIN_AGENT_ID;
 		const registry = WorkPoolRegistry.global();
 		let name = requestedName ?? `${policy.agentName}-pool`;
@@ -121,6 +116,7 @@ export async function runEvalWorkpool(args: unknown, options: EvalWorkpoolBridge
 					policy,
 					...(context ? { context } : {}),
 					customTools,
+					contract,
 					target: boundTarget,
 				})
 			: registry.create(options.session, {
@@ -128,6 +124,7 @@ export async function runEvalWorkpool(args: unknown, options: EvalWorkpoolBridge
 					policy,
 					...(context ? { context } : {}),
 					customTools,
+					contract,
 				});
 		options.emitStatus?.({ op: "workpool", action: "create", pool: name, count: pool.limit() });
 		return { name, agent: policy.agentName, limit: pool.limit() };

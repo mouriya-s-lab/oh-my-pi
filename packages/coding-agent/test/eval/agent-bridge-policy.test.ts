@@ -340,19 +340,25 @@ describe("runEvalAgent", () => {
 		expect(secondOptions.outputSchemaOverridesAgent).toBeUndefined();
 	});
 
-	it("drops a per-call model argument on agent() (removed, issue #6438)", async () => {
+	it("rejects a per-call model argument with unknown-parameter (upstream b8779dae63)", async () => {
 		mockAgents();
 		const runSpy = vi.spyOn(taskExecutor, "runSubprocess").mockImplementation(async options => singleResult(options));
 
-		// The schema strips unknown keys; a legacy `model` argument is silently
-		// discarded so resolution is identical to omitting it — the agent's own
-		// frontmatter model applies (issue #6438).
-		await runEvalAgentAndWait({ prompt: "work", model: "default" }, { session: makeSession() });
-		await runEvalAgentAndWait({ prompt: "work" }, { session: makeSession() });
+		// #12: model is rejected at the boundary — the execution domain owns model
+		// selection (upstream b8779dae63), so a caller-supplied model fails
+		// distillation instead of being silently dropped (issue #6438).
+		const failure = await runEvalAgent({ prompt: "work", model: "p/active" }, { session: makeSession() }).then(
+			() => { throw new Error("model argument should have been rejected"); },
+			(error: unknown) => error as { context?: { code?: unknown; paramsError?: { code?: unknown; field?: unknown } } },
+		);
+		expect(failure.context?.code).toBe("unknown-parameter");
+		expect(failure.context?.paramsError?.code).toBe("unknown-parameter");
+		expect(failure.context?.paramsError?.field).toBe("model");
+		expect(runSpy).not.toHaveBeenCalled();
 
-		const withModel = runSpy.mock.calls[0]?.[0];
-		const withoutModel = runSpy.mock.calls[1]?.[0];
-		expect(withModel?.modelOverride).toEqual(withoutModel?.modelOverride);
+		// The no-model path still resolves through the agent's own frontmatter model.
+		await runEvalAgentAndWait({ prompt: "work" }, { session: makeSession() });
+		expect(runSpy).toHaveBeenCalledTimes(1);
 	});
 	it("returns host-parsed data for caller, agent, and inherited schemas", async () => {
 		const agentSchema = { type: "object" };

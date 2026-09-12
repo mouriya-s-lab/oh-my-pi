@@ -38,6 +38,7 @@ import type { AgentSession } from "../../session/agent-session";
 import { SKILL_PROMPT_MESSAGE_TYPE, USER_INTERRUPT_LABEL } from "../../session/messages";
 import { type AgentEndpoint, ENDPOINT_STILL_OWNED_REFUSAL } from "../../task/endpoint";
 import { LocalAgentEndpoint, type LocalTerminalResult } from "../../task/endpoint/local";
+import { distillRunContract, ParamsError, type RunContract } from "../../task/params";
 import { executeAcpBuiltinSlashCommand } from "../../slash-commands/acp-builtins";
 import { buildAvailableSlashCommands } from "../../slash-commands/available-commands";
 import { defaultLoadModeForToolName } from "../../tools/essential-tools";
@@ -465,6 +466,7 @@ async function dispatchManagedCommand(command: RpcCommand, deps: RpcInputFrameDe
 		const message = err instanceof Error ? err.message : String(err);
 		response = managedErrorResponse(command, command.type, message,
 			err instanceof ManagedRpcError ? err.code : "remote-execution-failed");
+		if (err instanceof ParamsError) response.paramsError = err;
 	}
 	response = correlateManagedResponse(response, command);
 	deps.output(response);
@@ -1054,6 +1056,38 @@ interface ManagedRpcRun {
 const MANAGED_CLEANUP_TIMEOUT_MS = 3_000;
 
 /**
+ * The managed server wraps a pre-created session, not the task executor.
+ * Refuse controls it cannot enforce instead of pretending prompt options apply them.
+ * Full per-run execution is owned by https://github.com/mouriya-s-lab/oh-my-pi/issues/14.
+ */
+function parseManagedRunContract(raw: unknown, message: string, preparedAgent: string | undefined):
+	{ contract: RunContract } | { error: ParamsError } {
+	const parsed = distillRunContract(raw, "task");
+	if ("error" in parsed) return parsed;
+	const { contract } = parsed;
+	if (contract.task !== message) {
+		return { error: new ParamsError("invalid-shape", "Start message and contract task must match.", "task") };
+	}
+	if (contract.agent !== undefined && contract.agent !== preparedAgent) {
+		return { error: new ParamsError("conflict-with-remote-policy", "Run agent differs from the prepared remote role.", "agent") };
+	}
+	if (contract.isolated === true) {
+		return { error: new ParamsError("isolation-unsupported", "Managed RPC has no isolated-workspace executor.", "isolated") };
+	}
+	for (const field of [
+		"effort", "outputSchema", "schemaMode", "tools", "apply", "merge",
+		"keepAlive", "retainArtifacts", "timeout", "budget", "depth", "spawns", "workpoolItems", "freshAgents",
+	] as const) {
+		if (contract[field] !== undefined) {
+			return { error: new ParamsError("conflict-with-remote-policy",
+				`Managed RPC cannot enforce explicit '${field}'; per-run execution is deferred to https://github.com/mouriya-s-lab/oh-my-pi/issues/14.`,
+				field) };
+		}
+	}
+	return { contract };
+}
+
+/**
  * Run in RPC mode.
  * Listens for JSON commands on stdin, outputs events and responses on stdout.
  */
@@ -1303,7 +1337,7 @@ export async function runRpcMode(
 		const result = await manager.waitForOwnerJobsAndReplies(ownerId, signal);
 		if (result.status !== "drained") throw new ManagedRpcError("timeout", "Owned job replies did not drain");
 	};
-	const beginManagedRun = async (command: RpcCommand | undefined, kind: "bash" | "prompt"): Promise<ManagedRpcRun> => {
+	const beginManagedRun = async (command: RpcCommand | undefined, kind: "bash" | "prompt", contract?: RunContract): Promise<ManagedRpcRun> => {
 		if (managedClosing) throw new ManagedRpcError("connection-lost", "Managed peer is shutting down");
 		if (kind === "prompt" && command && ircWakeRun) {
 			throw new ManagedRpcError("resource-unavailable", "An IRC wake turn still owns the session");
@@ -1319,6 +1353,7 @@ export async function runRpcMode(
 			agent: session.getAgentId() ?? session.sessionId,
 			managed: true,
 			awaitTerminal: () => terminal.promise,
+			...(contract === undefined ? {} : { executeContract: () => terminal.promise }),
 			cancelRun: async () => {
 				abortController.abort();
 				if (kind === "prompt") {
@@ -1329,9 +1364,10 @@ export async function runRpcMode(
 			},
 			terminate: () => session.dispose(),
 		});
-		const ack = await endpoint.start(kind);
+		const ack = await (contract === undefined ? endpoint.start(kind) : endpoint.start(contract.task, { contract }));
 		const run: ManagedRpcRun = { runId: ack.runId, command: kind, endpoint, terminal, abortController,
-			terminalObserved: endpoint.run(ack.runId).then(() => {}), replyBarrier: Promise.withResolvers<void>() };
+			terminalObserved: (contract === undefined ? endpoint.run(ack.runId) : endpoint.run(ack.runId, { contract })).then(() => {}),
+			replyBarrier: Promise.withResolvers<void>() };
 		managedRuns.set(run.runId, run);
 		if (command) managedCommandRuns.set(command, run);
 		if (managedClosing) {
@@ -1818,24 +1854,37 @@ export async function runRpcMode(
 			// Prompting
 			// =================================================================
 
+			case "start":
 			case "prompt": {
+				let contract: RunContract | undefined;
+				if (command.type === "start") {
+					if (!options.managed) return error(id, command.type, "Start requires managed RPC.", "protocol-incompatible");
+					if (typeof command.message !== "string") throw new ParamsError("invalid-shape", "Start message must be a string.", "task");
+					if (command.contract !== undefined) {
+						const parsed = parseManagedRunContract(command.contract, command.message, options.bootstrap?.prepare.agent);
+						if ("error" in parsed) throw parsed.error;
+						contract = parsed.contract;
+					}
+				}
+				const images = command.type === "prompt" ? command.images : undefined;
+				const streamingBehavior = command.type === "prompt" ? command.streamingBehavior : undefined;
 				if (options.managed) {
-					currentModelRun = await beginManagedRun(command, "prompt");
+					currentModelRun = await beginManagedRun(command, "prompt", contract);
 					currentModelRun.promptTasks = [];
 				}
 				const skillResult = await dispatchRpcSkillPrompt({
 					id,
 					session,
 					message: command.message,
-					streamingBehavior: command.streamingBehavior,
+					streamingBehavior,
 					output,
 					onError: promptError => output(options.managed
-						? correlateManagedResponse(error(id, "prompt", promptError.message), command)
-						: error(id, "prompt", promptError.message)),
+						? correlateManagedResponse(error(id, command.type, promptError.message), command)
+						: error(id, command.type, promptError.message)),
 					extensionUserMessageTracker,
 				});
 				if (skillResult) {
-					return success(id, "prompt", skillResult);
+					return success(id, command.type, skillResult);
 				}
 				const builtinResult = await executeAcpBuiltinSlashCommand(command.message, {
 					session,
@@ -1857,20 +1906,20 @@ export async function runRpcMode(
 					if ("prompt" in builtinResult) {
 						watchAndReportLocalOnlyPromptResult({
 							id,
-							startPrompt: () => session.prompt(builtinResult.prompt, { images: command.images }),
+							startPrompt: () => session.prompt(builtinResult.prompt, { images }),
 							output,
 							onError: promptError => output(options.managed
-								? correlateManagedResponse(error(id, "prompt", promptError.message), command)
-								: error(id, "prompt", promptError.message)),
+								? correlateManagedResponse(error(id, command.type, promptError.message), command)
+								: error(id, command.type, promptError.message)),
 							extensionUserMessageTracker,
 						});
-						return success(id, "prompt");
+						return success(id, command.type);
 					}
 					// A consumed builtin is normally local-only, but some (e.g.
 					// `/retry`) schedule an agent turn whose events stream after
 					// this response. Report that so the host does not finalize the
 					// request as non-agent work while the agent is running.
-					return success(id, "prompt", { agentInvoked: builtinResult.agentInvoked === true });
+					return success(id, command.type, { agentInvoked: builtinResult.agentInvoked === true });
 				}
 
 				// Don't await - events will stream
@@ -1880,16 +1929,16 @@ export async function runRpcMode(
 					id,
 					startPrompt: () =>
 						session.prompt(command.message, {
-							images: command.images,
-							streamingBehavior: command.streamingBehavior,
+							images,
+							streamingBehavior,
 						}),
 					output,
 					onError: promptError => output(options.managed
-						? correlateManagedResponse(error(id, "prompt", promptError.message), command)
-						: error(id, "prompt", promptError.message)),
+						? correlateManagedResponse(error(id, command.type, promptError.message), command)
+						: error(id, command.type, promptError.message)),
 					extensionUserMessageTracker,
 				});
-				return success(id, "prompt");
+				return success(id, command.type);
 			}
 
 			case "steer": {

@@ -24,6 +24,8 @@ import { buildOutputValidator } from "../tools/output-schema-validator";
 import { trackLateCleanup } from "../utils/late-cleanup";
 import { type DiscoveryResult, discoverAgents, getAgent } from "./discovery";
 import { type ExecutorOptions, runSubprocess } from "./executor";
+import type { RunBoundsLedger } from "./budget-tracker";
+import { authorizeHostTools, ParamsError, type RunContract } from "./params";
 import {
 	applyEligibleNestedPatches,
 	type IsolationContext,
@@ -82,6 +84,8 @@ export interface StructuredSubagentIdentity {
 
 /** One normalized child invocation. */
 export interface StructuredSubagentRequest {
+	contract?: RunContract;
+	boundsLedger?: RunBoundsLedger;
 	session: ToolSession;
 	invocationKind: "task" | "eval";
 	assignment: string;
@@ -187,6 +191,47 @@ function sanitizeAgentId(value: string | undefined): string | undefined {
 	return sanitized || undefined;
 }
 
+function applyRunContract(request: StructuredSubagentRequest): StructuredSubagentRequest {
+	const contract = request.contract;
+	if (!contract) return request;
+	// #12: manual + false is an explicit opt-out pairing, not a contradiction.
+	if (contract.merge !== undefined && contract.apply !== undefined && contract.apply !== (contract.merge === "auto")) {
+		throw new ParamsError("invalid-shape", "merge and apply request contradictory behavior.", "apply");
+	}
+	for (const field of ["freshAgents", "workpoolItems"] as const) {
+		if (contract[field] !== undefined) throw new ParamsError("invalid-shape", `${field} requires the workpool executor.`, field);
+	}
+	const toolsError = authorizeHostTools(contract, new Set(request.customTools?.map(tool => tool.name) ?? []));
+	if (toolsError) throw toolsError;
+	return {
+		...request,
+		assignment: contract.task,
+		...(contract.context !== undefined ? { context: contract.context } : {}),
+		...(contract.agent !== undefined ? { agent: contract.agent } : {}),
+		...(contract.effort !== undefined ? { effort: contract.effort } : {}),
+		...(Object.hasOwn(contract, "outputSchema") ? { outputSchema: contract.outputSchema } : {}),
+		...(contract.schemaMode !== undefined ? { schemaMode: contract.schemaMode } : {}),
+		...(contract.keepAlive !== undefined ? { keepAlive: contract.keepAlive } : {}),
+		...(contract.retainArtifacts !== undefined ? { retainArtifacts: contract.retainArtifacts } : {}),
+		...(contract.tools !== undefined ? { customTools: request.customTools?.filter(tool => contract.tools?.includes(tool.name)) ?? [] } : {}),
+		...(contract.detached !== undefined ? { detached: contract.detached } : {}),
+		...(contract.isolated !== undefined || contract.apply !== undefined || contract.merge !== undefined
+			? {
+					isolation: {
+						...request.isolation,
+						...(contract.isolated !== undefined ? { requested: contract.isolated } : {}),
+						// #12: merge=false demotes to patch mode; apply falls through to the entry
+						// default so the patch merge still runs (manual+false stays an explicit opt-out).
+						...(contract.merge === false ? { merge: "patch" as const } : {}),
+						...(contract.apply !== undefined
+							? { apply: contract.apply }
+							: contract.merge !== undefined && contract.merge !== false ? { apply: contract.merge === "auto" } : {}),
+					},
+				}
+			: {}),
+	};
+}
+
 function resolveSchema(request: StructuredSubagentRequest, agent: AgentDefinition): StructuredSubagentSchemaResolution {
 	const mode = request.schemaMode ?? request.session.outputSchemaMode ?? "permissive";
 	if (Object.hasOwn(request, "outputSchema")) {
@@ -262,6 +307,7 @@ function assertDepthAndSpawnAllowed(request: StructuredSubagentRequest, agentNam
 export async function resolveEffectiveSubagentPolicy(
 	request: StructuredSubagentRequest,
 ): Promise<EffectiveSubagentPolicy> {
+	request = applyRunContract(request);
 	await request.session.settings.reloadFromDisk();
 	const spawnPolicy = resolveSpawnPolicy(request.session.getSessionSpawns());
 	const agentName = request.agent?.trim() || spawnPolicy.defaultAgent;
@@ -403,6 +449,18 @@ function buildExecutorOptions(
 	const restrictToolNames = policy.planMode || session.restrictToolNames === true;
 	const enableMCP = !restrictToolNames && (session.enableMCP ?? true);
 	return {
+		...(request.contract
+			? {
+					contract: {
+						task: renderSubagentPrompt(request.assignment),
+						...(request.contract.timeout !== undefined ? { timeout: request.contract.timeout } : {}),
+						...(request.contract.budget !== undefined ? { budget: request.contract.budget } : {}),
+						...(request.contract.depth !== undefined ? { depth: request.contract.depth } : {}),
+						...(request.contract.spawns !== undefined ? { spawns: request.contract.spawns } : {}),
+					},
+				}
+			: {}),
+		boundsLedger: request.boundsLedger,
 		cwd: session.cwd,
 		additionalDirectories: session.additionalDirectories,
 		getApiKey: session.getApiKey,
@@ -515,6 +573,7 @@ function buildFailureResult(
 			modelOverride: policy.modelOverride,
 			modelRole: policy.modelRole,
 			error: message,
+			...(error instanceof ParamsError ? { paramsError: error } : {}),
 		};
 	};
 }
@@ -573,6 +632,7 @@ function attachStructuredOutputMetadata(result: SingleResult, schema: Structured
  * lease or child dispatch; callers keep responsibility for their result text.
  */
 export async function runStructuredSubagent(request: StructuredSubagentRequest): Promise<StructuredSubagentResult> {
+	request = applyRunContract(request);
 	const policy = await resolveEffectiveSubagentPolicy(request);
 	const lease = await leaseArtifacts(request.session, request.invocationKind);
 	let changesApplied: boolean | null = null;
@@ -681,7 +741,7 @@ export async function runStructuredSubagent(request: StructuredSubagentRequest):
 			temporaryArtifacts: lease.temporary,
 		};
 	} catch (error) {
-		if (error instanceof StructuredSubagentError) throw error;
+		if (error instanceof StructuredSubagentError || error instanceof ParamsError) throw error;
 		throw new StructuredSubagentError(
 			"execution",
 			`Subagent execution failed: ${error instanceof Error ? error.message : String(error)}`,

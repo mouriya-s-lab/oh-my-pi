@@ -3,6 +3,8 @@ import type { Usage } from "@oh-my-pi/pi-ai";
 import { $env } from "@oh-my-pi/pi-utils";
 import type { AgentSessionEvent } from "../session/agent-session";
 import type { ConfiguredThinkingLevel, TaskEffort } from "../thinking";
+import type { ParamsError, RunContract } from "./params";
+import type { RemoteArtifacts } from "./endpoint";
 import type { ExecutionTarget } from "./target";
 import type { NestedRepoPatch } from "./worktree";
 
@@ -126,7 +128,23 @@ export const targetInputSchema = type({ kind: "'local'", "+": "delete" }).or(
 // Coarse per-spawn thinking effort; must stay in sync with TASK_EFFORTS in ../thinking.
 const effortRule = '"lo" | "med" | "hi"' as const;
 
+const runContractFields = {
+	"handle?": "boolean",
+	"apply?": "boolean",
+	"merge?": "'auto' | 'manual' | false",
+	"keepAlive?": "boolean",
+	"retainArtifacts?": "boolean",
+	"detached?": "boolean",
+	"timeout?": "number",
+	"budget?": "number",
+	"depth?": "number",
+	"spawns?": "number",
+	"freshAgents?": "boolean",
+	"workpoolItems?": "unknown[]",
+} as const;
+
 export const taskItemSchema = type({
+	...runContractFields,
 	"name?": "string",
 	"agent?": "string>0",
 	task: "string",
@@ -137,6 +155,7 @@ export const taskItemSchema = type({
 	"+": "delete",
 });
 const taskItemSchemaIsolated = type({
+	...runContractFields,
 	"name?": "string",
 	"agent?": "string>0",
 	task: "string",
@@ -149,7 +168,7 @@ const taskItemSchemaIsolated = type({
 });
 
 /** Single task item. Fields are optional defensively: args stream in token by token. */
-export interface TaskItem {
+export interface TaskItem extends Partial<Omit<RunContract, "tools">> {
 	/** Stable agent name; becomes the registry/IRC id. Default = generated AdjectiveNoun. */
 	name?: string;
 	/**
@@ -174,6 +193,7 @@ export interface TaskItem {
 }
 
 export const taskSchema = type({
+	...runContractFields,
 	"name?": "string",
 	"agent?": "string>0",
 	task: "string",
@@ -185,6 +205,7 @@ export const taskSchema = type({
 	"+": "delete",
 });
 const taskSchemaNoIsolation = type({
+	...runContractFields,
 	"name?": "string",
 	"agent?": "string>0",
 	task: "string",
@@ -228,6 +249,7 @@ function createTaskSchema(options: {
 	if (options.batchEnabled) {
 		if (options.isolationEnabled) {
 			const item = type.raw({
+				...runContractFields,
 				"name?": "string",
 				...agentField,
 				task: "string",
@@ -246,6 +268,7 @@ function createTaskSchema(options: {
 			});
 		}
 		const item = type.raw({
+			...runContractFields,
 			"name?": "string",
 			...agentField,
 			task: "string",
@@ -264,6 +287,7 @@ function createTaskSchema(options: {
 	}
 	if (options.isolationEnabled) {
 		return type.raw({
+			...runContractFields,
 			"name?": "string",
 			...agentField,
 			task: "string",
@@ -277,6 +301,7 @@ function createTaskSchema(options: {
 		});
 	}
 	return type.raw({
+		...runContractFields,
 		"name?": "string",
 		...agentField,
 		task: "string",
@@ -317,7 +342,7 @@ export function getTaskSchema(options: {
  * otherwise); runtime stays permissive so internal callers and stale
  * transcripts using the flat form keep working under either setting.
  */
-export interface TaskParams {
+export interface TaskParams extends Partial<Omit<RunContract, "tools">> {
 	/** Stable agent name (flat form). */
 	name?: string;
 	/** Agent type to spawn (flat form); omitted values resolve from the session spawn policy. */
@@ -546,6 +571,8 @@ export interface SingleResult {
 	/** True when {@link resolvedModel} is the target of an active retry fallback. Mirrors {@link AgentProgress.resolvedModelIsFallback} onto the settled result. */
 	resolvedModelIsFallback?: boolean;
 	error?: string;
+	paramsError?: ParamsError;
+	remoteArtifacts?: RemoteArtifacts;
 	aborted?: boolean;
 	abortReason?: string;
 	/** Aggregated usage from the subprocess, accumulated incrementally from message_end events. */
@@ -585,6 +612,7 @@ export interface TaskToolDetails {
 	projectAgentsDir: string | null;
 	results: SingleResult[];
 	totalDurationMs: number;
+	paramsError?: ParamsError;
 	/** Aggregated usage across all subagents. */
 	usage?: Usage;
 	outputPaths?: string[];

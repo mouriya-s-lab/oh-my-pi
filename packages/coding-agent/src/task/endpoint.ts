@@ -37,6 +37,7 @@ import type { IrcDeliveryOptions, IrcMessage } from "../irc/bus";
 import type { AgentSession } from "../session/agent-session";
 import type { ReplyDrainedResult } from "./reply-drained";
 import type { StructuredSubagentOutput } from "./types";
+import type { ParamsError, RunContract } from "./params";
 
 /**
  * Delivery switches an inbound frame carries beside its envelope
@@ -72,6 +73,8 @@ export interface RunOutcome {
 	error?: string;
 	usage?: Usage;
 	structured?: StructuredSubagentOutput;
+	paramsError?: ParamsError;
+	remoteArtifacts?: { repoRef: string; branch?: string; patchRef?: string };
 }
 
 /**
@@ -82,6 +85,13 @@ export interface RunOutcome {
 export interface RunAck {
 	runId: string;
 	acceptedAt: number;
+}
+
+/** Optional explicit work contract; the first run argument remains the run identity. */
+export interface RunOpts {
+	runId?: string;
+	signal?: AbortSignal;
+	contract?: RunContract;
 }
 
 /**
@@ -404,8 +414,8 @@ export interface AgentEndpoint {
 	/** The session or peer reference this endpoint was built around. */
 	readonly handle: AgentEndpointHandle;
 	prepare(): Promise<PrepareResult>;
-	start(assignment: string): Promise<RunAck>;
-	run(runId: string, signal?: AbortSignal): Promise<RunOutcome>;
+	start(assignment: string, opts?: RunOpts): Promise<RunAck>;
+	run(runId: string, signalOrOpts?: AbortSignal | RunOpts): Promise<RunOutcome>;
 	cancelRun(runId: string): Promise<void>;
 	terminate(): Promise<void>;
 	/**

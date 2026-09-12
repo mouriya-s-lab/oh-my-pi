@@ -69,6 +69,8 @@ import { buildNamedToolChoice } from "../utils/tool-choice";
 import type { WorkspaceTree } from "../workspace-tree";
 import { type DispatchContext, startEndpoint } from "./dispatch";
 import type { AgentEndpoint, RunOutcome } from "./endpoint";
+import { RunBoundsLedger } from "./budget-tracker";
+import { authorizeHostTools, ParamsError, type RunContract, validateRunOutput } from "./params";
 import { attributeSubagentError } from "./error-attribution";
 import { generateTaskLabel } from "./label";
 import { resolveAgentPrewalkDefault } from "./prewalk";
@@ -390,7 +392,9 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 /** Options for subagent execution */
 export interface ExecutorOptions {
 	/** D2: an endpoint already prepared through dispatch; absent keeps the local runner unchanged. */
-	endpointExecution?: { endpoint: AgentEndpoint; context: DispatchContext };
+	endpointExecution?: { endpoint: AgentEndpoint; context: DispatchContext; contract?: RunContract };
+	contract?: RunContract;
+	boundsLedger?: RunBoundsLedger;
 	cwd: string;
 	/** Additional workspace directories to seed on the subagent session (multi-root). */
 	additionalDirectories?: string[];
@@ -635,6 +639,7 @@ interface FinalizeSubprocessOutputResult {
 	abortedViaYield: boolean;
 	hasYield: boolean;
 	structuredOutput?: StructuredSubagentOutput;
+	paramsError?: ParamsError;
 }
 export const SUBAGENT_WARNING_SCHEMA_OVERRIDDEN =
 	"SYSTEM WARNING: Subagent exhausted schema-retry budget; result was accepted despite failing the output schema.";
@@ -674,6 +679,7 @@ export function finalizeSubprocessOutput(args: FinalizeSubprocessOutputArgs): Fi
 	const source = args.outputSchemaSource ?? (outputSchema === undefined ? "none" : "session");
 	const includeStructuredOutput = source !== "none";
 	let structuredOutput: StructuredSubagentOutput | undefined;
+	let paramsError: ParamsError | undefined;
 	let abortedViaYield = false;
 	const hasYield = Array.isArray(yieldItems) && yieldItems.length > 0;
 	// D2: observation loss is not a yield success or an inferred execution failure.
@@ -711,6 +717,8 @@ export function finalizeSubprocessOutput(args: FinalizeSubprocessOutputArgs): Fi
 						undefined,
 					);
 					rawOutput = outcome.rawOutput;
+					paramsError = validateRunOutput({ task: "", outputSchema, schemaMode: mode }, undefined)
+						?? new ParamsError("strict-schema-unsatisfied", outcome.stderr, "outputSchema");
 					stderr = outcome.stderr;
 					exitCode = outcome.exitCode;
 				}
@@ -745,6 +753,8 @@ export function finalizeSubprocessOutput(args: FinalizeSubprocessOutputArgs): Fi
 				if (mustReject && failure) {
 					const outcome = buildSchemaViolationOutcome(failure, completeData);
 					rawOutput = outcome.rawOutput;
+					if (mode === "strict") paramsError = validateRunOutput({ task: "", outputSchema, schemaMode: mode }, completeData)
+						?? new ParamsError("strict-schema-unsatisfied", outcome.stderr, "outputSchema");
 					stderr = outcome.stderr;
 					exitCode = outcome.exitCode;
 				} else {
@@ -784,6 +794,8 @@ export function finalizeSubprocessOutput(args: FinalizeSubprocessOutputArgs): Fi
 				}
 				const outcome = buildSchemaViolationOutcome(summary, completeData);
 				rawOutput = outcome.rawOutput;
+				if (mode === "strict") paramsError = validateRunOutput({ task: "", outputSchema, schemaMode: mode }, completeData)
+					?? new ParamsError("strict-schema-unsatisfied", outcome.stderr, "outputSchema");
 				stderr = outcome.stderr;
 				exitCode = outcome.exitCode;
 			} else {
@@ -813,11 +825,14 @@ export function finalizeSubprocessOutput(args: FinalizeSubprocessOutputArgs): Fi
 			if (hasOutputSchema || !hasRawOutput) {
 				exitCode = 1;
 				stderr = SUBAGENT_WARNING_MISSING_YIELD;
+				if (mode === "strict" && hasOutputSchema) {
+					paramsError = new ParamsError("strict-schema-unsatisfied", stderr, "outputSchema");
+				}
 			}
 		}
 	}
 
-	return { rawOutput, exitCode, stderr, abortedViaYield, hasYield, structuredOutput };
+	return { rawOutput, exitCode, stderr, abortedViaYield, hasYield, structuredOutput, paramsError };
 }
 
 /**
@@ -1025,6 +1040,7 @@ interface RunMonitorArgs {
 	softRequestBudgetNotice: boolean;
 	/** Wall-clock cap in ms; 0 disables the timer. */
 	maxRuntimeMs: number;
+	boundsLedger?: RunBoundsLedger;
 }
 
 /**
@@ -1038,6 +1054,7 @@ interface SubagentRunMonitor {
 	readonly abortSignal: AbortSignal;
 	readonly accumulatedUsage: Usage;
 	hasUsage(): boolean;
+	paramsError(): ParamsError | undefined;
 	yieldCalled(): boolean;
 	runtimeLimitExceeded(): boolean;
 	/** True once the soft-budget stop fired: the free-running turn was aborted and the run is being driven to a forced final yield. */
@@ -1732,6 +1749,10 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 					if (role === "assistant") {
 						const costRecord = isRecord(messageUsage.cost) ? messageUsage.cost : undefined;
 						hasUsage = true;
+						const boundsError = args.boundsLedger?.recordUsage(
+							getNumberField(messageUsage, "totalTokens") ?? getUsageTokens(messageUsage),
+						);
+						if (boundsError) requestAbort(boundsError.field === "timeout" ? "timeout" : "budget");
 						accumulatedUsage.input += getNumberField(messageUsage, "input") ?? 0;
 						accumulatedUsage.output += getNumberField(messageUsage, "output") ?? 0;
 						accumulatedUsage.cacheRead += getNumberField(messageUsage, "cacheRead") ?? 0;
@@ -1889,6 +1910,7 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 				hasUsage = true;
 				progress.tokens = getUsageTokens(outcome.usage);
 				progress.cost = outcome.usage.cost.total;
+				args.boundsLedger?.recordUsage(outcome.usage.totalTokens);
 			}
 			switch (outcome.status) {
 				case "completed":
@@ -1904,6 +1926,7 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 		yieldCalled: () => yieldCalled,
 		runtimeLimitExceeded: () => runtimeLimitExceeded,
 		terminalError: () => terminalError,
+		paramsError: () => args.boundsLedger?.check(),
 		hasExplicitAbortReason: () =>
 			abortReason === "signal" ||
 			abortReason === "shutdown" ||
@@ -2301,6 +2324,7 @@ async function finalizeRunResult(args: FinalizeRunArgs): Promise<SingleResult> {
 					abortedViaYield: false,
 					hasYield: false,
 					structuredOutput: args.endpointOutcome.structured,
+					paramsError: args.endpointOutcome.paramsError,
 				}
 			: finalizeSubprocessOutput({
 					rawOutput,
@@ -2320,6 +2344,12 @@ async function finalizeRunResult(args: FinalizeRunArgs): Promise<SingleResult> {
 	rawOutput = finalized.rawOutput;
 	exitCode = finalized.exitCode;
 	stderr = finalized.stderr;
+	const paramsError = finalized.paramsError ?? monitor.paramsError();
+	if (paramsError) {
+		finalized.paramsError = paramsError;
+		if (exitCode === 0) exitCode = 1;
+		if (!stderr) stderr = paramsError.message;
+	}
 	// Salvage for cancelled/aborted children that produced no completed output:
 	// surface the last assistant text + stats instead of "(no output)" so the
 	// parent doesn't redo work the child already finished.
@@ -2468,6 +2498,8 @@ async function finalizeRunResult(args: FinalizeRunArgs): Promise<SingleResult> {
 		stderr,
 		truncated: Boolean(truncated),
 		...(finalized.structuredOutput ? { structuredOutput: finalized.structuredOutput } : {}),
+		...(finalized.paramsError ? { paramsError: finalized.paramsError } : {}),
+		...(args.endpointOutcome?.remoteArtifacts ? { remoteArtifacts: args.endpointOutcome.remoteArtifacts } : {}),
 		durationMs: Date.now() - args.startTime,
 		tokens: progress.tokens,
 		requests: progress.requests,
@@ -2856,6 +2888,8 @@ export async function finalizeSubagentLifecycle(args: {
 
 /** Options for {@link runSubagentFollowUpTurn}. */
 export interface FollowUpTurnOptions {
+	contract?: RunContract;
+	boundsLedger?: RunBoundsLedger;
 	/** Registry id of the (live or parked) subagent to continue. */
 	id: string;
 	/** Agent definition the session was originally spawned with (drives progress labels + finalize). */
@@ -2982,10 +3016,51 @@ export async function runSubagentFollowUpTurn(options: FollowUpTurnOptions): Pro
 	});
 }
 
+function applyExecutorContract(options: ExecutorOptions, contract: RunContract): ExecutorOptions {
+	for (const field of ["isolated", "apply", "merge", "retainArtifacts", "freshAgents", "workpoolItems"] as const) {
+		if (contract[field] !== undefined) {
+			throw new ParamsError(
+				field === "isolated" || field === "apply" || field === "merge" ? "isolation-unsupported" : "invalid-shape",
+				`${field} requires the structured or workpool runner.`,
+				field,
+			);
+		}
+	}
+	if (contract.agent !== undefined && contract.agent !== options.agent.name) {
+		throw new ParamsError("invalid-shape", "Agent selection requires the structured runner.", "agent");
+	}
+	const toolsError = authorizeHostTools(contract, new Set(options.customTools?.map(tool => tool.name) ?? []));
+	if (toolsError) throw toolsError;
+	return {
+		...options,
+		task: contract.task,
+		...(contract.context !== undefined ? { context: contract.context } : {}),
+		...(contract.effort !== undefined ? { effort: contract.effort } : {}),
+		...(Object.hasOwn(contract, "outputSchema")
+			? { outputSchema: contract.outputSchema, outputSchemaSource: "caller", outputSchemaOverridesAgent: true }
+			: {}),
+		...(contract.schemaMode !== undefined ? { outputSchemaMode: contract.schemaMode } : {}),
+		...(contract.tools !== undefined ? { customTools: options.customTools?.filter(tool => contract.tools?.includes(tool.name)) ?? [] } : {}),
+		...(contract.keepAlive !== undefined ? { keepAlive: contract.keepAlive } : {}),
+		...(contract.detached !== undefined ? { detached: contract.detached } : {}),
+		...(contract.timeout !== undefined ? { maxRuntimeMs: contract.timeout * 1000 } : {}),
+	};
+}
+
+function boundedRuntimeMs(maxRuntimeMs: number, boundsLedger: RunBoundsLedger | undefined): number {
+	const remaining = boundsLedger?.remainingTimeoutMs();
+	return remaining === undefined ? maxRuntimeMs : Math.max(1, Math.min(maxRuntimeMs > 0 ? maxRuntimeMs : Infinity, remaining));
+}
+
 /**
  * Run a single agent in-process.
  */
 export async function runSubprocess(options: ExecutorOptions): Promise<SingleResult> {
+	if (!options.endpointExecution && options.contract) options = applyExecutorContract(options, options.contract);
+	const contract = options.contract ?? options.endpointExecution?.contract;
+	const boundsLedger = contract || options.boundsLedger ? new RunBoundsLedger(contract, options.boundsLedger) : undefined;
+	const reservationError = boundsLedger?.reserve({ depth: options.taskDepth ?? 0 });
+	if (reservationError) throw reservationError;
 	const {
 		cwd,
 		agent,
@@ -3033,6 +3108,101 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		};
 	}
 
+	if (options.endpointExecution) {
+		// D2: reuse dispatch authorization and this monitor without registering a duplicate outer task job.
+		const { endpoint, context } = options.endpointExecution;
+		const contract = options.contract ?? options.endpointExecution.contract;
+		const monitor = createSubagentRunMonitor({
+			boundsLedger,
+			index, id, agent, task, assignment,
+			description: options.description,
+			signal,
+			onProgress,
+			eventBus: options.eventBus,
+			subagentEventBus: options.subagentEventBus,
+			parentToolCallId: options.parentToolCallId,
+			detached: options.detached,
+			softRequestBudget: 0,
+			softRequestBudgetNotice: false,
+			maxRuntimeMs: boundedRuntimeMs(options.maxRuntimeMs ?? 0, boundsLedger),
+		});
+		const registry = AgentRegistry.global();
+		const ref = registry.get(id);
+		const ownsRemoteRef = ref?.endpoint.kind === "remote" && ref.endpoint.endpoint === endpoint;
+		try {
+			const ack = await startEndpoint(endpoint, contract?.task ?? task, monitor.abortSignal, context, contract);
+			if (ownsRemoteRef) registry.setStatus(id, "running", ref);
+			emitSubagentFrame(options.eventBus, options.subagentEventBus, TASK_SUBAGENT_LIFECYCLE_CHANNEL, {
+				id,
+				agent: agent.name,
+				status: "started",
+				index,
+				parentToolCallId: options.parentToolCallId,
+				detached: options.detached,
+				agentSource: agent.source,
+				description: options.description,
+			});
+			// D2: cancelling an assignment is separate from observing it; never terminate the peer.
+			const cancelRun = (): void => {
+				void Promise.resolve()
+					.then(() => endpoint.cancelRun(ack.runId))
+					.catch(error => {
+						logger.warn("Endpoint assignment cancellation failed", {
+							id,
+							runId: ack.runId,
+							error: error instanceof Error ? error.message : String(error),
+						});
+					});
+			};
+			monitor.abortSignal.addEventListener("abort", cancelRun, { once: true });
+			if (monitor.abortSignal.aborted) cancelRun();
+			let outcome: RunOutcome;
+			try {
+				outcome = await endpoint.run(ack.runId, contract ? { signal: monitor.abortSignal, contract } : monitor.abortSignal);
+			} catch (error) {
+				if (error instanceof ParamsError || endpoint.handle.kind === "local") throw error;
+				// D2: observer failure does not establish that remote execution failed or was cancelled.
+				outcome = {
+					runId: ack.runId,
+					status: "execution-unknown",
+					error: error instanceof Error ? error.message : String(error),
+				};
+			} finally {
+				monitor.abortSignal.removeEventListener("abort", cancelRun);
+			}
+			const done = monitor.captureEndpointOutcome(outcome);
+			if (ownsRemoteRef) {
+				registry.setStatus(
+					id,
+					outcome.status === "execution-unknown" ? "execution-unknown" : outcome.status === "cancelled" ? "aborted" : "idle",
+					ref,
+				);
+			}
+			// D2: cancellation of a reply wait must not overwrite the endpoint's reported run outcome.
+			await AsyncJobManager.instance()?.waitForOwnerJobsAndReplies(id, monitor.abortSignal);
+			monitor.finish();
+			return await finalizeRunResult({
+				monitor,
+				done: { ...done, abortReason: done.abortReasonText, durationMs: Date.now() - startTime },
+				endpointOutcome: outcome,
+				index,
+				id,
+				agent,
+				task,
+				assignment,
+				modelOverride,
+				modelRole,
+				eventBus: options.eventBus,
+				subagentEventBus: options.subagentEventBus,
+				parentToolCallId: options.parentToolCallId,
+				detached: options.detached,
+				artifactsDir: options.artifactsDir,
+				startTime,
+			});
+		} finally {
+			monitor.finish();
+		}
+	}
 	// Set up artifact paths and write input file upfront if artifacts dir provided
 	let subtaskSessionFile: string | undefined;
 	// D2: remote endpoints do not acquire a fabricated local transcript path.
@@ -3065,9 +3235,9 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		options.parentServiceTier,
 	);
 	const maxRecursionDepth = settings.get("task.maxRecursionDepth") ?? 2;
-	const maxRuntimeMs = Math.max(
-		0,
-		Math.trunc(Number(options.maxRuntimeMs ?? settings.get("task.maxRuntimeMs") ?? 0) || 0),
+	const maxRuntimeMs = boundedRuntimeMs(
+		Math.max(0, Math.trunc(Number(options.maxRuntimeMs ?? settings.get("task.maxRuntimeMs") ?? 0) || 0)),
+		boundsLedger,
 	);
 	// TTL before an adopted idle subagent is parked by the lifecycle manager.
 	// <= 0 disables parking (the session stays live until process teardown).
@@ -3123,6 +3293,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 	const skipPythonPreflight = Array.isArray(toolNames) && !toolNames.includes("eval");
 
 	const monitor = createSubagentRunMonitor({
+		boundsLedger,
 		index,
 		id,
 		agent,
@@ -3145,86 +3316,6 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		maxRuntimeMs,
 	});
 	const progress = monitor.progress;
-	if (options.endpointExecution) {
-		// D2: reuse dispatch authorization and this monitor without registering a duplicate outer task job.
-		const { endpoint, context } = options.endpointExecution;
-		const registry = AgentRegistry.global();
-		const ref = registry.get(id);
-		const ownsRemoteRef = ref?.endpoint.kind === "remote" && ref.endpoint.endpoint === endpoint;
-		try {
-			const ack = await startEndpoint(endpoint, task, monitor.abortSignal, context);
-			if (ownsRemoteRef) registry.setStatus(id, "running", ref);
-			emitSubagentFrame(options.eventBus, options.subagentEventBus, TASK_SUBAGENT_LIFECYCLE_CHANNEL, {
-				id,
-				agent: agent.name,
-				status: "started",
-				index,
-				parentToolCallId: options.parentToolCallId,
-				detached: options.detached,
-				agentSource: agent.source,
-				description: options.description,
-			});
-			// D2: cancelling an assignment is separate from observing it; never terminate the peer.
-			const cancelRun = (): void => {
-				void Promise.resolve()
-					.then(() => endpoint.cancelRun(ack.runId))
-					.catch(error => {
-						logger.warn("Endpoint assignment cancellation failed", {
-							id,
-							runId: ack.runId,
-							error: error instanceof Error ? error.message : String(error),
-						});
-					});
-			};
-			monitor.abortSignal.addEventListener("abort", cancelRun, { once: true });
-			if (monitor.abortSignal.aborted) cancelRun();
-			let outcome: RunOutcome;
-			try {
-				outcome = await endpoint.run(ack.runId, monitor.abortSignal);
-			} catch (error) {
-				if (endpoint.handle.kind === "local") throw error;
-				// D2: observer failure does not establish that remote execution failed or was cancelled.
-				outcome = {
-					runId: ack.runId,
-					status: "execution-unknown",
-					error: error instanceof Error ? error.message : String(error),
-				};
-			} finally {
-				monitor.abortSignal.removeEventListener("abort", cancelRun);
-			}
-			const done = monitor.captureEndpointOutcome(outcome);
-			if (ownsRemoteRef) {
-				registry.setStatus(
-					id,
-					outcome.status === "execution-unknown" ? "execution-unknown" : outcome.status === "cancelled" ? "aborted" : "idle",
-					ref,
-				);
-			}
-			// D2: cancellation of a reply wait must not overwrite the endpoint's reported run outcome.
-			await AsyncJobManager.instance()?.waitForOwnerJobsAndReplies(id, monitor.abortSignal);
-			monitor.finish();
-			return await finalizeRunResult({
-				monitor,
-				done: { ...done, abortReason: done.abortReasonText, durationMs: Date.now() - startTime },
-				endpointOutcome: outcome,
-				index,
-				id,
-				agent,
-				task,
-				assignment,
-				modelOverride,
-				modelRole,
-				eventBus: options.eventBus,
-				subagentEventBus: options.subagentEventBus,
-				parentToolCallId: options.parentToolCallId,
-				detached: options.detached,
-				artifactsDir: options.artifactsDir,
-				startTime,
-			});
-		} finally {
-			monitor.finish();
-		}
-	}
 	let unsubscribe: (() => void) | null = null;
 	let reviveSession: AgentReviver | null = null;
 	const installIrcWakeTurnMonitor = (target: AgentSession): void => {

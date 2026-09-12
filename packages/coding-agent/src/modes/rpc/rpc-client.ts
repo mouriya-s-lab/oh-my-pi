@@ -17,6 +17,7 @@ import { deliverInboundEnvelope } from "../../irc/inbound";
 import { AgentRegistry, MAIN_AGENT_ID } from "../../registry/agent-registry";
 import type { AgentSessionEvent, SessionStats } from "../../session/agent-session";
 import type { EndpointControlAck } from "../../task/endpoint";
+import { distillRunContract, readParamsError, type ParamsError, type RunContract } from "../../task/params";
 import { createLeaseState, isLeaseExpired, type LeaseState, negotiateLease, tickLease } from "./lease";
 import {
 	ManagedIrcChannel, ManagedIrcObservationRelay, type ManagedIrcObservation,
@@ -316,8 +317,22 @@ function parseManagedRunEvent(value: Record<string, unknown>): RpcManagedRunEven
 		if (value.runStatusRevision !== undefined &&
 			(typeof value.runStatusRevision !== "number" || !Number.isSafeInteger(value.runStatusRevision) || value.runStatusRevision < 0)) return undefined;
 		if (value.replyDrained === false && typeof value.runStatusRevision !== "number") return undefined;
+		let remoteArtifacts: Extract<RpcManagedRunEvent, { type: "managed_run_end" }>["remoteArtifacts"];
+		if (value.remoteArtifacts !== undefined) {
+			const refs = value.remoteArtifacts;
+			if (!isRecord(refs) || typeof refs.repoRef !== "string" ||
+				(refs.branch !== undefined && typeof refs.branch !== "string") ||
+				(refs.patchRef !== undefined && typeof refs.patchRef !== "string")) return undefined;
+			remoteArtifacts = { repoRef: refs.repoRef,
+				...(typeof refs.branch === "string" ? { branch: refs.branch } : {}),
+				...(typeof refs.patchRef === "string" ? { patchRef: refs.patchRef } : {}) };
+		}
+		const paramsError = readParamsError(value.paramsError);
+		if (value.paramsError !== undefined && paramsError === undefined) return undefined;
 		return { type: "managed_run_end", runId, status, replyDrained: value.replyDrained,
-			...(typeof value.runStatusRevision === "number" ? { runStatusRevision: value.runStatusRevision } : {}) };
+			...(typeof value.runStatusRevision === "number" ? { runStatusRevision: value.runStatusRevision } : {}),
+			...(remoteArtifacts === undefined ? {} : { remoteArtifacts }),
+			...(paramsError === undefined ? {} : { paramsError }) };
 	}
 	return undefined;
 }
@@ -398,6 +413,7 @@ export class RpcCommandError extends Error {
 		message: string,
 		readonly command: string,
 		readonly code?: string,
+		readonly paramsError?: ParamsError,
 	) {
 		super(message);
 		this.name = "RpcCommandError";
@@ -410,6 +426,7 @@ class ManagedRpcError<Code extends RpcErrorCode = RpcErrorCode> extends Error {
 		readonly code: Code,
 		message: string,
 		readonly command?: string,
+		readonly paramsError?: ParamsError,
 	) {
 		super(message);
 		this.name = "RpcClientError";
@@ -1263,6 +1280,18 @@ export class RpcClient {
 		await this.#send({ type: "prompt", message, images });
 	}
 
+	/** Start an assignment with only its explicit, portable execution contract. */
+	async startRun(message: string, contract?: RunContract): Promise<void> {
+		let wireContract: RunContract | undefined;
+		if (contract !== undefined) {
+			const distilled = distillRunContract(contract, "task");
+			if ("error" in distilled) throw distilled.error;
+			wireContract = distilled.contract;
+		}
+		this.#getData(await this.#send({ type: "start", message,
+			...(wireContract === undefined ? {} : { contract: wireContract }) }));
+	}
+
 	/**
 	 * Queue a steering message to interrupt the agent mid-run.
 	 */
@@ -1911,7 +1940,7 @@ export class RpcClient {
 				if (this.options.expectManagedBootstrap && !response.success) {
 					reject(new RpcClientError(
 						isRpcErrorCode(response.code) ? response.code : "protocol-incompatible",
-						response.message ?? response.error, response.command,
+						response.message ?? response.error, response.command, readParamsError(response.paramsError),
 					));
 					return;
 				}
@@ -2028,7 +2057,7 @@ export class RpcClient {
 	#getData<T>(response: RpcResponse): T {
 		if (!response.success) {
 			const errorResponse = response as Extract<RpcResponse, { success: false }>;
-			throw new RpcCommandError(errorResponse.error, errorResponse.command, errorResponse.code);
+			throw new RpcCommandError(errorResponse.error, errorResponse.command, errorResponse.code, readParamsError(errorResponse.paramsError));
 		}
 		// Type assertion: we trust response.data matches T based on the command sent.
 		// This is safe because each public method specifies the correct T for its command.

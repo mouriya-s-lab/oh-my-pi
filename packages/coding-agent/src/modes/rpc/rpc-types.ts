@@ -24,6 +24,7 @@ import type {
 	SubagentProgressPayload,
 } from "../../task";
 import type { EndpointControlAck, EndpointSnapshot } from "../../task/endpoint";
+import type { ParamsError, RunContract } from "../../task/params";
 import type { TodoPhase } from "../../tools/todo";
 import type { RpcMessagesPage } from "./rpc-messages";
 
@@ -336,6 +337,7 @@ type RpcCommandVariants =
 
 	// Prompting
 	| { id?: string; type: "prompt"; message: string; images?: ImageContent[]; streamingBehavior?: "steer" | "followUp" }
+	| { id?: string; type: "start"; message: string; contract?: RunContract }
 	| { id?: string; type: "steer"; message: string; images?: ImageContent[] }
 	| { id?: string; type: "follow_up"; message: string; images?: ImageContent[] }
 	| { id?: string; type: "abort" }
@@ -564,6 +566,7 @@ export type RpcManagedErrorResponse = {
 	error: string;
 	message: string;
 	code: RpcErrorCode;
+	paramsError?: ParamsError;
 };
 
 /**
@@ -603,6 +606,7 @@ type RpcResponseVariants =
 
 	// Prompting (async - events follow)
 	| { id?: string; type: "response"; command: "prompt"; success: true; data?: { agentInvoked: boolean } }
+	| { id?: string; type: "response"; command: "start"; success: true; data?: { agentInvoked: boolean } }
 	| { id?: string; type: "response"; command: "steer"; success: true }
 	| { id?: string; type: "response"; command: "follow_up"; success: true }
 	| { id?: string; type: "response"; command: "abort"; success: true }
@@ -763,6 +767,7 @@ type RpcResponseVariants =
 			error: string;
 			message?: string;
 			code?: string;
+			paramsError?: ParamsError;
 	  }
 
 	// Managed error (any command, when the peer speaks the managed protocol)
@@ -827,6 +832,8 @@ export type RpcManagedRunEvent =
 			status: "completed" | "failed" | "cancelled";
 			replyDrained: boolean;
 			runStatusRevision?: number;
+			remoteArtifacts?: { repoRef: string; branch?: string; patchRef?: string };
+			paramsError?: ParamsError;
 	  };
 
 // ============================================================================

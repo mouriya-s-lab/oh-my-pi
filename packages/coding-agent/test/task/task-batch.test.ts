@@ -198,7 +198,9 @@ describe("task.batch schema gating", () => {
 			throw new Error("Expected isolated to be a boolean schema");
 		}
 		expect(isolatedSchema.type).toBe("boolean");
-		expect(itemProperties.apply).toBeUndefined();
+		// #12: apply/merge now interpret at all three entries.
+		expect(itemProperties.apply).toBeDefined();
+		expect(itemProperties.merge).toBeDefined();
 	});
 
 	it("hides isolation from the dynamic batch schema in plan mode", async () => {

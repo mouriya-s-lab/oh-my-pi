@@ -138,3 +138,10 @@ This directory records fork-specific changes that live in trunk source rather th
 
 - Ruling: `model` is REJECTED on all entries (RFC vs #6438 conflict; upstream wins per `b8779dae63`). `distillRunContract` returns `ParamsError { code: "unknown-parameter", field: "model" }` for a caller-supplied `model`; no contract→executor model forward remains (`structured-subagent.ts`, `executor.ts`, `rpc-mode.ts` deferred list, `runContractFields`).
 - `handle` remains as an eval-entry alias: `handle: true` sets `retainArtifacts: true` in the distilled contract, preserving the `agent://` handle path.
+
+## fork-features/acceptance/ — C1–C13 acceptance harness (issue #14)
+
+- Slice: [mouriya-s-lab#14](https://github.com/mouriya-s-lab/oh-my-pi/issues/14). No production code touched: `README.md`, `matrix.md` (RFC §10.3 rows verbatim, all BLOCKED), `env-prerequisites.md` (six unchecked gaps), `run-baseline.sh` (reproducible B1–B4 capture against upstream `omp/18.1.17`), and five `run-c*.sh` placeholders that echo BLOCKED and exit 78 (`EX_CONFIG`).
+- Change: operator-facing harness for the dual-remote acceptance the seven Full slices must eventually pass. Fresh baseline evidence lives outside the repo under `/Users/mouriya/Ext/work/omp-remote-agents/08b-matrix/2026-09-12-issue14-baseline/`; prior `08b-matrix/` experiments stay labelled experimental per RFC §10.3.
+- Why recorded here: this directory is fork-side scaffolding around trunk RPC behaviour (wire shapes, refusal strings), not a trunk change — listed so rebase review can see the acceptance surface in one place.
+- Trunk-migration trigger: once upstream ships an equivalent structured acceptance suite covering dual-remote IRC/lifecycle/version matrix, migrate these rows into it and delete this section with the replacement.

@@ -41,9 +41,30 @@ export class SessionFocusController {
 	async focusAgent(id: string): Promise<void> {
 		if (this.ctx.collabGuest) throw new Error("Viewing agents is unavailable in a collab session.");
 		if (id === MAIN_AGENT_ID) return this.unfocus();
-		// D2 dependency: only a local live agent can be attached to this session UI.
 		const live = await this.lifecycle().ensureLive(id);
-		if (live.kind !== "local") throw new Error("Remote agent viewing is not implemented (#13).");
+		if (live.kind !== "local") {
+			// #13: remote agents have no in-process session to attach. Verify
+			// the peer is reachable through its endpoint content channel
+			// (availability probe, never `run`/`start`) and focus the hub
+			// transcript view instead of throwing the deferred error.
+			const ref = this.registry.get(id);
+			const endpoint = ref?.endpoint.kind === "remote" ? ref.endpoint.endpoint : null;
+			if (endpoint) {
+				const reference = ref.endpoint.kind === "remote" ? ref.endpoint.reference : id;
+				try {
+					await endpoint.readResource({ kind: "history", ref: id, peerId: reference, probe: true });
+				} catch {
+					// Probe failure still focuses: the transcript view surfaces
+				// the unavailability rather than refusing the navigation.
+				}
+			}
+			if (id === this.#focusedAgentId) return;
+			this.#focusedAgentId = id;
+			this.#attachedSession = undefined;
+			this.#registryUnsubscribe ??= this.registry.onChange(e => this.#onRegistryEvent(e));
+			this.ctx.showStatus(`Viewing remote agent ${id} — Esc returns to main`);
+			return;
+		}
 		const session = live.session;
 		if (id === this.#focusedAgentId && session === this.#attachedSession) return;
 		this.#focusedAgentId = id;

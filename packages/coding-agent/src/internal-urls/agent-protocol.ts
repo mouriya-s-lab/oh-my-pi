@@ -50,9 +50,9 @@ export class AgentProtocolHandler implements ProtocolHandler {
 		}
 
 		const registry = AgentRegistry.global();
-		// D2 dependency: remote output lookup cannot reuse a same-id local artifact (#13).
-		if (registry.get(outputId)?.endpoint.kind === "remote") {
-			throw new Error("Remote agent output reads are not implemented (#13).");
+		const remoteRef = registry.get(outputId);
+		if (remoteRef?.endpoint.kind === "remote") {
+			return await resolveRemoteAgentOutput(url, remoteRef, { hasPathExtraction, hasQueryExtraction, urlPath, queryParam });
 		}
 		const rootSessionFile = context?.sessionFile
 			? await ensurePersistedRoster(registry, context.sessionFile)
@@ -242,4 +242,90 @@ export class AgentProtocolHandler implements ProtocolHandler {
 		}
 		return [...ids].sort().map(value => ({ value }));
 	}
+}
+
+/**
+ * Remote output read (#13) via the endpoint content channel.
+ *
+ * Dispatches on `AgentRef.endpoint.kind`: remote refs reassemble `result`
+ * chunks through `endpoint.readResource` (never a same-id local artifact, and
+ * never a local open of the peer's `displayPath` — that throws
+ * `ResourceOwnershipError { code: "remote-path-not-local" }`). JSON
+ * extraction (`/<path>` / `?q=`) applies to the remote bytes exactly as it
+ * does locally.
+ */
+async function resolveRemoteAgentOutput(
+	url: import("./types").InternalUrl,
+	ref: import("../registry/agent-registry").AgentRef,
+	opts: { hasPathExtraction: boolean; hasQueryExtraction: boolean; urlPath: string; queryParam: string | null },
+): Promise<import("./types").InternalResource> {
+	const endpoint = ref.endpoint.kind === "remote" ? ref.endpoint.endpoint : null;
+	if (!endpoint) throw new Error(`Agent ${ref.id} has no connected endpoint.`);
+	const { resourceBytesToText, assertLocalDisplayPathString } = await import("../task/resource");
+	const { applyQuery: applyRemoteQuery, pathToQuery: pathToRemoteQuery } = await import("./json-query");
+	if (opts.hasPathExtraction && opts.hasQueryExtraction) {
+		throw new Error("agent:// URL cannot combine path extraction with ?q=");
+	}
+	// The peer's display path is display ONLY: a `/remote/` path must never be
+	// opened locally (ownership error, never ENOENT). Other display paths are
+	// advisory and do not block the content read.
+	try {
+		const probe = await endpoint.readResource({ kind: "result", ref: ref.id, peerId: ref.endpoint.kind === "remote" ? ref.endpoint.reference : ref.id, probe: true });
+		if (probe.status === "available" && probe.ref.displayPath?.startsWith("/remote/")) {
+			assertLocalDisplayPathString(probe.ref.displayPath, "remote");
+		}
+	} catch (error) {
+		if (error instanceof Error && error.name === "ResourceOwnershipError") throw error;
+	}
+	let offset = 0;
+	let combined = "";
+	for (let pages = 0; pages < 16; pages++) {
+		const result = await endpoint.readResource({
+			kind: "result",
+			ref: ref.id,
+			peerId: ref.endpoint.kind === "remote" ? ref.endpoint.reference : ref.id,
+			offset,
+			probe: false,
+		});
+		if (result.status === "chunk") {
+			combined += resourceBytesToText(result.chunk.bytes);
+			offset = result.chunk.offset + result.chunk.bytes.byteLength;
+			if (result.chunk.final) break;
+			continue;
+		}
+		if (result.status === "available") continue;
+		if (result.status === "forbidden") {
+			const { ResourceOwnershipError } = await import("../task/resource");
+			throw new ResourceOwnershipError(result.code, `Remote agent output refused: ${result.code}`);
+		}
+		throw new Error(`Remote agent output unavailable: ${result.status}`);
+	}
+	let content = combined;
+	let contentType: import("./types").InternalResource["contentType"] = "text/markdown";
+	const extract = opts.hasQueryExtraction || opts.hasPathExtraction;
+	if (extract) {
+		let jsonValue: unknown;
+		try {
+			jsonValue = JSON.parse(combined);
+		} catch (err) {
+			throw new Error(`Output ${ref.id} is not valid JSON: ${err instanceof Error ? err.message : String(err)}`);
+		}
+		const query = opts.hasQueryExtraction ? opts.queryParam! : pathToRemoteQuery(opts.urlPath);
+		if (query) {
+			const extracted = applyRemoteQuery(jsonValue, query);
+			if (typeof extracted === "string") content = extracted;
+			else {
+				try {
+					content = JSON.stringify(extracted, null, 2) ?? "null";
+				} catch {
+					content = String(extracted);
+				}
+				contentType = "application/json";
+			}
+		} else {
+			content = JSON.stringify(jsonValue, null, 2);
+			contentType = "application/json";
+		}
+	}
+	return { url: url.href, content, contentType, size: Buffer.byteLength(content, "utf-8") };
 }

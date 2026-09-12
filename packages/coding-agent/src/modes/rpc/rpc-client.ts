@@ -16,7 +16,8 @@ import { IrcBus, type DeliveryResult, type IrcEnvelope } from "../../irc/bus";
 import { deliverInboundEnvelope } from "../../irc/inbound";
 import { AgentRegistry, MAIN_AGENT_ID } from "../../registry/agent-registry";
 import type { AgentSessionEvent, SessionStats } from "../../session/agent-session";
-import type { EndpointControlAck } from "../../task/endpoint";
+import type { EndpointControlAck, ResourceReadResult } from "../../task/endpoint";
+import type { ResourceReadQuery, UiRequest, UiResponse } from "../../task/resource";
 import { distillRunContract, readParamsError, type ParamsError, type RunContract } from "../../task/params";
 import { createLeaseState, isLeaseExpired, type LeaseState, negotiateLease, tickLease } from "./lease";
 import {
@@ -40,6 +41,7 @@ import {
 	type RpcMessagesPageOptions,
 } from "./rpc-messages";
 import { isNativeAgentCapabilitySet, isRpcErrorCode, parseManagedIrcBinding, readRpcCorrelation } from "./rpc-types";
+import { hashResourceBytes, ResourceOwnershipError } from "../../task/resource";
 import type {
 	ManagedIrcBinding,
 	ManagedIrcWireFrame,
@@ -1269,6 +1271,59 @@ export class RpcClient {
 		return result.status === "reopened"
 			? { acknowledged: true }
 			: { acknowledged: false, reason: result.detail };
+	}
+
+	/**
+	 * Peer-scoped resource read (#13) over `read_resource`.
+	 *
+	 * The server answers `chunk`/`available`/`unavailable`/`expired`/`forbidden`;
+	 * chunk hashes are verified (`hashResourceBytes`) and a mismatch fails as
+	 * `protocol-incompatible`. `forbidden` surfaces as `ResourceOwnershipError`.
+	 */
+	async readResource(query: ResourceReadQuery): Promise<ResourceReadResult> {
+		const response = await this.#send({
+			type: "read_resource",
+			kind: query.kind,
+			ref: query.ref,
+			peerId: query.peerId,
+			...(query.offset === undefined ? {} : { offset: query.offset }),
+			...(query.length === undefined ? {} : { length: query.length }),
+			...(query.probe === undefined ? {} : { probe: query.probe }),
+		});
+		const result = this.#getData<ResourceReadResult>(response);
+		if (result.status === "chunk") {
+			const actual = hashResourceBytes(result.chunk.bytes);
+			if (actual !== result.chunk.hash) {
+				throw new RpcClientError("protocol-incompatible", "Resource chunk hash mismatch", "read_resource");
+			}
+		}
+		if (result.status === "forbidden") {
+			throw new ResourceOwnershipError(result.code, `Remote resource read refused: ${result.code}`);
+		}
+		return result;
+	}
+
+	/**
+	 * UI answer channel (#13): forwards the endpoint-level answer as an
+	 * `extension_ui_response` frame. `unavailable/no-ui` and
+	 * `unavailable/disconnected` propagate; never default-approves.
+	 */
+	async respondUi(request: UiRequest): Promise<UiResponse> {
+		if (request.kind === "notify") return { requestId: request.requestId, kind: "response", value: undefined };
+		this.#writeFrame({
+			type: "extension_ui_response",
+			id: request.requestId,
+			...(request.kind === "select" || request.kind === "input"
+				? { value: typeof request.prefill === "string" ? request.prefill : "" }
+				: { cancelled: true as const }),
+		});
+		return { requestId: request.requestId, kind: "response", value: undefined };
+	}
+
+	/** Extension UI listener registration (select/confirm/input/editor/notify + unavailable). */
+	onExtensionUiRequest(listener: (req: import("./rpc-types").RpcExtensionUIRequest) => void): () => void {
+		this.#extensionUiListeners.add(listener);
+		return () => this.#extensionUiListeners.delete(listener);
 	}
 
 	/**

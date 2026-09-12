@@ -352,45 +352,36 @@ export type IrcDeliveryReceipt =
 	| { status: "failed"; to: string; error: string }
 	| { status: "indeterminate"; to: string; error: string };
 
-/** Pinned detail for the resource-read deferral; #13 replaces the stub. */
-export const RESOURCE_READ_DEFERRED = "resource reads land under mouriya-s-lab#13";
-
-/** Pinned detail for the UI-response deferral; #13 replaces the stub. */
-export const UI_RESPONSE_DEFERRED = "UI responses land under mouriya-s-lab#13";
-
 /**
- * Opaque reference to a resource owned by a peer's session (D7, #13).
- *
- * #8 freezes only the seam: `reference` is the peer's opaque handle (never a
- * local filesystem path), `kind` names the resource family, and `path` is
- * remote display information. #13 owns the content channel and widens this
- * shape; nothing may turn a remote path into a locally openable one.
+ * Peer-scoped resource channel (#13). `ResourceRef` is opaque: `displayPath`
+ * is UI display ONLY and must never be opened locally (see
+ * `ResourceOwnershipError` in `./resource`). Re-exported here so existing
+ * `task/endpoint` import sites keep working.
  */
-export interface ResourceRef {
-	reference: string;
-	kind: "result" | "history" | "attachment";
-	path?: string;
-}
+export type {
+	ResourceChunk,
+	ResourceReadQuery,
+	ResourceRef,
+	UiRequest,
+	UiResponse,
+} from "./resource";
+export { ResourceOwnershipError } from "./resource";
 
 /**
  * Result of {@link AgentEndpoint.readResource}.
  *
- * The peer-scoped content channel lands under #13; until then the only honest
- * answer is `not-implemented`, and #13 widens this union with the content and
- * availability variants rather than handing callers an empty or invented
- * payload.
+ * `chunk` carries content (offset into the peer's byte stream, `final` marks
+ * the last chunk); `available` is the probe answer (the bytes exist, fetch
+ * them with a non-probe read); `unavailable`/`expired` feed the
+ * result-ref-first settle (`result-ref-unavailable`); `forbidden` is the
+ * cross-peer or remote-path boundary.
  */
-export type ResourceReadResult = { status: "not-implemented"; detail: string };
-
-/**
- * One answer to a UI request a peer raised (D7, #13). `requestId` is minted by
- * the asking peer; an absent `value` is an explicit cancel, never an implicit
- * approval. #13 owns the request/response channel.
- */
-export interface UiResponse {
-	requestId: string;
-	value?: string;
-}
+export type ResourceReadResult =
+	| { status: "chunk"; chunk: import("./resource").ResourceChunk }
+	| { status: "available"; ref: import("./resource").ResourceRef }
+	| { status: "unavailable"; reason?: string }
+	| { status: "expired" }
+	| { status: "forbidden"; code: "cross-peer-forbidden" | "remote-path-not-local" };
 
 /**
  * Where a spawn actually runs.
@@ -488,21 +479,20 @@ export interface AgentEndpoint {
 	/**
 	 * Read a peer-owned resource through the endpoint.
 	 *
-	 * Not implemented here: #8 defers the peer-scoped content channel to #13,
-	 * so the answer is a resolved `not-implemented` result carrying
-	 * {@link RESOURCE_READ_DEFERRED}; #13 widens
-	 * {@link ResourceReadResult} with the content variants.
+	 * `probe: true` is the availability check (no bytes move); a non-probe
+	 * read returns the `chunk` slices (reassembled by the caller). A reference
+	 * whose `peerId` does not match the connection's bound owner peer answers
+	 * `forbidden/cross-peer-forbidden`.
 	 */
-	readResource(ref: ResourceRef): Promise<ResourceReadResult>;
+	readResource(query: import("./resource").ResourceReadQuery): Promise<ResourceReadResult>;
 	/**
 	 * Answer a UI request raised by this endpoint's peer.
 	 *
-	 * Not implemented here: #8 defers the interactive channel to #13. The
-	 * required `acknowledged: true` cannot honestly signal failure, so an
-	 * unsupported invocation rejects with {@link UI_RESPONSE_DEFERRED} rather
-	 * than returning a false success.
+	 * Bounded (~30s, see `UI_BRIDGE_TIMEOUT_MS`); `unavailable/no-ui` means no
+	 * adapter is attached, `unavailable/disconnected` means the connection
+	 * dropped. Never default-approves: an absent answer is a cancel.
 	 */
-	respondUi(response: UiResponse): Promise<{ acknowledged: true }>;
+	respondUi(request: import("./resource").UiRequest): Promise<import("./resource").UiResponse>;
 	/** Monitor-facing view (`hub jobs` rows become consumers of this in #8). */
 	asJobSnapshot(): EndpointSnapshot;
 	/** Handle-facing view (`hub list` rows become consumers of this in #8). */

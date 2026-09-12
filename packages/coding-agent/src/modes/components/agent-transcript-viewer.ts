@@ -215,15 +215,19 @@ export class AgentTranscriptViewer implements Component {
 	// Transcript loading
 	// ========================================================================
 
-	/** Refresh the transcript from a local file or remote host. */
+	/** Refresh the transcript from a local file, remote endpoint, or remote host. */
 	#refresh(): void {
 		if (this.#disposed) return;
 		if (this.deps.remote) {
 			this.#fetchRemote();
 			return;
 		}
-		// D2 dependency: remote transcripts require endpoint resource routing (#13).
-		const sessionFile = getLocalSessionFile(this.deps.registry.get(this.deps.agentId));
+		const ref = this.deps.registry.get(this.deps.agentId);
+		if (ref?.endpoint.kind === "remote" && ref.endpoint.endpoint) {
+			void this.#fetchViaEndpoint(ref.endpoint.endpoint, ref.endpoint.reference);
+			return;
+		}
+		const sessionFile = getLocalSessionFile(ref);
 		if (!sessionFile) {
 			this.#clearLocal("none");
 			return;
@@ -244,6 +248,61 @@ export class AgentTranscriptViewer implements Component {
 			}
 		}
 		this.#loadLocalFull(sessionFile, stat);
+	}
+
+	/**
+	 * Remote transcript read (#13) via the endpoint content channel: reassemble
+	 * `history` chunks without waking the peer (no `run`/`start`). Failures
+	 * mark the view unavailable rather than inventing rows.
+	 */
+	async #fetchViaEndpoint(endpoint: import("../../task/endpoint").AgentEndpoint, reference: string): Promise<void> {
+		if (this.#remoteFetchInFlight) return;
+		this.#remoteFetchInFlight = true;
+		const token = ++this.#remoteToken;
+		try {
+			const { resourceBytesToText } = await import("../../task/resource");
+			let offset = this.#remoteBytes;
+			let combined = "";
+			for (let pages = 0; pages < 16; pages++) {
+				const result = await endpoint.readResource({
+					kind: "history",
+					ref: this.deps.agentId,
+					peerId: reference,
+					offset,
+					probe: false,
+				});
+				if (result.status === "chunk") {
+					combined += resourceBytesToText(result.chunk.bytes);
+					offset = result.chunk.offset + result.chunk.bytes.byteLength;
+					if (result.chunk.final) break;
+					continue;
+				}
+				break;
+			}
+			if (token !== this.#remoteToken || this.#disposed) return;
+			if (combined.length === 0) {
+				if (!this.#hasRemoteData && !this.#remoteUnavailable) {
+					this.#remoteUnavailable = true;
+					this.deps.requestRender();
+				}
+				return;
+			}
+			this.#remoteUnavailable = false;
+			this.#remoteError = "";
+			this.#hasRemoteData = true;
+			this.#remoteBytes = offset;
+			const { parseSessionEntries } = await import("../../session/session-loader");
+			const parsed = this.#extractMessages(parseSessionEntries(combined));
+			if (parsed.length > 0) this.#append(parsed);
+			else this.deps.requestRender();
+		} catch (error: unknown) {
+			if (token === this.#remoteToken) {
+				this.#remoteError = error instanceof Error ? error.message : String(error);
+				this.#hasRemoteData = true;
+			}
+		} finally {
+			if (token === this.#remoteToken) this.#remoteFetchInFlight = false;
+		}
 	}
 
 	#clearLocal(reason: string): void {

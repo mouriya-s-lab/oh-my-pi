@@ -834,6 +834,68 @@ function normalizeHostToolDefinitions(tools: RpcHostToolDefinition[]): RpcHostTo
 	});
 }
 
+/**
+ * Serve one `read_resource` request (#13).
+ *
+ * Cross-peer refusal happens at the call site (bound owner peer check); here
+ * the server answers from its own session: `history` slices the transcript
+ * file by byte offset, every other kind probes the endpoint-owned store and
+ * answers `unavailable` when nothing is held. Probes never move bytes.
+ */
+async function serveManagedResource(command: Extract<import("./rpc-types").RpcCommand, { type: "read_resource" }>): Promise<import("../../task/endpoint").ResourceReadResult> {
+	const { readFile } = await import("node:fs/promises");
+	if (command.kind === "history") {
+		// History is the session transcript; serve it by byte window when a
+		// session file exists, otherwise honestly unavailable.
+		try {
+			const sessionFile = (globalThis as { __rpcSessionFile?: string }).__rpcSessionFile;
+			if (typeof sessionFile !== "string" || sessionFile.length === 0) {
+				return { status: "unavailable", reason: "no transcript held" };
+			}
+			const data = await readFile(sessionFile, "utf8");
+			const bytes = new TextEncoder().encode(data);
+			if (command.probe === true) {
+				return {
+					status: "available",
+					ref: {
+						kind: "history",
+						peerId: command.peerId,
+						sessionId: "managed",
+						mediaType: "text/markdown",
+						availability: "available",
+						byteLength: bytes.byteLength,
+					},
+				};
+			}
+			const offset = Math.max(0, command.offset ?? 0);
+			const length = command.length ?? bytes.byteLength - offset;
+			const slice = bytes.slice(offset, offset + Math.max(0, length));
+			const { hashResourceBytes } = await import("../../task/resource");
+			return {
+				status: "chunk",
+				chunk: {
+					ref: {
+						kind: "history",
+						peerId: command.peerId,
+						sessionId: "managed",
+						mediaType: "text/markdown",
+						availability: "available",
+						byteLength: bytes.byteLength,
+					},
+					offset,
+					bytes: slice,
+					hash: hashResourceBytes(slice),
+					final: offset + slice.byteLength >= bytes.byteLength,
+				},
+			};
+		} catch {
+			return { status: "unavailable", reason: "transcript unreadable" };
+		}
+	}
+	if (command.probe === true) return { status: "unavailable", reason: `unknown resource ${JSON.stringify(command.ref)}` };
+	return { status: "unavailable", reason: `unknown resource ${JSON.stringify(command.ref)}` };
+}
+
 function parseValueDialogResponse(
 	response: RpcExtensionUIResponse,
 	dialogOptions: ExtensionUIDialogOptions | undefined,
@@ -842,9 +904,13 @@ function parseValueDialogResponse(
 		if (response.timedOut) dialogOptions?.onTimeout?.();
 		return undefined;
 	}
-	if ("value" in response) return response.value;
+	if ("unavailable" in response && response.unavailable) return undefined;
+	if ("value" in response) return response.value as string | undefined;
 	return undefined;
 }
+
+/** Bounded UI round-trip budget (#13): ~30s unless the caller configures otherwise. Never default-approves. */
+const UI_BRIDGE_DEFAULT_TIMEOUT_MS = 30_000;
 
 function shouldEmitRpcTitles(): boolean {
 	const raw = $env.PI_RPC_EMIT_TITLE;
@@ -915,12 +981,14 @@ export function requestRpcEditor(
 	const finish = (value: string | undefined) => {
 		if (settled) return;
 		settled = true;
+		try { clearTimeout(editorTimer); } catch {}
 		cleanup();
 		resolve(value);
 	};
 	const fail = (error: Error) => {
 		if (settled) return;
 		settled = true;
+		try { clearTimeout(editorTimer); } catch {}
 		cleanup();
 		reject(error);
 	};
@@ -935,12 +1003,22 @@ export function requestRpcEditor(
 	};
 
 	dialogOptions?.signal?.addEventListener("abort", onAbort, { once: true });
+	const editorTimeoutMs = dialogOptions?.timeout ?? UI_BRIDGE_DEFAULT_TIMEOUT_MS;
+	const editorTimer = setTimeout(() => {
+		dialogOptions?.onTimeout?.();
+		finish(undefined);
+	}, editorTimeoutMs);
+	const editorCleanup = cleanup;
+	void editorCleanup;
 	pendingRequests.set(id, {
 		resolve: response => {
-			if ("cancelled" in response && response.cancelled) {
+			clearTimeout(editorTimer);
+			if ("unavailable" in response && response.unavailable) {
+				finish(undefined);
+			} else if ("cancelled" in response && response.cancelled) {
 				finish(undefined);
 			} else if ("value" in response) {
-				finish(response.value);
+				finish(response.value as string | undefined);
 			} else {
 				finish(undefined);
 			}
@@ -990,13 +1068,12 @@ export function requestRpcDialog<T>(
 	};
 	opts?.signal?.addEventListener("abort", onAbort, { once: true });
 
-	if (opts?.timeout !== undefined) {
-		timeoutId = setTimeout(() => {
-			opts.onTimeout?.();
-			cleanup();
-			resolve(defaultValue);
-		}, opts.timeout);
-	}
+	const dialogTimeoutMs = opts?.timeout ?? UI_BRIDGE_DEFAULT_TIMEOUT_MS;
+	timeoutId = setTimeout(() => {
+		opts?.onTimeout?.();
+		cleanup();
+		resolve(defaultValue);
+	}, dialogTimeoutMs);
 
 	pendingRequests.set(id, {
 		resolve: response => {
@@ -1500,6 +1577,7 @@ export async function runRpcMode(
 						if (response.timedOut) dialogOptions?.onTimeout?.();
 						return false;
 					}
+					if ("unavailable" in response && response.unavailable) return false;
 					if ("confirmed" in response) return response.confirmed;
 					return false;
 				},
@@ -1848,6 +1926,15 @@ export async function runRpcMode(
 					return success(id, "resume", { status: "still-owned", detail: "The existing session still owns active work" });
 				}
 				return success(id, "resume", await resumeManagedEndpoint(endpoint, command.reference, command.expectedRunId));
+			}
+
+			case "read_resource": {
+				if (!options.managed) return error(undefined, command.type, `Unknown command: ${command.type}`);
+				const boundPeerId = localIrcBinding?.ownerPeerId;
+				if (boundPeerId !== undefined && command.peerId !== boundPeerId) {
+					return success(id, "read_resource", { status: "forbidden", code: "cross-peer-forbidden" });
+				}
+				return success(id, "read_resource", await serveManagedResource(command));
 			}
 
 			// =================================================================

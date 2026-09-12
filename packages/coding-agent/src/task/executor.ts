@@ -3170,6 +3170,44 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			} finally {
 				monitor.abortSignal.removeEventListener("abort", cancelRun);
 			}
+			// #13 result-ref-first: after the peer's terminal frame plus its
+			// remoteArtifacts, probe the ResultRef before settling locally.
+			// Only `available` settles `completed`; `unavailable`/`expired`
+			// settle `failed { code: "result-ref-unavailable" }`.
+			if (outcome.remoteArtifacts && outcome.status === "completed") {
+				const peerId = ref?.endpoint.kind === "remote" ? ref.endpoint.reference : "local";
+				try {
+					const probe = await endpoint.readResource({
+						kind: "result",
+						ref: outcome.remoteArtifacts.repoRef,
+						peerId,
+						probe: true,
+					});
+					if (probe.status === "forbidden") {
+						outcome = {
+							runId: outcome.runId,
+							status: "failed",
+							error: `result ref forbidden: ${probe.code}`,
+						};
+					} else if (probe.status === "unavailable" || probe.status === "expired") {
+						outcome = {
+							runId: outcome.runId,
+							status: "failed",
+							error: "result-ref-unavailable",
+						};
+					}
+				} catch (error) {
+					if (error instanceof Error && error.name === "ResourceOwnershipError") {
+						outcome = { runId: outcome.runId, status: "failed", error: error.message };
+					} else {
+						outcome = {
+							runId: outcome.runId,
+							status: "failed",
+							error: "result-ref-unavailable",
+						};
+					}
+				}
+			}
 			const done = monitor.captureEndpointOutcome(outcome);
 			if (ownsRemoteRef) {
 				registry.setStatus(

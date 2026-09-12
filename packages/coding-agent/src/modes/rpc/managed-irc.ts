@@ -67,8 +67,9 @@ function controlOrUi(value: unknown): value is ManagedControlOrUi {
 		case "terminate": return value.peerId === undefined || validId(value.peerId);
 		case "resume": return validId(value.reference) && (value.expectedRunId === undefined || validId(value.expectedRunId));
 		case "extension_ui_response":
-			return validId(value.id) && (typeof value.value === "string" || typeof value.confirmed === "boolean" ||
-				(value.cancelled === true && (value.timedOut === undefined || typeof value.timedOut === "boolean")));
+			return validId(value.id) && ("value" in value || typeof value.confirmed === "boolean" ||
+				(value.cancelled === true && (value.timedOut === undefined || typeof value.timedOut === "boolean")) ||
+				(value.unavailable === true && (value.reason === "no-ui" || value.reason === "disconnected")));
 		default: return false;
 	}
 }

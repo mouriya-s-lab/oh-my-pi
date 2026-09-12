@@ -69,16 +69,18 @@ import {
 	type IrcDeliveryReceipt,
 	type IrcInboundEnvelope,
 	type PrepareResult,
-	RESOURCE_READ_DEFERRED,
 	type ResourceReadResult,
-	type ResourceRef,
 	type RunAck,
 	type RunOpts,
 	type RunOutcome,
 	type RunOutcomeStatus,
-	UI_RESPONSE_DEFERRED,
-	type UiResponse,
 } from "../../packages/coding-agent/src/task/endpoint";
+import {
+	ResourceOwnershipError,
+	type ResourceReadQuery,
+	type UiRequest,
+	type UiResponse,
+} from "../../packages/coding-agent/src/task/resource";
 import { ReplyDrainedBarrier, type ReplyDrainedResult } from "../../packages/coding-agent/src/task/reply-drained";
 import type { SshBackendTransport } from "./transport";
 
@@ -347,20 +349,25 @@ export class SshBackendEndpoint implements AgentEndpoint {
 	}
 
 	/**
-	 * Not implemented: #13 owns the peer-scoped content channel. A stub that
-	 * cannot return content says so rather than inventing bytes.
+	 * Peer-scoped content channel (#13) over RPC: `read_resource` carries the
+	 * opaque ref plus the byte window; the server refuses cross-peer reads and
+	 * answers `chunk`/`available`/`unavailable`/`expired`. A `forbidden`
+	 * answer surfaces as `ResourceOwnershipError`.
 	 */
-	async readResource(_ref: ResourceRef): Promise<ResourceReadResult> {
-		return { status: "not-implemented", detail: RESOURCE_READ_DEFERRED };
+	async readResource(query: ResourceReadQuery): Promise<ResourceReadResult> {
+		const result = await this.#client.readResource(query);
+		if (result.status === "forbidden") {
+			throw new ResourceOwnershipError(result.code, `Remote resource read refused: ${result.code}`);
+		}
+		return result;
 	}
 
 	/**
-	 * Not implemented: #13 owns the interactive channel. The required
-	 * `acknowledged: true` cannot signal failure, so an unsupported invocation
-	 * rejects instead of returning a false success.
+	 * Interactive channel (#13) over RPC: `ui_response` carries the answer
+	 * back to the peer's pending request. Never default-approves.
 	 */
-	async respondUi(_response: UiResponse): Promise<{ acknowledged: true }> {
-		throw new Error(UI_RESPONSE_DEFERRED);
+	async respondUi(request: UiRequest): Promise<UiResponse> {
+		return this.#client.respondUi(request);
 	}
 
 	asJobSnapshot(): EndpointSnapshot {

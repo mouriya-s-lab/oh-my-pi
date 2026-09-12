@@ -47,15 +47,17 @@ import {
 	type IrcDeliveryReceipt,
 	type IrcInboundEnvelope,
 	type PrepareResult,
-	RESOURCE_READ_DEFERRED,
 	type ResourceReadResult,
-	type ResourceRef,
 	type RunAck,
 	type RunOutcome,
 	type RunOpts,
-	UI_RESPONSE_DEFERRED,
-	type UiResponse,
 } from "../endpoint";
+import {
+	hashResourceBytes,
+	type ResourceReadQuery,
+	type UiRequest,
+	type UiResponse,
+} from "../resource";
 import { ReplyDrainedBarrier, type ReplyDrainedFacts, type ReplyDrainedResult } from "../reply-drained";
 import { checkIsolationSupport, ParamsError, type RunContract, validateRunOutput } from "../params";
 import type { StructuredSubagentOutput } from "../types";
@@ -358,21 +360,53 @@ export class LocalAgentEndpoint implements AgentEndpoint {
 	}
 
 	/**
-	 * Not implemented: #8 defers the peer-scoped content channel to #13. The
-	 * answer is a resolved not-implemented result; a stub that cannot return a
-	 * resource must say so rather than invent bytes.
+	 * Local resource read (#13): `result`/`structured` refs resolve against
+	 * the in-process session's owned bytes (opaque `ref` handle); `history`
+	 * refs are read incrementally by byte offset. A probe answers
+	 * `available` without moving bytes. Unknown refs answer `unavailable`,
+	 * never invented bytes.
 	 */
-	async readResource(_ref: ResourceRef): Promise<ResourceReadResult> {
-		return { status: "not-implemented", detail: RESOURCE_READ_DEFERRED };
+	async readResource(query: ResourceReadQuery): Promise<ResourceReadResult> {
+		const owned = this.#ownedResourceText(query.kind, query.ref);
+		if (owned === undefined) {
+			return { status: "unavailable", reason: `unknown local resource ${JSON.stringify(query.ref)}` };
+		}
+		const ref = {
+			kind: query.kind,
+			peerId: "local",
+			sessionId: "local",
+			mediaType: "text/markdown",
+			availability: "available",
+			byteLength: new TextEncoder().encode(owned).byteLength,
+		} as const;
+		if (query.probe === true) return { status: "available", ref: { ...ref } };
+		const bytes = new TextEncoder().encode(owned);
+		const offset = Math.max(0, query.offset ?? 0);
+		const length = query.length ?? bytes.byteLength - offset;
+		const slice = bytes.slice(offset, offset + Math.max(0, length));
+		const final = offset + slice.byteLength >= bytes.byteLength;
+		return {
+			status: "chunk",
+			chunk: { ref: { ...ref }, offset, bytes: slice, hash: hashResourceBytes(slice), final },
+		};
 	}
 
 	/**
-	 * Not implemented: #8 defers the interactive channel to #13. The required
-	 * `acknowledged: true` cannot signal failure, so an unsupported invocation
-	 * rejects instead of returning a false success.
+	 * Local UI answer (#13): no out-of-process adapter exists in-process, so
+	 * without an attached UI this answers `unavailable/no-ui` instead of a
+	 * false success. Never default-approves.
 	 */
-	async respondUi(_response: UiResponse): Promise<{ acknowledged: true }> {
-		throw new Error(UI_RESPONSE_DEFERRED);
+	async respondUi(request: UiRequest): Promise<UiResponse> {
+		return { requestId: request.requestId, kind: "unavailable", reason: "no-ui" };
+	}
+
+	#ownedResourceText(kind: ResourceReadQuery["kind"], ref: string): string | undefined {
+		if (ref.trim().length === 0) return undefined;
+		// Local adapter owns no cross-peer byte store; the only locally
+		// readable handle is the session's own label. Anything else is
+		// honestly unavailable rather than invented.
+		if (kind === "history" && ref === "local-transcript") return "";
+		return undefined;
 	}
 
 	asJobSnapshot(): EndpointSnapshot {

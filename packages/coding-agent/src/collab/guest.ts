@@ -213,6 +213,10 @@ export class CollabGuestLink {
 			this.#socket?.send({ t: "agent-cmd", cmd: "revive", agentId: id });
 		},
 		readTranscript: (id, fromByte) => {
+			const ref = this.agentRegistry.get(id);
+			if (ref?.endpoint.kind === "remote" && ref.endpoint.endpoint) {
+				return readRemoteTranscriptViaEndpoint(ref.endpoint.endpoint, ref.endpoint.reference, id, fromByte);
+			}
 			const socket = this.#socket;
 			if (!socket || this.#agentHasTranscript.get(id) === false) {
 				return Promise.resolve(null);
@@ -775,4 +779,49 @@ export class CollabGuestLink {
 			stateOverride: this.state,
 		});
 	}
+}
+
+/**
+ * Hub history read (#13) via the peer's content channel: reassemble `history`
+ * chunks from `fromByte` without waking the peer (no `run`/`start`, snapshot
+ * reads only). Returns null when the peer holds nothing.
+ */
+async function readRemoteTranscriptViaEndpoint(
+	endpoint: import("../task/endpoint").AgentEndpoint,
+	reference: string,
+	id: string,
+	fromByte: number,
+): Promise<import("../modes/components/agent-hub").AgentHubRemoteTranscript | null> {
+	const { resourceBytesToText } = await import("../task/resource");
+	let offset = Math.max(0, fromByte);
+	let text = "";
+	for (let pages = 0; pages < 16; pages++) {
+		let result: import("../task/endpoint").ResourceReadResult;
+		try {
+			result = await endpoint.readResource({ kind: "history", ref: id, peerId: reference, offset, probe: false });
+		} catch {
+			return text.length > 0 ? { text, newSize: offset } : null;
+		}
+		if (result.status === "chunk") {
+			text += resourceBytesToText(result.chunk.bytes);
+			offset = result.chunk.offset + result.chunk.bytes.byteLength;
+			if (result.chunk.final) break;
+			continue;
+		}
+		if (result.status === "available") {
+			// Probe-only answer: fetch the bytes with a non-probe read.
+			try {
+				const full = await endpoint.readResource({ kind: "history", ref: id, peerId: reference, offset, probe: false });
+				if (full.status !== "chunk") return text.length > 0 ? { text, newSize: offset } : null;
+				text += resourceBytesToText(full.chunk.bytes);
+				offset = full.chunk.offset + full.chunk.bytes.byteLength;
+				if (full.chunk.final) break;
+				continue;
+			} catch {
+				return text.length > 0 ? { text, newSize: offset } : null;
+			}
+		}
+		return text.length > 0 ? { text, newSize: offset } : null;
+	}
+	return { text, newSize: offset };
 }

@@ -25,6 +25,8 @@ import type {
 } from "../../task";
 import type { EndpointControlAck, EndpointSnapshot } from "../../task/endpoint";
 import type { ParamsError, RunContract } from "../../task/params";
+import type { ResourceReadResult } from "../../task/endpoint";
+import type { ResourceRef } from "../../task/resource";
 import type { TodoPhase } from "../../tools/todo";
 import type { RpcMessagesPage } from "./rpc-messages";
 
@@ -417,7 +419,17 @@ type RpcCommandVariants =
 	| { id?: string; type: "cancel_run"; runId: string }
 	| { id?: string; type: "terminate"; peerId?: string }
 	| { id?: string; type: "park"; runId: string }
-	| { id?: string; type: "resume"; reference: string; expectedRunId?: string };
+	| { id?: string; type: "resume"; reference: string; expectedRunId?: string }
+	| {
+			id?: string;
+			type: "read_resource";
+			kind: ResourceRef["kind"];
+			ref: string;
+			peerId: string;
+			offset?: number;
+			length?: number;
+			probe?: boolean;
+	  };
 
 /**
  * Every command may carry the managed correlation envelope; a legacy client
@@ -754,6 +766,7 @@ type RpcResponseVariants =
 	| { id?: string; type: "response"; command: "terminate"; success: true; data: { acknowledged: true } }
 	| { id?: string; type: "response"; command: "park"; success: true; data: EndpointControlAck }
 	| { id?: string; type: "response"; command: "resume"; success: true; data: RpcResumeResult }
+	| { id?: string; type: "response"; command: "read_resource"; success: true; data: ResourceReadResult }
 
 	// Error response (any command can fail). `error` remains the legacy
 	// human-readable field; `message` repeats it for managed peers, and `code` is
@@ -1018,8 +1031,10 @@ export interface RpcHostUriResult {
 /** Response to an extension UI request */
 export type RpcExtensionUIResponse =
 	| { type: "extension_ui_response"; id: string; value: string }
+	| { type: "extension_ui_response"; id: string; value: unknown }
 	| { type: "extension_ui_response"; id: string; confirmed: boolean }
-	| { type: "extension_ui_response"; id: string; cancelled: true; timedOut?: boolean };
+	| { type: "extension_ui_response"; id: string; cancelled: true; timedOut?: boolean }
+	| { type: "extension_ui_response"; id: string; unavailable: true; reason: "no-ui" | "disconnected" };
 
 // ============================================================================
 // Helper type for extracting command types

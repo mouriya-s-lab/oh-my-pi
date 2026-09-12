@@ -139,6 +139,45 @@ export interface AgentHubRemoteTranscript {
 	error?: string;
 }
 
+/**
+ * Read one history page through an agent's endpoint without waking it (#13).
+ *
+ * Dispatches on `AgentRef.endpoint.kind`: local refs read nothing here (the
+ * caller owns the session file), remote refs reassemble `history` chunks from
+ * `fromByte`. Never calls `endpoint.run`/`endpoint.start`: a snapshot or
+ * history read must leave idle/parked peers exactly as they were.
+ */
+export async function readHubHistoryViaEndpoint(
+	ref: AgentRef,
+	fromByte: number,
+): Promise<{ text: string; newSize: number } | null> {
+	if (ref.endpoint.kind !== "remote" || !ref.endpoint.endpoint) return null;
+	const endpoint = ref.endpoint.endpoint;
+	const reference = ref.endpoint.reference;
+	const { resourceBytesToText } = await import("../../task/resource");
+	let offset = Math.max(0, fromByte);
+	let text = "";
+	for (let pages = 0; pages < 16; pages++) {
+		const result = await endpoint.readResource({ kind: "history", ref: ref.id, peerId: reference, offset, probe: false });
+		if (result.status === "chunk") {
+			text += resourceBytesToText(result.chunk.bytes);
+			offset = result.chunk.offset + result.chunk.bytes.byteLength;
+			if (result.chunk.final) break;
+			continue;
+		}
+		if (result.status === "available") {
+			const full = await endpoint.readResource({ kind: "history", ref: ref.id, peerId: reference, offset, probe: false });
+			if (full.status !== "chunk") break;
+			text += resourceBytesToText(full.chunk.bytes);
+			offset = full.chunk.offset + full.chunk.bytes.byteLength;
+			if (full.chunk.final) break;
+			continue;
+		}
+		break;
+	}
+	return { text, newSize: offset };
+}
+
 /** Guest-side proxy for hub actions executed on the collab host. */
 export interface AgentHubRemote {
 	chat(id: string, text: string): void;

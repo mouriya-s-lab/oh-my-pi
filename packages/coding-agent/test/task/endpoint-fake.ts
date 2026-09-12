@@ -47,14 +47,16 @@ import {
 	type IrcDeliveryReceipt,
 	type IrcInboundEnvelope,
 	type PrepareResult,
-	RESOURCE_READ_DEFERRED,
 	type ResourceReadResult,
-	type ResourceRef,
 	type RunAck,
 	type RunOutcome,
-	UI_RESPONSE_DEFERRED,
-	type UiResponse,
 } from "@oh-my-pi/pi-coding-agent/task/endpoint";
+import type {
+	ResourceReadQuery,
+	UiRequest,
+	UiResponse,
+} from "@oh-my-pi/pi-coding-agent/task/resource";
+import { FakeResourceTable, type FakeResourceSetup } from "./resource-fake";
 import {
 	ReplyDrainedBarrier,
 	type ReplyDrainedFacts,
@@ -181,6 +183,7 @@ export class FakeRemoteEndpoint implements AgentEndpoint {
 
 	/** Records the run and returns immediately; the ACK is not an outcome. */
 	async start(assignment: string): Promise<RunAck> {
+		this.startCount += 1;
 		const runId = crypto.randomUUID();
 		this.#currentRunId = runId;
 		this.#currentStatus = "running";
@@ -202,6 +205,7 @@ export class FakeRemoteEndpoint implements AgentEndpoint {
 	}
 
 	async run(runId: string): Promise<RunOutcome> {
+		this.runCount += 1;
 		if (runId !== this.#currentRunId) {
 			throw new Error(`FakeRemoteEndpoint.run: unknown run ${JSON.stringify(runId)}.`);
 		}
@@ -446,22 +450,36 @@ export class FakeRemoteEndpoint implements AgentEndpoint {
 		return { acknowledged: true };
 	}
 
-	/**
-	 * Not implemented: #8 defers the peer-scoped content channel to #13. A stub
-	 * that cannot return content answers not-implemented rather than inventing
-	 * bytes.
-	 */
-	async readResource(_ref: ResourceRef): Promise<ResourceReadResult> {
-		return { status: "not-implemented", detail: RESOURCE_READ_DEFERRED };
-	}
+	/** Peer-scoped content channel (#13): served from the in-memory table. */
+	readonly resources = new FakeResourceTable();
+	/** `run()` invocations observed; hub view must leave this at zero. */
+	runCount = 0;
+	/** `start()` invocations observed; hub view must leave this at zero. */
+	startCount = 0;
 
 	/**
-	 * Not implemented: #8 defers the interactive channel to #13. The required
-	 * `acknowledged: true` cannot signal failure, so an unsupported invocation
-	 * rejects instead of returning a false success.
+	 * Seed one fake remote resource. Tests initialize the table through this
+	 * rather than touching `resources` directly.
 	 */
-	async respondUi(_response: UiResponse): Promise<{ acknowledged: true }> {
-		throw new Error(UI_RESPONSE_DEFERRED);
+	setResource(entry: FakeResourceSetup): void {
+		this.resources.set(entry);
+	}
+
+	/** Flip one entry's availability (result-ref-first sequencing). */
+	setResourceAvailability(
+		kind: FakeResourceSetup["kind"],
+		ref: string,
+		availability: FakeResourceSetup["availability"] & {},
+	): void {
+		this.resources.setAvailability(kind, ref, availability ?? "available");
+	}
+
+	async readResource(query: ResourceReadQuery): Promise<ResourceReadResult> {
+		return this.resources.read(query);
+	}
+
+	async respondUi(request: UiRequest): Promise<UiResponse> {
+		return this.resources.answer(request);
 	}
 
 	asJobSnapshot(): EndpointSnapshot {

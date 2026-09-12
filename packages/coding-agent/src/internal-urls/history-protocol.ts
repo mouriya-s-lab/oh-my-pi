@@ -103,8 +103,9 @@ export class HistoryProtocolHandler implements ProtocolHandler {
 			const knownStr = known.length > 0 ? known.join(", ") : "none";
 			throw new Error(`Unknown agent: ${agentId}\nKnown agents: ${knownStr}\nList all with history://`);
 		}
-		// D2 dependency: a remote identity must not fall back to a same-id local transcript (#13).
-		if (ref.endpoint.kind === "remote") throw new Error("Remote history reads are not implemented (#13).");
+		if (ref.endpoint.kind === "remote") {
+			return { ...(await resolveRemoteHistory(url, ref)), url: url.href };
+		}
 		const session = getLocalSession(ref);
 		const sessionFile = getLocalSessionFile(ref);
 
@@ -215,4 +216,50 @@ export class HistoryProtocolHandler implements ProtocolHandler {
 		}
 		return completions;
 	}
+}
+
+/**
+ * Remote history read (#13) via the endpoint content channel.
+ *
+ * Dispatches on `AgentRef.endpoint.kind`: remote refs reassemble `history`
+ * chunks through `endpoint.readResource` (never a same-id local transcript).
+ * A `forbidden` answer surfaces as `ResourceOwnershipError`; other terminal
+ * unavailability throws rather than inventing rows.
+ */
+async function resolveRemoteHistory(
+	url: import("./types").InternalUrl,
+	ref: import("../registry/agent-registry").AgentRef,
+): Promise<import("./types").InternalResource> {
+	const endpoint = ref.endpoint.kind === "remote" ? ref.endpoint.endpoint : null;
+	if (!endpoint) throw new Error(`Agent ${ref.id} has no connected endpoint.`);
+	const { resourceBytesToText, ResourceOwnershipError } = await import("../task/resource");
+	let offset = 0;
+	let combined = "";
+	for (let pages = 0; pages < 16; pages++) {
+		const result = await endpoint.readResource({
+			kind: "history",
+			ref: ref.id,
+			peerId: ref.endpoint.kind === "remote" ? ref.endpoint.reference : ref.id,
+			offset,
+			probe: false,
+		});
+		if (result.status === "chunk") {
+			combined += resourceBytesToText(result.chunk.bytes);
+			offset = result.chunk.offset + result.chunk.bytes.byteLength;
+			if (result.chunk.final) break;
+			continue;
+		}
+		if (result.status === "available") continue;
+		if (result.status === "forbidden") {
+			throw new ResourceOwnershipError(result.code, `Remote history refused: ${result.code}`);
+		}
+		throw new Error(`Remote history unavailable: ${result.status}`);
+	}
+	return {
+		url: url.href,
+		content: combined,
+		contentType: "text/markdown",
+		size: Buffer.byteLength(combined, "utf-8"),
+		notes: ["Source: remote endpoint (history chunks)"],
+	};
 }

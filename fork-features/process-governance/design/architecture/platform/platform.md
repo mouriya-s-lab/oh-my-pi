@@ -5,7 +5,7 @@ module Platform
 imports from Governance
   types
     Identity renamed Identity;
-    Mark renamed Mark;
+    UnitId renamed UnitId;
     Enclosure renamed Enclosure;
     Capability renamed Capability;
     Cumulative renamed Cumulative;
@@ -19,9 +19,9 @@ exports
   types Program; struct Placement; struct Started; struct SpawnOutcome
   operations
     Describe: () ==> Capability;
-    Spawn: Program * Placement * Mark ==> SpawnOutcome;
+    Spawn: Program * Placement * UnitId ==> SpawnOutcome;
     Members: Enclosure ==> set of Identity;
-    Marked: Mark ==> set of Identity;
+    Marked: UnitId ==> set of Identity;
     ProbeAll: set of Identity ==> map Identity to Usage;
     Measure: Enclosure ==> Reading;
     Terminate: Identity ==> ();
@@ -45,16 +45,16 @@ types
   -- 操作系统的事实
 state Os of
   ability : Capability                       -- 这个平台的围栏能保证到什么程度
-  members : map Enclosure to set of Identity -- 每个围栏此刻的成员；没有成员的围栏不存在
-  marked  : map Identity to Mark             -- 活着的进程带的标记（读得到环境的那些）
+  members : map Enclosure to set of Identity -- 尚未释放的围栏与各自此刻活着的成员；成员退完时为空集
+  marked  : map Identity to UnitId           -- 活着的进程在环境里带的单位身份（读得到环境的那些）
   alive   : map Identity to Usage            -- 活着的进程与各自此刻的用量
-  charged : map Enclosure to Cumulative      -- 已退出成员留在围栏里的累计量
+  charged : map Enclosure to Cumulative      -- 已退出成员留在围栏里的累计量（平台有围栏账本的那些）
   peak    : map Enclosure to nat             -- 围栏整体的历史峰值内存（平台给得出的那些）
   inv mk_Os(-, m, mk, a, c, p) ==
-    (forall e in set dom m & m(e) <> {} and m(e) subset dom a)
+    (forall e in set dom m & m(e) subset dom a)
     and (forall e1, e2 in set dom m & e1 <> e2 => m(e1) inter m(e2) = {})
     and dom mk subset dom a
-    and dom c = dom m and dom p subset dom m
+    and dom c subset dom m and dom p subset dom m
   init s == s = mk_Os(mk_Capability(<Cooperative>, false), {|->}, {|->}, {|->}, {|->}, {|->})
 end
 
@@ -66,14 +66,13 @@ functions
     then iota e in set dom m & id in set m(e)
     else nil;
 
-  -- 读数：围栏整体的累计量含已退出成员时为完整，否则只含活着的
-  Collect: set of Identity * map Identity to Usage * Cumulative * [nat] * bool -> Reading
-  Collect(ids, usage, charged, peak, complete) ==
+  -- 围栏的读数：有已退出成员账本时累计量为完整，否则只含此刻活着的成员
+  Collect: set of Identity * map Identity to Usage * [Cumulative] * [nat] -> Reading
+  Collect(ids, usage, exited, peak) ==
     let live = Sum(ids, usage) in
-      mk_Reading(AddCumulative(live.cumulative, charged),
-                 if complete then <Complete> else <LiveOnly>,
-                 live.memoryBytes,
-                 peak)
+      if exited = nil
+      then mk_Reading(live.cumulative, <LiveOnly>, live.memoryBytes, peak)
+      else mk_Reading(AddCumulative(live.cumulative, exited), <Complete>, live.memoryBytes, peak)
   pre ids subset dom usage;
 
 operations
@@ -82,68 +81,71 @@ operations
   ext rd ability
   post r = ability;
 
-  -- 起一个程序并盖上标记；要围栏时围栏随它诞生，开不出来时它不在任何围栏里
-  Spawn(program: Program, placement: Placement, mark: Mark) r: SpawnOutcome
-  ext wr alive wr members wr marked wr charged
-  post (r = <Failed> and alive = alive~ and members = members~ and marked = marked~ and charged = charged~)
+  -- 起一个程序并在环境里盖上单位身份；要围栏时围栏随它诞生，开不出来时它不在任何围栏里
+  Spawn(program: Program, placement: Placement, unit: UnitId) r: SpawnOutcome
+  ext wr alive wr members wr marked wr charged wr peak
+  post (r = <Failed> and alive = alive~ and members = members~ and marked = marked~ and charged = charged~ and peak = peak~)
     or (is_Started(r)
         and r.id not in set dom alive~
         and r.id in set dom alive
         and alive~ = {r.id} <-: alive
-        and marked = marked~ ++ {r.id |-> mark}
+        and {r.id} <-: marked = marked~
+        and (r.id in set dom marked => marked(r.id) = unit)
         and (placement = <Unfenced> => r.enclosure = nil)
-        and (r.enclosure = nil => members = members~ and charged = charged~)
+        and (r.enclosure = nil => members = members~ and charged = charged~ and peak = peak~)
         and (r.enclosure <> nil =>
               r.enclosure not in set dom members~
               and members = members~ ++ {r.enclosure |-> {r.id}}
-              and charged = charged~ ++ {r.enclosure |-> NoCumulative()}));
+              and {r.enclosure} <-: charged = charged~
+              and (r.enclosure in set dom charged => charged(r.enclosure) = NoCumulative())
+              and {r.enclosure} <-: peak = peak~));
 
-  -- 围栏此刻的成员；围栏已消失时为空集
+  -- 围栏此刻活着的成员；成员已退完或围栏已释放时为空集
   Members(enclosure: Enclosure) r: set of Identity
   ext rd members
   post r = (if enclosure in set dom members then members(enclosure) else {});
 
-  -- 带着这个标记的活着的进程；读不到环境的进程不出现，所以是下界
-  Marked(mark: Mark) r: set of Identity
+  -- 环境里带着这个单位身份的活着的进程；读不到环境的进程不出现，所以是下界
+  Marked(unit: UnitId) r: set of Identity
   ext rd marked
-  post r = {id | id in set dom marked & marked(id) = mark};
+  post r = {id | id in set dom marked & marked(id) = unit};
 
   -- 读一组进程此刻的用量；已不存在的进程不出现在结果里
   ProbeAll(ids: set of Identity) r: map Identity to Usage
   ext rd alive
   post r = ids <: alive;
 
-  -- 读一个围栏的读数：累计量含已退出成员，所以完整；峰值在平台给得出时交出
+  -- 读一个围栏的读数：围栏有已退出成员账本时标完整，否则只含此刻活着的成员；围栏已释放时为零读数
   Measure(enclosure: Enclosure) r: Reading
   ext rd members rd alive rd charged rd peak
-  pre enclosure in set dom members
-  post r = Collect(members(enclosure), alive, charged(enclosure),
-                   if enclosure in set dom peak then peak(enclosure) else nil,
-                   true);
+  post r = Collect(if enclosure in set dom members then members(enclosure) else {},
+                   alive,
+                   if enclosure in set dom charged then charged(enclosure) else nil,
+                   if enclosure in set dom peak then peak(enclosure) else nil);
 
-  -- 终止一个进程；按身份操作，进程号已被复用时不影响新进程；它的累计量计入所在围栏，围栏空了就消失
+  -- 终止一个进程；按身份操作，进程号已被复用时不影响新进程；若所在围栏有账本则累计量计入，围栏本身保留到 Kill 释放
   Terminate(id: Identity)
-  ext wr alive wr members wr marked wr charged wr peak
+  ext wr alive wr members wr marked wr charged
   post alive = {id} <-: alive~
     and marked = {id} <-: marked~
     and (let e = Within(id, members~) in
-          (e = nil => members = members~ and charged = charged~ and peak = peak~)
+          (e = nil => members = members~ and charged = charged~)
           and (e <> nil =>
-                (members~(e) = {id} =>
-                  members = {e} <-: members~ and charged = {e} <-: charged~ and peak = {e} <-: peak~)
-                and (members~(e) <> {id} =>
-                      members = members~ ++ {e |-> members~(e) \ {id}}
-                      and charged = charged~ ++ {e |-> AddCumulative(charged~(e), alive~(id).cumulative)}
-                      and peak = peak~)));
+                members = members~ ++ {e |-> members~(e) \ {id}}
+                and charged = (if e in set dom charged~
+                               then charged~ ++ {e |-> AddCumulative(charged~(e), alive~(id).cumulative)}
+                               else charged~)));
 
-  -- 终止一个围栏的全部成员；围栏随之消失
+  -- 终止一个围栏里残余的全部成员并释放围栏；释放两次与一次效果相同
   Kill(enclosure: Enclosure)
   ext wr alive wr members wr marked wr charged wr peak
-  pre enclosure in set dom members
-  post alive = members~(enclosure) <-: alive~
-    and marked = members~(enclosure) <-: marked~
-    and members = {enclosure} <-: members~
-    and charged = {enclosure} <-: charged~
-    and peak = {enclosure} <-: peak~;
+  post (enclosure not in set dom members~ =>
+          alive = alive~ and members = members~ and marked = marked~ and charged = charged~ and peak = peak~)
+    and (enclosure in set dom members~ =>
+          alive = members~(enclosure) <-: alive~
+          and marked = members~(enclosure) <-: marked~
+          and members = {enclosure} <-: members~
+          and charged = {enclosure} <-: charged~
+          and peak = {enclosure} <-: peak~);
 end Platform
 ```

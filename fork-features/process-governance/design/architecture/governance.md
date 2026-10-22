@@ -4,7 +4,7 @@
 module Governance
 exports
   types
-    struct Identity; Mark; Enclosure; struct Guarantee; struct Capability;
+    struct Identity; UnitId; Enclosure; struct Guarantee; struct Capability;
     struct Cumulative; struct Usage; struct Coverage; struct Reading
   functions
     NoCumulative: () -> Cumulative;
@@ -18,8 +18,8 @@ types
     pid   : nat    -- 操作系统分配的进程号
     birth : token; -- 这个进程出生时刻的标记，由平台给出
 
-  -- 宿主在起进程时盖在它环境里的标记；后代继承，宿主据此认出血统
-  Mark = token;
+  -- 一个归属单位的身份；台账造出，起进程时作为血统标记盖进环境，后代继承
+  UnitId = token;
 
   -- 一个围栏的身份；平台造出，使用方不读结构
   Enclosure = token;
@@ -32,7 +32,7 @@ types
   -- 这个平台的围栏能保证到什么程度；使用方按这两项分支，不按平台分支
   Capability ::
     guarantee : Guarantee  -- 宿主死亡后成员的命运
-    contained : bool;      -- 成员不能自行离开围栏；为假时成员可能离开，要用标记补找
+    contained : bool;      -- 成员不能自行离开围栏；为假时成员可能离开，要按单位身份补找
 
   -- 累计量：进程出生以来的总和，只增不减
   Cumulative ::
@@ -55,7 +55,7 @@ types
     cumulative  : Cumulative  -- 累计量之和
     coverage    : Coverage    -- 累计量覆盖的范围
     memoryBytes : nat         -- 取回那一刻活着的进程的内存之和
-    memoryPeak  : [nat];      -- 围栏整体的历史峰值内存；平台给不出时为空
+    memoryPeak  : [nat];      -- 围栏整体的历史峰值内存；平台给不出或合并多份读数后为空
 
 functions
   -- 没有累计量

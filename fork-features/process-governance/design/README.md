@@ -8,3 +8,5 @@
 - [architecture/platform/platform.md](architecture/platform/platform.md)
 - [architecture/registry/README.md](architecture/registry/README.md)
 - [architecture/registry/registry.md](architecture/registry/registry.md)
+- [business/host/README.md](business/host/README.md)
+- [business/host/host.md](business/host/host.md)

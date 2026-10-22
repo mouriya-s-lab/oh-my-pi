@@ -4,12 +4,12 @@
 module Governance
 exports
   types
-    struct Identity; struct Usage; Enclosure; struct Guarantee; struct Capability; struct Opened;
-    struct Coverage; struct Reading
+    struct Identity; Mark; Enclosure; struct Guarantee; struct Capability;
+    struct Cumulative; struct Usage; struct Coverage; struct Reading
   functions
-    Zero: () -> Usage;
-    Add: Usage * Usage -> Usage;
-    Total: set of Identity * map Identity to Usage -> Usage;
+    NoCumulative: () -> Cumulative;
+    AddCumulative: Cumulative * Cumulative -> Cumulative;
+    Sum: set of Identity * map Identity to Usage -> Reading;
     Merge: Reading * Reading -> Reading
 definitions
 types
@@ -18,12 +18,8 @@ types
     pid   : nat    -- 操作系统分配的进程号
     birth : token; -- 这个进程出生时刻的标记，由平台给出
 
-  -- 一次读数：CPU 与 IO 为累计值，内存为当前占用
-  Usage ::
-    cpuNanos    : nat   -- 累计 CPU 时间，纳秒
-    readBytes   : nat   -- 累计读入字节
-    writeBytes  : nat   -- 累计写出字节
-    memoryBytes : nat;  -- 当前内存占用，按平台的实际占用口径
+  -- 宿主在起进程时盖在它环境里的标记；后代继承，宿主据此认出血统
+  Mark = token;
 
   -- 一个围栏的身份；平台造出，使用方不读结构
   Enclosure = token;
@@ -33,52 +29,65 @@ types
   -- <Kernel>: 内核终止全部成员，宿主怎样死亡都成立
   -- <Cooperative>: 宿主正常退出前自己终止成员；崩溃后无人清理
 
-  -- 一个围栏能保证到什么程度；使用方按这两项分支，不按平台分支
+  -- 这个平台的围栏能保证到什么程度；使用方按这两项分支，不按平台分支
   Capability ::
     guarantee : Guarantee  -- 宿主死亡后成员的命运
-    aggregate : bool;      -- 围栏的读数含已退出成员
+    contained : bool;      -- 成员不能自行离开围栏；为假时成员可能离开，要用标记补找
 
-  -- 开出的围栏与它的能力
-  Opened ::
-    enclosure  : Enclosure    -- 开出的围栏
-    capability : Capability;  -- 这个围栏能保证到什么程度
+  -- 累计量：进程出生以来的总和，只增不减
+  Cumulative ::
+    cpuNanos   : nat   -- 累计 CPU 时间，纳秒
+    readBytes  : nat   -- 累计读入字节
+    writeBytes : nat;  -- 累计写出字节
 
-  -- 读数覆盖的范围
+  -- 一个活着的进程此刻的用量
+  Usage ::
+    cumulative  : Cumulative  -- 出生以来的累计
+    memoryBytes : nat;        -- 此刻的内存占用，按平台的实际占用口径
+
+  -- 累计量覆盖的范围
   Coverage = <Complete> | <LiveOnly>;
   -- <Complete>: 含已退出的进程
   -- <LiveOnly>: 只含取回那一刻活着的进程
 
-  -- 一份读数与它覆盖的范围
+  -- 一份读数：累计量带覆盖范围，内存只对活着的进程有意义
   Reading ::
-    usage    : Usage      -- 读到的用量
-    coverage : Coverage;  -- 这份读数覆盖的范围
+    cumulative  : Cumulative  -- 累计量之和
+    coverage    : Coverage    -- 累计量覆盖的范围
+    memoryBytes : nat         -- 取回那一刻活着的进程的内存之和
+    memoryPeak  : [nat];      -- 围栏整体的历史峰值内存；平台给不出时为空
 
 functions
-  -- 没有用量
-  Zero: () -> Usage
-  Zero() == mk_Usage(0, 0, 0, 0);
+  -- 没有累计量
+  NoCumulative: () -> Cumulative
+  NoCumulative() == mk_Cumulative(0, 0, 0);
 
-  -- 两份用量相加
-  Add: Usage * Usage -> Usage
-  Add(a, b) ==
-    mk_Usage(a.cpuNanos + b.cpuNanos, a.readBytes + b.readBytes, a.writeBytes + b.writeBytes, a.memoryBytes + b.memoryBytes);
+  -- 两份累计量相加
+  AddCumulative: Cumulative * Cumulative -> Cumulative
+  AddCumulative(a, b) ==
+    mk_Cumulative(a.cpuNanos + b.cpuNanos, a.readBytes + b.readBytes, a.writeBytes + b.writeBytes);
 
-  -- 一组进程的用量之和；两个实现必须得出同一结果，所以写显式体
-  Total: set of Identity * map Identity to Usage -> Usage
-  Total(ids, usage) ==
-    if ids = {} then Zero()
-    else let i in set ids in Add(usage(i), Total(ids \ {i}, usage))
+  -- 一组活着的进程的读数之和：只含活着的，没有整体峰值；两个实现必须得出同一结果，所以写显式体
+  Sum: set of Identity * map Identity to Usage -> Reading
+  Sum(ids, usage) ==
+    if ids = {} then mk_Reading(NoCumulative(), <LiveOnly>, 0, nil)
+    else let i in set ids in
+      let rest = Sum(ids \ {i}, usage) in
+        mk_Reading(AddCumulative(usage(i).cumulative, rest.cumulative), <LiveOnly>,
+                   usage(i).memoryBytes + rest.memoryBytes, nil)
   pre ids subset dom usage
   measure Size;
 
-  -- Total 的递归度量：每次递归少一个进程
+  -- Sum 的递归度量：每次递归少一个进程
   Size: set of Identity * map Identity to Usage -> nat
   Size(ids, -) == card ids;
 
-  -- 两份读数合成一份：只要有一份不完整，合成的就不完整
+  -- 两份读数合成一份：累计量相加，只要有一份不完整合成的就不完整；内存相加；峰值不可相加，合成后为空
   Merge: Reading * Reading -> Reading
   Merge(a, b) ==
-    mk_Reading(Add(a.usage, b.usage),
-               if a.coverage = <Complete> and b.coverage = <Complete> then <Complete> else <LiveOnly>);
+    mk_Reading(AddCumulative(a.cumulative, b.cumulative),
+               if a.coverage = <Complete> and b.coverage = <Complete> then <Complete> else <LiveOnly>,
+               a.memoryBytes + b.memoryBytes,
+               nil);
 end Governance
 ```

@@ -21,3 +21,5 @@
 宿主所在的进程组不一定属于宿主：由 zsh 启动的宿主自成一组；由桌面应用（Paseo）启动的宿主 39307 观察到 pgid 为 861，与其他程序共用一组。
 
 TS 侧约 49 个文件直接调用 `Bun.spawn` 或 `ptree.spawn`，没有统一的起进程入口；上游 PR #13192 为 Linux cgroup 逐个包装了约 60 处，review 指出以后新增的 `Bun.spawn` 会悄悄漏掉。
+
+活过宿主的进程在三个平台上都有操作系统自己的拥有者：macOS 的 launchd 按 plist 起用户代理并在退出后拉起，Linux 的 systemd 按用户级 unit 起服务，Windows 的服务管理器按服务注册起；它们的父进程是服务管理器，不是宿主。omp 当前的 `nohup` 两层 fork 与 detached 守护进程绕过了这一层，由宿主自己充当"放走"的一方。

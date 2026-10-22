@@ -1,25 +1,33 @@
 # 宿主生命周期
 
-负责把归属单位的开始、起进程并登记、逃逸后代补找、用量读数汇总、按单位收尾与宿主退出串成完整路径，并判定一份读数是否越过内存阈值；不负责围栏在各操作系统上的底层机制，也不负责告警的界面展示与通知文案。
+负责把归属单位的嵌套开闭、起受管进程树并登记、采集单棵或多棵进程树的 CPU/IO/内存读数、按单位去重判定超限告警、按单位收尾与宿主退出串成完整路径；不负责各操作系统圈住进程树的内部机制，也不负责告警的界面展示与文案。
 
 ## 依据
 
-宿主在起进程时拿到子进程身份与可能随它诞生的围栏；有围栏的进程树按围栏计量与终止，没有围栏的按进程身份计量与终止（来源：架构 ``Platform`` 与 ``Registry`` 连接，证据见附录 `evidence/spawn-sites.md`）。所以起进程成功后，有围栏的调 ``Registry`Attach`` 记围栏，没有围栏的调 ``Registry`Track`` 记进程身份。
+宿主在归属单位名下起进程时，必须先确认该归属单位仍在册，再调用平台起受管进程树并登记到该单位名下；起进程失败时不在台账里留空记录（来源：架构 ``Platform`Spawn`` 与 ``Registry`Attach`` 契约，证据见附录 `evidence/spawn-sites.md`）。所以 ``Host`Launch`` 先调 ``Registry`Live`` 核对单位在册，通过后才调 ``Platform`Spawn`` 与 ``Registry`Attach``。
 
-`contained` 为假的平台上，围栏成员可以自行 `setsid` 离开围栏，但仍带着环境里的单位身份；围栏内的成员同样带着单位身份（来源：证据 `evidence/platform-containment.md`、`evidence/spawn-sites.md`）。所以补找逃逸后代只在 `contained` 为假时查询 ``Platform`Marked``，并用 ``Host`Escaped`` 减去围栏内此刻的成员，既不漏掉逃逸后代，也不与围栏成员重复计算。
+一个归属单位名下只有一棵受管进程树时，直接取 ``Platform`Measure`` 的读数即可保留平台给出的 `<Complete>` 覆盖度与 `memoryPeak`；有多棵受管进程树时，用 ``Governance`Merge`` 合并各棵树的读数（来源：架构 ``Governance`Merge`` 与 ``Platform`Measure`` 契约，证据见附录 `evidence/identity-and-usage.md`）。所以单棵树采样由 ``Host`SampleTree`` 直接返回 ``Platform`Measure`` 的读数，多棵树合并由 ``Host`SamplePair`` 调 ``Governance`Merge``。
 
-归属单位按嵌套树组织，外层结束前内层必须全部结束，单位结束前名下的围栏与无围栏进程必须全部清掉（来源：架构 ``Registry`End`` 准入契约，证据见附录 `evidence/upstream-issues.md`）。所以单位收尾对名下围栏调 ``Platform`Kill`` 并 ``Registry`Release``，对无围栏进程与逃逸后代调 ``Platform`Terminate`` 并 ``Registry`Drop``，最后调 ``Registry`End``。
+同一归属单位在存续期内可能连续派生多个子进程，或被周期性采样多次；越过阈值后若每次采样都告警会造成重复刷屏（来源：上游 #5684、#12961，证据见附录 `evidence/upstream-issues.md`）。所以 ``Host`JudgeAlert`` 先用 ``Governance`Exceeded`` 判定读数是否越过 CPU、IO 或内存阈值，超限时查 ``Registry`Alerted``：未告警过则调 ``Registry`MarkAlerted`` 并返回 `<Triggered>`，已告警过则返回 `<Suppressed>`。
 
-`<Kernel>` 保证的围栏在宿主怎样死亡时都由内核终止全部成员，`<Cooperative>` 的围栏在宿主正常退出前必须由宿主自己终止（来源：证据 `evidence/platform-containment.md`）。所以宿主退出前按 ``Platform`Describe`` 的 `guarantee` 分支：`<Cooperative>` 时终止并释放围栏，`<Kernel>` 时交由内核处理。
+归属单位按嵌套树组织，外层单位结束前它的直接内层子单位（``Registry`Children``）必须全部结束，名下的受管进程树（``Registry`Trees``）必须全部终止并释放（来源：架构 ``Registry`End`` 准入契约，证据见附录 `evidence/upstream-issues.md` #5684）。所以单位收尾先对名下每棵进程树调 ``Host`RetireTree``（``Platform`Kill`` 加 ``Registry`Release``），待内层子单位与进程树全部清空后由 ``Host`FinishUnit`` 调 ``Registry`End``。
 
-归属单位的内存占用越过配置阈值时宿主需要收到告警（来源：上游 #5684 与 #12961，证据见附录 `evidence/upstream-issues.md`）。所以 ``Host`Exceeded`` 按阈值判定一份读数是否超限。
+`<Kernel>` 保证的平台在宿主怎样退出时都由内核随句柄关闭终止全部受管进程树，`<Cooperative>` 的平台在宿主正常退出前必须由宿主自己终止（来源：证据 `evidence/platform-containment.md`）。所以宿主退出前 ``Host`ExitTree`` 按 ``Platform`Describe`` 分支：`<Cooperative>` 时终止并释放进程树，`<Kernel>` 时交由内核随宿主退出清理。
 
 ## 需求
 
-在归属单位名下起进程时，进程起来后按有无围栏登记到该单位名下，起进程失败时不留登记（来源：上游 #5684、#12961），由 ``Host`Launch`` 走通。
+在归属单位名下起受管进程树时，单位不在册则拒绝起进程，起进程成功则登记到该单位名下，起进程失败则不留登记（来源：上游 #5684、#12961），由 ``Host`Launch`` 走通。
 
-采集归属单位的用量时，合并该单位围栏的读数与围栏外进程（含 `contained` 为假时逃出围栏的后代）的读数，并在内存越过阈值时给出超限判定（来源：上游 #5684、#12961），由 ``Host`Outside``、``Host`Sample`` 与 ``Host`Exceeded`` 走通。
+采集归属单位名下受管进程树的 CPU、IO、内存读数时，单棵树保留完整度与峰值，多棵树合并读数；首次越过阈值时返回触发告警，同一单位后续采样仍超限时抑制重复告警（来源：上游 #5684、#12961），由 ``Host`JudgeAlert``、``Host`SampleTree`` 与 ``Host`SamplePair`` 走通。
 
-归属单位收尾时，终止并释放名下围栏、终止并撤销名下无围栏进程与逃出围栏的后代，再结束该单位（来源：上游 #5684），由 ``Host`RetireFence``、``Host`RetireProcess`` 与 ``Host`RunUnit`` 走通。
+归属单位按由内到外的嵌套次序收尾：内层子单位先完成采样、终止并释放名下受管进程树、结束内层单位，外层单位再终止并释放自己的受管进程树并结束外层单位（来源：上游 #5684），由 ``Host`RetireTree``、``Host`FinishUnit`` 与 ``Host`RunNested`` 走通。
 
-宿主退出前，对 `<Cooperative>` 平台的围栏执行终止清理，对 `<Kernel>` 平台的围栏交由内核清理（来源：证据 `evidence/platform-containment.md`），由 ``Host`ExitFence`` 走通。
+宿主退出前，对 `<Cooperative>` 平台的受管进程树执行终止与释放，对 `<Kernel>` 平台的受管进程树交由内核清理（来源：证据 `evidence/platform-containment.md`），由 ``Host`ExitTree`` 走通。
+
+## 语义
+
+最终用量采集（``Host`SampleTree`` / ``Host`SamplePair``）必须在 ``Host`RetireTree`` 之前完成：``Platform`Kill`` 会释放平台上的进程树账本与成员记录，释放后再采样只能得到空读数。
+
+单位收尾按嵌套深度自内向外推进：对每个最内层单位，先对 ``Registry`Trees`` 里的全部进程树执行 ``Host`RetireTree``，确认无子单位且无进程树后调 ``Host`FinishUnit``；全部内层单位结束后，外层单位才能满足 ``Host`FinishUnit`` 的条件。
+
+``Host`ExitTree`` 只用于宿主进程即将退出的终态：`<Kernel>` 分支不调 ``Platform`Kill`` 与 ``Registry`Release``，因为宿主进程退出时操作系统关闭句柄即由内核终止全部成员，内存台账也随宿主进程一并销毁。

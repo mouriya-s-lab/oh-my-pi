@@ -5,35 +5,31 @@ module Registry
 imports from Governance
   types
     Identity renamed Identity;
-    UnitId renamed UnitId;
-    Enclosure renamed Enclosure
+    UnitId renamed UnitId
 exports
-  functions
-    Ancestors: UnitId * map UnitId to UnitId * nat -> set of UnitId;
-    UnitEnclosures: UnitId * map Enclosure to UnitId -> set of Enclosure;
-    UnitUnfenced: UnitId * map Identity to UnitId -> set of Identity
   operations
     Begin: [UnitId] ==> UnitId;
-    Attach: UnitId * Enclosure ==> ();
-    Track: UnitId * Identity ==> ();
-    Enclosures: UnitId ==> set of Enclosure;
-    Unfenced: UnitId ==> set of Identity;
-    Release: Enclosure ==> ();
-    Drop: Identity ==> ();
+    Live: UnitId ==> bool;
+    Children: UnitId ==> set of UnitId;
+    Attach: UnitId * Identity ==> ();
+    Trees: UnitId ==> set of Identity;
+    Release: Identity ==> ();
+    Alerted: UnitId ==> bool;
+    MarkAlerted: UnitId ==> ();
     End: UnitId ==> ()
 definitions
-  -- 登记表
+  -- 宿主内存里的归属与告警台账
 state Table of
-  units      : set of UnitId             -- 活着的单位
-  parent     : map UnitId to UnitId      -- 内层单位到它的外层；构成森林
-  enclosures : map Enclosure to UnitId   -- 尚未释放的围栏归哪个单位
-  unfenced   : map Identity to UnitId    -- 没有围栏的进程归哪个单位
-  inv mk_Table(u, p, e, uf) ==
+  units   : set of UnitId            -- 活着的归属单位
+  parent  : map UnitId to UnitId     -- 内层单位到它的外层；构成无环森林
+  trees   : map Identity to UnitId   -- 尚未释放的受管进程树归哪个单位
+  alerted : set of UnitId            -- 存续期内已经触发过超限告警的单位
+  inv mk_Table(u, p, t, a) ==
     dom p subset u and rng p subset u
     and (forall x in set dom p & x not in set Ancestors(x, p, card dom p))
-    and rng e subset u
-    and rng uf subset u
-  init t == t = mk_Table({}, {|->}, {|->}, {|->})
+    and rng t subset u
+    and a subset u
+  init s == s = mk_Table({}, {|->}, {|->}, {})
 end
 
 functions
@@ -48,15 +44,15 @@ functions
   Fuel: UnitId * map UnitId to UnitId * nat -> nat
   Fuel(-, -, fuel) == fuel;
 
-  -- 一个单位名下尚未释放的全部围栏
-  UnitEnclosures: UnitId * map Enclosure to UnitId -> set of Enclosure
-  UnitEnclosures(unit, enclosures) ==
-    {e | e in set dom enclosures & enclosures(e) = unit};
+  -- 一个单位的直接内层子单位
+  UnitChildren: UnitId * map UnitId to UnitId -> set of UnitId
+  UnitChildren(unit, parent) ==
+    {c | c in set dom parent & parent(c) = unit};
 
-  -- 一个单位名下没有围栏的全部进程
-  UnitUnfenced: UnitId * map Identity to UnitId -> set of Identity
-  UnitUnfenced(unit, unfenced) ==
-    {id | id in set dom unfenced & unfenced(id) = unit};
+  -- 一个单位名下尚未释放的全部受管进程树
+  UnitTrees: UnitId * map Identity to UnitId -> set of Identity
+  UnitTrees(unit, trees) ==
+    {t | t in set dom trees & trees(t) = unit};
 
 operations
   -- 开始一个单位；没有外层就是根，否则嵌在一个活着的外层里
@@ -67,46 +63,51 @@ operations
     and units = units~ union {r}
     and parent = (if outer = nil then parent~ else parent~ ++ {r |-> outer});
 
-  -- 把一个新诞生的围栏记在单位名下；同一围栏只登记一次
-  Attach(unit: UnitId, enclosure: Enclosure)
-  ext wr enclosures rd units
-  pre unit in set units and enclosure not in set dom enclosures
-  post enclosures = enclosures~ ++ {enclosure |-> unit};
+  -- 一个单位是否活着
+  Live(unit: UnitId) r: bool
+  ext rd units
+  post r <=> unit in set units;
 
-  -- 把一个没有围栏的进程记在单位名下；同一身份只登记一次
-  Track(unit: UnitId, id: Identity)
-  ext wr unfenced rd units
-  pre unit in set units and id not in set dom unfenced
-  post unfenced = unfenced~ ++ {id |-> unit};
+  -- 一个单位此刻的直接内层子单位；不在册的单位为空集
+  Children(unit: UnitId) r: set of UnitId
+  ext rd parent
+  post r = UnitChildren(unit, parent);
 
-  -- 一个单位名下尚未释放的围栏；不在册的单位为空集
-  Enclosures(unit: UnitId) r: set of Enclosure
-  ext rd enclosures
-  post r = UnitEnclosures(unit, enclosures);
+  -- 把一棵新诞生的受管进程树记在单位名下；同一棵树只登记一次
+  Attach(unit: UnitId, tree: Identity)
+  ext wr trees rd units
+  pre unit in set units and tree not in set dom trees
+  post trees = trees~ ++ {tree |-> unit};
 
-  -- 一个单位名下没有围栏的进程；不在册的单位为空集
-  Unfenced(unit: UnitId) r: set of Identity
-  ext rd unfenced
-  post r = UnitUnfenced(unit, unfenced);
+  -- 一个单位名下尚未释放的受管进程树；不在册的单位为空集
+  Trees(unit: UnitId) r: set of Identity
+  ext rd trees
+  post r = UnitTrees(unit, trees);
 
-  -- 围栏已在平台上释放，台账随之撤销；撤销两次与一次效果相同
-  Release(enclosure: Enclosure)
-  ext wr enclosures
-  post enclosures = {enclosure} <-: enclosures~;
+  -- 受管进程树已在平台上释放，台账随之撤销；撤销两次与一次效果相同
+  Release(tree: Identity)
+  ext wr trees
+  post trees = {tree} <-: trees~;
 
-  -- 无围栏进程已不存在，台账随之撤销；撤销两次与一次效果相同
-  Drop(id: Identity)
-  ext wr unfenced
-  post unfenced = {id} <-: unfenced~;
+  -- 一个单位在存续期内是否已经触发过超限告警
+  Alerted(unit: UnitId) r: bool
+  ext rd alerted
+  post r <=> unit in set alerted;
 
-  -- 结束一个单位；内层已全部结束，名下没有围栏也没有无围栏进程
-  End(unit: UnitId)
-  ext wr units wr parent rd enclosures rd unfenced
+  -- 记下这个单位已经触发过超限告警；同一单位重复记与一次效果相同
+  MarkAlerted(unit: UnitId)
+  ext wr alerted rd units
   pre unit in set units
-      and unit not in set rng parent
-      and UnitEnclosures(unit, enclosures) = {}
-      and UnitUnfenced(unit, unfenced) = {}
+  post alerted = alerted~ union {unit};
+
+  -- 结束一个单位；直接内层子单位已全部结束，名下受管进程树已全部释放；它的已告警记录随之清除
+  End(unit: UnitId)
+  ext wr units wr parent wr alerted rd trees
+  pre unit in set units
+      and UnitChildren(unit, parent) = {}
+      and UnitTrees(unit, trees) = {}
   post units = units~ \ {unit}
-    and parent = {unit} <-: parent~;
+    and parent = {unit} <-: parent~
+    and alerted = alerted~ \ {unit};
 end Registry
 ```

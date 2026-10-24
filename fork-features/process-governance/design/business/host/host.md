@@ -5,26 +5,25 @@ module Host
 imports
   from Governance
     types
-      Identity renamed Identity;
-      UnitId renamed UnitId;
-      Guarantee renamed Guarantee;
-      Reading renamed Reading;
-      Limit renamed Limit
-    functions
-      Merge: Reading * Reading -> Reading renamed Merge;
-      Exceeded: Reading * Limit -> bool renamed Exceeded,
+      Identity renamed Identity,
   from Platform
     types
       Program renamed Program;
-      SpawnOutcome renamed SpawnOutcome
+      SpawnOutcome renamed SpawnOutcome;
+      Guarantee renamed Guarantee;
+      Cumulative renamed Cumulative;
+      Reading renamed Reading
+    functions
+      AddCumulative: Cumulative * Cumulative -> Cumulative renamed AddCumulative
     operations
       Describe: () ==> Guarantee renamed Describe;
       Spawn: Program ==> SpawnOutcome renamed Spawn;
       Measure: Identity ==> Reading renamed Measure;
       Kill: Identity ==> () renamed Kill,
   from Registry
+    types
+      UnitId renamed UnitId
     operations
-      Begin: [UnitId] ==> UnitId renamed Begin;
       Live: UnitId ==> bool renamed Live;
       Children: UnitId ==> set of UnitId renamed Children;
       Attach: UnitId * Identity ==> () renamed Attach;
@@ -34,31 +33,55 @@ imports
       MarkAlerted: UnitId ==> () renamed MarkAlerted;
       End: UnitId ==> () renamed End
 exports
-  types struct LaunchOutcome; struct AlertOutcome; struct SampleOutcome
+  types struct Limit; struct LaunchOutcome; struct AlertOutcome; struct SampleOutcome
+  functions
+    Merge: Reading * Reading -> Reading;
+    Exceeded: Reading * Limit -> bool
   operations
     Launch: UnitId * Program ==> LaunchOutcome;
-    JudgeAlert: UnitId * Reading * Limit ==> AlertOutcome;
     SampleTree: UnitId * Identity * Limit ==> [SampleOutcome];
     SamplePair: UnitId * Identity * Identity * Limit ==> [SampleOutcome];
-    RetireTree: UnitId * Identity ==> ();
+    RetireTree: UnitId * Identity * Limit ==> [SampleOutcome];
     FinishUnit: UnitId ==> bool;
-    ExitTree: Identity ==> ();
-    RunNested: Program * Program * Limit ==> [SampleOutcome]
+    CloseNested: UnitId * UnitId ==> bool;
+    ExitTree: Identity ==> ()
 definitions
 types
-  -- Launch 的结局：登记在册的受管进程树身份、平台起进程失败，或归属单位不在册
+  -- 告警阈值：CPU 时间、读写总字节或当前内存任一越过上限即超限
+  Limit ::
+    cpuNanos    : nat   -- CPU 时间上限，纳秒
+    ioBytes     : nat   -- 读入加写出字节上限
+    memoryBytes : nat;  -- 当前内存占用上限，字节
+
+  -- Launch 的结局：登记在单位名下的新树、平台起进程失败，或单位不在册；后两支都没有留下登记
   LaunchOutcome = Identity | <Failed> | <NotLive>;
 
-  -- 一次超限告警判定的结局：首次超限触发告警、同一单位已告警过予以抑制，或未超限
+  -- 一次告警判定的结局：首次超限触发、同一单位已告警过而抑制，或正常
   AlertOutcome = <Triggered> | <Suppressed> | <Normal>;
 
-  -- 一次采样的结果：用量读数与告警判定结局
+  -- 一次采样交给调用方的结果：采到的读数与它的告警判定结局
   SampleOutcome ::
-    reading : Reading       -- 采到的用量读数
-    alert   : AlertOutcome; -- 本次采样的告警判定结局
+    reading : Reading       -- 这次采到的读数
+    alert   : AlertOutcome; -- 这次采样的告警判定结局
+
+functions
+  -- 两棵树的读数合成一份：两份都完整时才完整；峰值不能跨树相加，合成后为空；两个实现必须得出同一结果，所以写显式体
+  Merge: Reading * Reading -> Reading
+  Merge(a, b) ==
+    mk_Reading(AddCumulative(a.cumulative, b.cumulative),
+               if a.coverage = <Complete> and b.coverage = <Complete> then <Complete> else <LiveOnly>,
+               a.memoryBytes + b.memoryBytes,
+               nil);
+
+  -- 读数是否超限：任一项严格超过上限即超限，不看峰值；两个实现必须得出同一结果，所以写显式体
+  Exceeded: Reading * Limit -> bool
+  Exceeded(reading, limit) ==
+    reading.cumulative.cpuNanos > limit.cpuNanos
+    or reading.cumulative.readBytes + reading.cumulative.writeBytes > limit.ioBytes
+    or reading.memoryBytes > limit.memoryBytes;
 
 operations
-  -- 场景：先核对单位在册，再起受管进程树并登记到该单位名下；失败或不在册时不留登记
+  -- 场景：先核对单位在册，再起树，成功才登记到该单位名下
   Launch: UnitId * Program ==> LaunchOutcome
   Launch(unit, program) ==
     if not Live(unit) then return <NotLive>
@@ -67,14 +90,14 @@ operations
         if outcome = <Failed> then return <Failed>
         else (Attach(unit, outcome); return outcome);
 
-  -- 场景：按阈值判定一份读数是否触发告警；同一归属单位在存续期内至多触发一次
+  -- 场景：按单位去重判定一份读数；同一单位存续期内至多触发一次
   JudgeAlert: UnitId * Reading * Limit ==> AlertOutcome
   JudgeAlert(unit, reading, limit) ==
     if not Live(unit) or not Exceeded(reading, limit) then return <Normal>
     elseif Alerted(unit) then return <Suppressed>
     else (MarkAlerted(unit); return <Triggered>);
 
-  -- 场景：采集单位名下一棵受管进程树的读数并判定告警；直接返回单树读数以保留 Complete 与峰值
+  -- 场景：采单位名下一棵树；直接用平台读数，保留完整性与峰值；树不在该单位名下时不采样
   SampleTree: UnitId * Identity * Limit ==> [SampleOutcome]
   SampleTree(unit, tree, limit) ==
     if tree not in set Trees(unit) then return nil
@@ -83,7 +106,7 @@ operations
         let alert = JudgeAlert(unit, reading, limit) in
           return mk_SampleOutcome(reading, alert);
 
-  -- 场景：合并采集单位名下两棵不同受管进程树的读数并判定告警
+  -- 场景：合成单位名下两棵不同的树的读数再判定；任一棵不在该单位名下或两棵相同时不采样
   SamplePair: UnitId * Identity * Identity * Limit ==> [SampleOutcome]
   SamplePair(unit, first, second, limit) ==
     if first not in set Trees(unit) or second not in set Trees(unit) or first = second then return nil
@@ -92,43 +115,38 @@ operations
         let alert = JudgeAlert(unit, reading, limit) in
           return mk_SampleOutcome(reading, alert);
 
-  -- 场景：终止并释放单位名下的一棵受管进程树
-  RetireTree: UnitId * Identity ==> ()
-  RetireTree(unit, tree) ==
-    if tree in set Trees(unit) then
-      (Kill(tree); Release(tree));
+  -- 场景：收尾单位名下一棵树：先做最后一次采样，再终止并释放平台上的树，最后撤销登记
+  RetireTree: UnitId * Identity * Limit ==> [SampleOutcome]
+  RetireTree(unit, tree, limit) ==
+    if tree not in set Trees(unit) then return nil
+    else
+      let final = SampleTree(unit, tree, limit) in
+        (Kill(tree); Release(tree); return final);
 
-  -- 场景：在内层子单位与名下受管进程树已全部清空时结束该单位
+  -- 场景：单位活着、内层已全部结束、名下树已全部撤销时结束它，否则不结束
   FinishUnit: UnitId ==> bool
   FinishUnit(unit) ==
     if Live(unit) and Children(unit) = {} and Trees(unit) = {}
     then (End(unit); return true)
     else return false;
 
-  -- 场景：宿主进程退出前按平台保证处置一棵受管进程树
+  -- 场景：由内向外收尾一对嵌套单位：内层结束之后才结束外层
+  CloseNested: UnitId * UnitId ==> bool
+  CloseNested(outer, inner) ==
+    if inner not in set Children(outer) then return false
+    else
+      let innerDone = FinishUnit(inner) in
+        if not innerDone then return false
+        else
+          let outerDone = FinishUnit(outer) in
+            return outerDone;
+
+  -- 场景：宿主正常退出前处置一棵未释放的树：协作平台上终止释放并撤销登记，内核保证平台上交给内核
   ExitTree: Identity ==> ()
   ExitTree(tree) ==
     cases Describe():
       <Kernel> -> skip,
       <Cooperative> -> (Kill(tree); Release(tree))
     end;
-
-  -- 场景：走完外层单位与内层子单位从嵌套开启、起进程、采样告警、由内向外收尾到结束的完整生命周期
-  RunNested: Program * Program * Limit ==> [SampleOutcome]
-  RunNested(outerProgram, innerProgram, limit) ==
-    let outer = Begin(nil) in
-      let inner = Begin(outer) in
-        let innerLaunch = Launch(inner, innerProgram) in
-          (if is_Identity(innerLaunch) then
-             let - = SampleTree(inner, innerLaunch, limit) in
-               RetireTree(inner, innerLaunch);
-           let - = FinishUnit(inner) in
-             let outerLaunch = Launch(outer, outerProgram) in
-               if not is_Identity(outerLaunch) then
-                 let - = FinishUnit(outer) in return nil
-               else
-                 let sampled = SampleTree(outer, outerLaunch, limit) in
-                   (RetireTree(outer, outerLaunch);
-                    let - = FinishUnit(outer) in return sampled));
 end Host
 ```

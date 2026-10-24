@@ -1555,6 +1555,30 @@ const GOOGLE_THINKING: Record<Effort, number> = {
 	max: 32768,
 };
 
+/**
+ * Estimated thinking spend for an effort, used to size Google's
+ * `maxOutputTokens` (Gemini counts thinking against it). Level mode and the
+ * dynamic budget (`-1`) put no number on the wire, so this stands in for them.
+ */
+function googleThinkingHeadroom(model: Model<Api>, effort: Effort, customBudgets?: ThinkingBudgets): number {
+	return customBudgets?.[effort] ?? model.thinking?.effortBudgets?.[effort] ?? GOOGLE_THINKING[effort];
+}
+
+/**
+ * Google total output cap for a caller answer budget: the budget plus thinking
+ * headroom, bounded by the model cap. `undefined` (no cap sent) when neither
+ * the caller nor the model has one.
+ */
+function googleMaxOutputTokens(
+	baseMaxTokens: number | undefined,
+	model: Model<Api>,
+	headroom: number,
+): number | undefined {
+	return baseMaxTokens === undefined
+		? undefined
+		: maxTokensWithThinkingBudget(baseMaxTokens, model.maxTokens, headroom);
+}
+
 const BEDROCK_CLAUDE_THINKING: Record<Effort, number> = {
 	minimal: 1024,
 	low: 2048,
@@ -2069,14 +2093,16 @@ function mapOptionsForApi<TApi extends Api>(
 			// Explicitly disable thinking when reasoning is absent, unsupported, or
 			// replaced by the caller's external scratchpad. Gemini defaults thinking on.
 			const reasoning = options?.reasoning;
-			if (!reasoning || !model.reasoning || options?.disableReasoning || options?.forceReasoningOff) {
-				return castApi<"google-generative-ai">({
+			const thinkingOff = () =>
+				castApi<"google-generative-ai">({
 					...base,
 					serviceTier: options?.serviceTier,
 					thinking: resolveGoogleThinkingOff(model),
 					toolChoice: mapGoogleToolChoice(options?.toolChoice),
 					cachedContent: options?.cachedContent,
 				});
+			if (!reasoning || !model.reasoning || options?.disableReasoning || options?.forceReasoningOff) {
+				return thinkingOff();
 			}
 
 			const googleModel = model as Model<"google-generative-ai">;
@@ -2087,6 +2113,12 @@ function mapOptionsForApi<TApi extends Api>(
 			if (googleModel.thinking?.mode === "google-level") {
 				return castApi<"google-generative-ai">({
 					...base,
+					// Caller's maxTokens is desired output; Gemini counts thinking against the cap.
+					maxTokens: googleMaxOutputTokens(
+						base.maxTokens,
+						model,
+						googleThinkingHeadroom(model, effort, options?.thinkingBudgets),
+					),
 					serviceTier: options?.serviceTier,
 					thinking: {
 						enabled: true,
@@ -2098,11 +2130,24 @@ function mapOptionsForApi<TApi extends Api>(
 				});
 			}
 
+			const requestedBudget = getGoogleBudget(googleModel, effort, options?.thinkingBudgets);
+			const maxTokens = googleMaxOutputTokens(
+				base.maxTokens,
+				model,
+				requestedBudget > 0 ? requestedBudget : googleThinkingHeadroom(model, effort, options?.thinkingBudgets),
+			);
+			let budgetTokens = requestedBudget;
+			// If not enough room for thinking + output, reduce thinking budget.
+			if (requestedBudget > 0 && maxTokens !== undefined && maxTokens <= requestedBudget) {
+				budgetTokens = maxTokens - MIN_OUTPUT_TOKENS;
+				if (budgetTokens <= 0) return thinkingOff();
+			}
 			return castApi<"google-generative-ai">({
 				...base,
+				maxTokens,
 				thinking: {
 					enabled: true,
-					budgetTokens: getGoogleBudget(googleModel, effort, options?.thinkingBudgets),
+					budgetTokens,
 				},
 				hideThinkingSummary: options?.hideThinkingSummary,
 				toolChoice: mapGoogleToolChoice(options?.toolChoice),
@@ -2120,6 +2165,12 @@ function mapOptionsForApi<TApi extends Api>(
 				if (model.thinking?.mode === "google-level") {
 					return castApi<"google-gemini-cli">({
 						...base,
+						// Caller's maxTokens is desired output; Gemini counts thinking against the cap.
+						maxTokens: googleMaxOutputTokens(
+							base.maxTokens,
+							model,
+							googleThinkingHeadroom(model, effort, options.thinkingBudgets),
+						),
 						requestModelId: resolveWireModelId(model, effort),
 						thinking: {
 							enabled: true,
@@ -2131,8 +2182,7 @@ function mapOptionsForApi<TApi extends Api>(
 					});
 				}
 
-				let thinkingBudget =
-					options.thinkingBudgets?.[effort] ?? model.thinking?.effortBudgets?.[effort] ?? GOOGLE_THINKING[effort];
+				let thinkingBudget = googleThinkingHeadroom(model, effort, options.thinkingBudgets);
 
 				// Caller's maxTokens is desired output, so add thinking budget on top. With no caller/model cap, use a finite total fallback.
 				const maxTokens = maxTokensWithThinkingBudget(base.maxTokens, model.maxTokens, thinkingBudget);
@@ -2175,14 +2225,16 @@ function mapOptionsForApi<TApi extends Api>(
 			// Explicitly disable thinking when reasoning is absent, unsupported, or
 			// replaced by the caller's external scratchpad.
 			const reasoning = options?.reasoning;
-			if (!reasoning || !model.reasoning || options?.disableReasoning || options?.forceReasoningOff) {
-				return castApi<"google-vertex">({
+			const thinkingOff = () =>
+				castApi<"google-vertex">({
 					...base,
 					serviceTier: options?.serviceTier,
 					thinking: resolveGoogleThinkingOff(model),
 					toolChoice: mapGoogleToolChoice(options?.toolChoice),
 					cachedContent: options?.cachedContent,
 				});
+			if (!reasoning || !model.reasoning || options?.disableReasoning || options?.forceReasoningOff) {
+				return thinkingOff();
 			}
 
 			const vertexModel = model as Model<"google-vertex">;
@@ -2192,6 +2244,12 @@ function mapOptionsForApi<TApi extends Api>(
 			if (geminiModel.thinking?.mode === "google-level") {
 				return castApi<"google-vertex">({
 					...base,
+					// Caller's maxTokens is desired output; Gemini counts thinking against the cap.
+					maxTokens: googleMaxOutputTokens(
+						base.maxTokens,
+						model,
+						googleThinkingHeadroom(model, effort, options?.thinkingBudgets),
+					),
 					serviceTier: options?.serviceTier,
 					thinking: {
 						enabled: true,
@@ -2203,12 +2261,25 @@ function mapOptionsForApi<TApi extends Api>(
 				});
 			}
 
+			const requestedBudget = getGoogleBudget(geminiModel, effort, options?.thinkingBudgets);
+			const maxTokens = googleMaxOutputTokens(
+				base.maxTokens,
+				model,
+				requestedBudget > 0 ? requestedBudget : googleThinkingHeadroom(model, effort, options?.thinkingBudgets),
+			);
+			let budgetTokens = requestedBudget;
+			// If not enough room for thinking + output, reduce thinking budget.
+			if (requestedBudget > 0 && maxTokens !== undefined && maxTokens <= requestedBudget) {
+				budgetTokens = maxTokens - MIN_OUTPUT_TOKENS;
+				if (budgetTokens <= 0) return thinkingOff();
+			}
 			return castApi<"google-vertex">({
 				...base,
+				maxTokens,
 				serviceTier: options?.serviceTier,
 				thinking: {
 					enabled: true,
-					budgetTokens: getGoogleBudget(geminiModel, effort, options?.thinkingBudgets),
+					budgetTokens,
 				},
 				hideThinkingSummary: options?.hideThinkingSummary,
 				toolChoice: mapGoogleToolChoice(options?.toolChoice),

@@ -4,9 +4,9 @@
 module Registry
 imports from Governance
   types
-    Identity renamed Identity
+    Identity renamed Identity;
+    UnitId renamed UnitId
 exports
-  types UnitId
   operations
     Begin: [UnitId] ==> UnitId;
     Live: UnitId ==> bool;
@@ -18,10 +18,6 @@ exports
     MarkAlerted: UnitId ==> ();
     End: UnitId ==> ()
 definitions
-types
-  -- 一个归属单位的身份；台账造出，使用方只原样传递
-  UnitId = token;
-
   -- 宿主内存里的归属与告警台账
 state Table of
   units   : set of UnitId            -- 活着的归属单位
@@ -48,12 +44,12 @@ functions
   Fuel: UnitId * map UnitId to UnitId * nat -> nat
   Fuel(-, -, fuel) == fuel;
 
-  -- 一个单位的直接内层单位
+  -- 一个单位的直接内层子单位
   UnitChildren: UnitId * map UnitId to UnitId -> set of UnitId
   UnitChildren(unit, parent) ==
     {c | c in set dom parent & parent(c) = unit};
 
-  -- 一个单位名下尚未撤销登记的全部受管进程树
+  -- 一个单位名下尚未释放的全部受管进程树
   UnitTrees: UnitId * map Identity to UnitId -> set of Identity
   UnitTrees(unit, trees) ==
     {t | t in set dom trees & trees(t) = unit};
@@ -72,7 +68,7 @@ operations
   ext rd units
   post r <=> unit in set units;
 
-  -- 一个单位此刻的直接内层单位；不在册的单位为空集
+  -- 一个单位此刻的直接内层子单位；不在册的单位为空集
   Children(unit: UnitId) r: set of UnitId
   ext rd parent
   post r = UnitChildren(unit, parent);
@@ -83,12 +79,12 @@ operations
   pre unit in set units and tree not in set dom trees
   post trees = trees~ ++ {tree |-> unit};
 
-  -- 一个单位名下尚未撤销登记的受管进程树；不在册的单位为空集
+  -- 一个单位名下尚未释放的受管进程树；不在册的单位为空集
   Trees(unit: UnitId) r: set of Identity
   ext rd trees
   post r = UnitTrees(unit, trees);
 
-  -- 撤销一棵树的登记；只改台账，不终止平台上的树；撤销两次与一次效果相同
+  -- 受管进程树已在平台上释放，台账随之撤销；撤销两次与一次效果相同
   Release(tree: Identity)
   ext wr trees
   post trees = {tree} <-: trees~;
@@ -104,7 +100,7 @@ operations
   pre unit in set units
   post alerted = alerted~ union {unit};
 
-  -- 结束一个单位；直接内层单位已全部结束，名下树已全部撤销；它的已告警记录随之清除
+  -- 结束一个单位；直接内层子单位已全部结束，名下受管进程树已全部释放；它的已告警记录随之清除
   End(unit: UnitId)
   ext wr units wr parent wr alerted rd trees
   pre unit in set units

@@ -4,9 +4,9 @@
 module Registry
 imports from Governance
   types
-    Identity renamed Identity;
-    UnitId renamed UnitId
+    Identity renamed Identity
 exports
+  types UnitId
   operations
     Begin: [UnitId] ==> UnitId;
     Live: UnitId ==> bool;
@@ -18,6 +18,10 @@ exports
     MarkAlerted: UnitId ==> ();
     End: UnitId ==> ()
 definitions
+types
+  -- 一个归属单位的身份；台账造出，使用方不读结构
+  UnitId = token;
+
   -- 宿主内存里的归属与告警台账
 state Table of
   units   : set of UnitId            -- 活着的归属单位

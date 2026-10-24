@@ -5,24 +5,24 @@ module Host
 imports
   from Governance
     types
-      Identity renamed Identity;
-      UnitId renamed UnitId;
-      Guarantee renamed Guarantee;
-      Reading renamed Reading;
-      Limit renamed Limit
-    functions
-      Merge: Reading * Reading -> Reading renamed Merge;
-      Exceeded: Reading * Limit -> bool renamed Exceeded,
+      Identity renamed Identity,
   from Platform
     types
       Program renamed Program;
-      SpawnOutcome renamed SpawnOutcome
+      SpawnOutcome renamed SpawnOutcome;
+      Guarantee renamed Guarantee;
+      Cumulative renamed Cumulative;
+      Reading renamed Reading
+    functions
+      AddCumulative: Cumulative * Cumulative -> Cumulative renamed AddCumulative
     operations
       Describe: () ==> Guarantee renamed Describe;
       Spawn: Program ==> SpawnOutcome renamed Spawn;
       Measure: Identity ==> Reading renamed Measure;
       Kill: Identity ==> () renamed Kill,
   from Registry
+    types
+      UnitId renamed UnitId
     operations
       Begin: [UnitId] ==> UnitId renamed Begin;
       Live: UnitId ==> bool renamed Live;
@@ -34,7 +34,7 @@ imports
       MarkAlerted: UnitId ==> () renamed MarkAlerted;
       End: UnitId ==> () renamed End
 exports
-  types struct LaunchOutcome; struct AlertOutcome; struct SampleOutcome
+  types struct Limit; struct LaunchOutcome; struct AlertOutcome; struct SampleOutcome
   operations
     Launch: UnitId * Program ==> LaunchOutcome;
     JudgeAlert: UnitId * Reading * Limit ==> AlertOutcome;
@@ -46,6 +46,12 @@ exports
     RunNested: Program * Program * Limit ==> [SampleOutcome]
 definitions
 types
+  -- 告警阈值：CPU 时间、读写总字节或当前内存任一越过上限即超限
+  Limit ::
+    cpuNanos    : nat   -- CPU 时间上限，纳秒
+    ioBytes     : nat   -- 读入加写出字节上限
+    memoryBytes : nat;  -- 当前内存占用上限，字节
+
   -- Launch 的结局：登记在册的受管进程树身份、平台起进程失败，或归属单位不在册
   LaunchOutcome = Identity | <Failed> | <NotLive>;
 
@@ -56,6 +62,22 @@ types
   SampleOutcome ::
     reading : Reading       -- 采到的用量读数
     alert   : AlertOutcome; -- 本次采样的告警判定结局
+
+functions
+  -- 两棵受管进程树的读数合成一份：累计量相加，只要有一份不完整合成的就不完整；内存相加；峰值不可相加，合成后为空
+  Merge: Reading * Reading -> Reading
+  Merge(a, b) ==
+    mk_Reading(AddCumulative(a.cumulative, b.cumulative),
+               if a.coverage = <Complete> and b.coverage = <Complete> then <Complete> else <LiveOnly>,
+               a.memoryBytes + b.memoryBytes,
+               nil);
+
+  -- 一份读数是否越过阈值：CPU、读写总字节或当前内存任一超过上限即为真；两个实现必须得出同一结果，所以写显式体
+  Exceeded: Reading * Limit -> bool
+  Exceeded(reading, limit) ==
+    reading.cumulative.cpuNanos > limit.cpuNanos
+    or reading.cumulative.readBytes + reading.cumulative.writeBytes > limit.ioBytes
+    or reading.memoryBytes > limit.memoryBytes;
 
 operations
   -- 场景：先核对单位在册，再起受管进程树并登记到该单位名下；失败或不在册时不留登记
@@ -119,11 +141,11 @@ operations
     let outer = Begin(nil) in
       let inner = Begin(outer) in
         let innerLaunch = Launch(inner, innerProgram) in
-          (if is_Identity(innerLaunch) then
-             let - = SampleTree(inner, innerLaunch, limit) in
-               RetireTree(inner, innerLaunch);
-           let - = FinishUnit(inner) in
-             let outerLaunch = Launch(outer, outerProgram) in
+          let outerLaunch = Launch(outer, outerProgram) in
+            (if is_Identity(innerLaunch) then
+               let - = SampleTree(inner, innerLaunch, limit) in
+                 RetireTree(inner, innerLaunch);
+             let - = FinishUnit(inner) in
                if not is_Identity(outerLaunch) then
                  let - = FinishUnit(outer) in return nil
                else

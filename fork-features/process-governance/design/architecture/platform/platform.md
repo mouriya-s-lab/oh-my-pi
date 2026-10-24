@@ -4,16 +4,13 @@
 module Platform
 imports from Governance
   types
-    Identity renamed Identity;
-    Guarantee renamed Guarantee;
-    Cumulative renamed Cumulative;
-    Reading renamed Reading
-  functions
-    NoCumulative: () -> Cumulative renamed NoCumulative;
-    AddCumulative: Cumulative * Cumulative -> Cumulative renamed AddCumulative;
-    ZeroReading: () -> Reading renamed ZeroReading
+    Identity renamed Identity
 exports
-  types Program; struct SpawnOutcome
+  types
+    Program; struct SpawnOutcome; struct Guarantee;
+    struct Cumulative; struct Coverage; struct Reading
+  functions
+    AddCumulative: Cumulative * Cumulative -> Cumulative
   operations
     Describe: () ==> Guarantee;
     Spawn: Program ==> SpawnOutcome;
@@ -26,6 +23,29 @@ types
 
   -- Spawn 的结局：起来了就交回这棵受管进程树的根身份，否则为失败
   SpawnOutcome = Identity | <Failed>;
+
+  -- 宿主死亡后受管进程树成员的命运
+  Guarantee = <Kernel> | <Cooperative>;
+  -- <Kernel>: 内核终止全部成员，宿主怎样死亡都成立
+  -- <Cooperative>: 宿主正常退出前自己终止成员；崩溃后无人清理
+
+  -- 累计量：进程出生以来的总和，只增不减
+  Cumulative ::
+    cpuNanos   : nat   -- 累计 CPU 时间，纳秒
+    readBytes  : nat   -- 累计读入字节
+    writeBytes : nat;  -- 累计写出字节
+
+  -- 累计量覆盖的范围
+  Coverage = <Complete> | <LiveOnly>;
+  -- <Complete>: 含已退出的成员进程
+  -- <LiveOnly>: 只含取回那一刻活着的成员进程
+
+  -- 一棵或多棵受管进程树的读数：累计量带覆盖范围，内存只算此刻活着的成员
+  Reading ::
+    cumulative  : Cumulative  -- 累计量之和
+    coverage    : Coverage    -- 累计量覆盖的范围
+    memoryBytes : nat         -- 取回那一刻活着的成员内存之和
+    memoryPeak  : [nat];      -- 整棵树的历史峰值内存；平台给不出或合并多棵树后为空
 
   -- 一个活着的成员进程此刻的用量
   Usage ::
@@ -47,6 +67,19 @@ state Os of
 end
 
 functions
+  -- 没有累计量
+  NoCumulative: () -> Cumulative
+  NoCumulative() == mk_Cumulative(0, 0, 0);
+
+  -- 两份累计量相加
+  AddCumulative: Cumulative * Cumulative -> Cumulative
+  AddCumulative(a, b) ==
+    mk_Cumulative(a.cpuNanos + b.cpuNanos, a.readBytes + b.readBytes, a.writeBytes + b.writeBytes);
+
+  -- 空读数：没有成员、没有累计量
+  ZeroReading: () -> Reading
+  ZeroReading() == mk_Reading(NoCumulative(), <LiveOnly>, 0, nil);
+
   -- 一组活着的成员进程的读数之和
   Sum: set of Identity * map Identity to Usage -> Reading
   Sum(ids, usage) ==
